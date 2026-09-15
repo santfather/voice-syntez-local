@@ -1,0 +1,13 @@
+# Опциональные зависимости: очистка референса от шума и реверба (Фаза 6.4).
+# Ставятся отдельно от основного набора и только с --no-deps:
+#
+#   ./venv/bin/pip install --no-deps -r requirements-denoise.txt
+#
+# --no-deps здесь обязателен: deepfilternet объявляет numpy<2.0, а весь проект
+# проверен на numpy 2.4.6 — обычная установка молча откатила бы numpy назад.
+# Сама библиотека на numpy 2.x работает (проверено на референсах проекта).
+# DeepFilterNet не обновлялся с 2023 года и импортирует torchaudio.backend,
+# удалённый в torchaudio 2.9+ — шим на это есть в backend/denoise_worker.py.
+deepfilternet==0.5.6
+DeepFilterLib==0.5.6   # нативная часть (libdf); на macOS arm64 есть готовый wheel
+appdirs==1.4.4         # deepfilternet: каталог кэша моделей

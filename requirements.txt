@@ -7,11 +7,17 @@ python-multipart==0.0.32
 torch==2.14.0
 torchaudio==2.11.0
 f5-tts==1.1.22
+coqui-tts==0.27.5      # движок XTTS v2 (Фаза 5). Требует шима isin_mps_friendly — см. engines/xtts_engine.py
 ruaccent==1.5.8.3
+spacy==3.8.16           # разбиение длинного текста внутри XTTS (enable_text_splitting): coqui-tts
+                        # зовёт его, но в зависимостях не объявляет — без spacy падает ImportError
 librosa==0.11.0        # кросс-проверка F0 в audio_analysis.py (раньше приходила транзитивно)
+pyloudnorm==0.2.0      # LUFS-нормализация собранного трека (Фаза 6.1); scipy уже есть через librosa
+num2words==0.5.14      # числа словами в text_preprocess.py (Фаза 6.5); раньше приходил транзитивно
 transformers==5.17.0   # Whisper в transcribe_worker.py (раньше приходил транзитивно через f5-tts)
 pydub==0.25.1
 soundfile==0.14.0
 numpy==2.4.6
 psutil==7.2.2          # watchdog по RSS/CPU в resource_guard.py
 huggingface_hub==1.31.0
+pytest==8.4.2          # юнит-тесты (tests/): запускаются без моделей, на движке-заглушке

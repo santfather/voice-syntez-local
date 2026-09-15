@@ -43,7 +43,23 @@ def snapshot() -> dict:
     return {
         "rss_mb": round(process.memory_info().rss / (1024 * 1024), 1),
         "cpu_percent": round(process.cpu_percent(interval=None), 1),
+        "system_mem_percent": round(psutil.virtual_memory().percent, 1),
     }
+
+
+def check_system_memory_pressure() -> bool:
+    """True, если память занята не только этим процессом, но и всей системой.
+
+    Второй, независимый от `MAX_RSS_MB` слой защиты: свой лимит не видит, когда
+    машину уже загрузили редактор с индексацией и браузер, а питон-процесс ещё
+    в пределах своего потолка. Обратная слепота тоже есть — системный порог не
+    различает, кто именно занял память, поэтому обе проверки нужны вместе.
+
+    Сама по себе не логирует: вызывается в цикле ожидания, и предупреждение
+    на каждой итерации превратилось бы в спам. Решение о сообщении принимает
+    вызывающий (см. `job_queue._wait_for_memory`).
+    """
+    return psutil.virtual_memory().percent > config.SYSTEM_MEM_THRESHOLD_PERCENT
 
 
 class ResourceGuard:

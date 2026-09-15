@@ -14,10 +14,13 @@
 Всё остальное в скобках (``(тихо)``, ``(2024)``, ``12:30``) остаётся обычным текстом.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 # Разделители реплики: ":", "—", "–" и "-" только как отдельный токен.
 _SEPARATOR_RE = re.compile(r"^\s*(?P<speaker>[^:\n—–]{1,60}?)\s*(?::|—|–|\s-\s)\s*(?P<text>.*)$")
@@ -281,14 +284,38 @@ def parse_dialogue(raw_text: str, max_replica_chars: int | None = None) -> Parse
     result = [replica for replica in replicas if replica.text]
 
     if max_replica_chars:
-        for replica in result:
-            if len(replica.text) > max_replica_chars:
-                raise ValueError(
-                    f"Кусок в строке {replica.line_number} длиннее {max_replica_chars} символов. "
-                    "Разбейте его на части."
-                )
+        result = _split_long_replicas(result, max_replica_chars)
 
     return ParsedDialogue(replicas=result)
+
+
+def _split_long_replicas(replicas: list[Replica], max_chars: int) -> list[Replica]:
+    """Режет слишком длинные реплики по границам предложений.
+
+    Раньше такая реплика отклонялась с ошибкой, и пользователь делил её вручную —
+    обычно по счётчику символов, то есть посреди мысли. Разрыв интонации между
+    двумя законченными предложениями слышен заметно слабее.
+    """
+    expanded: list[Replica] = []
+    for replica in replicas:
+        if len(replica.text) <= max_chars:
+            expanded.append(replica)
+            continue
+        pieces = split_into_chunks(replica.text, max_chars)
+        logger.info(
+            "Реплика (строка %s) длиннее %s знаков — разрезана на %s кусков",
+            replica.line_number, max_chars, len(pieces),
+        )
+        expanded.extend(
+            Replica(
+                voice=replica.voice,
+                text=piece,
+                line_number=replica.line_number,
+                overrides=dict(replica.overrides),
+            )
+            for piece in pieces
+        )
+    return expanded
 
 
 # --- нарезка сплошного текста (режим «Сплошной текст») ------------------------

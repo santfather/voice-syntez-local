@@ -1,17 +1,26 @@
-"""Измерение высоты тона (F0) референс-аудио: проверка заявленного пола голоса.
+"""Проверка референс-аудио: высота тона (F0) против заявленного пола, перегрузка записи
+и полоса частот.
 
-Метод — разнос гармоник: берём самый энергичный участок записи, считаем спектр,
-выбираем основной тон по согласованности спектра с рядом гармоник.
+Метод измерения тона — разнос гармоник: берём самый энергичный участок записи,
+считаем спектр, выбираем основной тон по согласованности спектра с рядом гармоник.
 Кросс-проверка — `librosa.yin` (если библиотека доступна), `pyin` для коротких
 референсов ненадёжен и не используется.
+
+Вторая проверка — клиппинг: у референса с перегруженным микрофоном пики срезаны,
+и F5-TTS клонирует эти искажения вместе с тембром.
+
+Третья — полоса частот: узкополосная запись (телефонная линия, сильно сжатый mp3)
+даёт глухой тембр, который модель клонирует вместе с голосом и который настройками
+синтеза потом не лечится.
 """
 
 import hashlib
 import importlib.util
 import logging
+import math
+import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +31,17 @@ ANALYSIS_SR = 16_000
 FFT_SIZE = 32_768
 WINDOW_SEC = 1.5
 MIN_AUDIO_SEC = 0.5
+
+# Полоса частот меряется на своей частоте дискретизации: на 16 кГц (ANALYSIS_SR)
+# выше 8 кГц ничего нет, а проверке нужен диапазон до 11 кГц.
+BAND_SR = 24_000
+BAND_FRAME = 2_048
+BAND_CORE_HZ = (300.0, 3_400.0)  # ядро речи — уровень, с которым сравниваем
+BAND_HIGH_HZ = (7_000.0, 11_000.0)  # верх: его и срезают телефонные кодеки и сжатые mp3
+# Замерено на референсах проекта и на их копиях через ФНЧ: записи в полной полосе
+# дают −8…−19 дБ относительно ядра речи, обрезанные на 7 кГц — от −34 дБ и ниже,
+# на 6 кГц и ниже — от −67 дБ. Порог −28 дБ посередине между этими группами.
+BAND_HIGH_MIN_DB = -28.0
 
 # Ориентиры для взрослых голосов
 MALE_RANGE = (85.0, 155.0)
@@ -37,22 +57,59 @@ HARMONIC_LIMIT = 2_000.0
 # Демо-файлы пакета f5_tts, которые нельзя выдавать за пользовательские записи
 DEMO_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aiff", ".aif"}
 
+# Перегрузка: доля отсчётов, упёршихся в потолок шкалы. Порог по доле, а не по
+# одному пику: одиночный отсчёт на пределе бывает и у нормальной записи, а вот
+# срезанные вершины громких звуков дают их десятками на секунду.
+CLIPPING_LEVEL = 0.99
+CLIPPING_MIN_RATIO = 0.001
+
 
 @dataclass
-class F0Estimate:
+class ReferenceReport:
+    """Итог проверки референса: высота тона и дефекты записи."""
+
     f0_hz: float | None  # итоговая оценка (разнос гармоник)
     yin_hz: float | None  # кросс-проверка, может отсутствовать
+    duration_sec: float  # длительность записи; 0.0 — декодировать не удалось
+    clipping_warning: str | None  # микрофон перегружен
+    band_high_db: float | None = None  # уровень 6–8 кГц относительно ядра речи, дБ
+    band_warning: str | None = None  # запись узкополосная (телефон, сжатый mp3)
 
 
 def load_mono(data: bytes | bytearray | str | Path, suffix: str = "", target_sr: int = ANALYSIS_SR):
-    """Декодирует аудио (байты или путь) в моно float32 нужной частоты."""
-    from pydub import AudioSegment
+    """Декодирует аудио (байты или путь) в моно float32 нужной частоты.
 
-    source = BytesIO(bytes(data)) if isinstance(data, (bytes, bytearray)) else str(data)
-    fmt = suffix.lstrip(".").lower() or None
-    segment = AudioSegment.from_file(source, format=fmt)
-    segment = segment.set_channels(1).set_frame_rate(target_sr)
-    samples = np.frombuffer(segment.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+    Через ffmpeg напрямую, а не через pydub: pydub отдаёт сырые сэмплы в том
+    формате, который выбрал для вывода ffmpeg, и разрядность приходится угадывать
+    по ширине сэмпла. Для opus (а это любая запись из браузера: webm/ogg) ffmpeg
+    выдаёт 32-битный float, а `AudioSegment.sample_width` остаётся 4 — тот же
+    размер и у int32. Разбор такого потока как int16 удваивал число сэмплов:
+    одиннадцатисекундная запись превращалась в 22 секунды, а тон 150 Гц — в 76.
+    Явный `s16le` на выходе убирает неоднозначность.
+
+    `suffix` сохранён в подписи для совместимости с вызовами: ffmpeg определяет
+    формат сам, в том числе по имени файла.
+    """
+    del suffix
+    if isinstance(data, (bytes, bytearray)):
+        # `cache:` делает трубу сэмплов ищущей: контейнеры mp4/m4a (их отдаёт
+        # Safari) без этого не демультиплексируются — «Invalid data found».
+        command = ["-read_ahead_limit", "-1", "-i", "cache:pipe:0"]
+        stdin = bytes(data)
+    else:
+        command = ["-i", str(data)]
+        stdin = None
+    process = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *command,
+         "-ac", "1", "-ar", str(target_sr), "-f", "s16le", "-"],
+        input=stdin,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0 or not process.stdout:
+        tail = process.stderr.decode("utf-8", "replace").strip().splitlines()[-1:]
+        raise RuntimeError(f"ffmpeg не смог прочитать аудио: {tail[0] if tail else process.returncode}")
+    samples = np.frombuffer(process.stdout, dtype="<i2").astype(np.float32) / 32768.0
     return samples, target_sr
 
 
@@ -153,17 +210,97 @@ def estimate_f0_yin(y: np.ndarray, sr: int) -> float | None:
     return float(np.median(f0[keep]))
 
 
-def analyze(data: bytes | bytearray | str | Path, suffix: str = "") -> F0Estimate:
-    """Оценка F0 референса. Ошибки декодирования не пробрасываются — вернётся пустой результат."""
+def check_clipping(y: np.ndarray) -> str | None:
+    """Предупреждение, если микрофон был перегружен и вершины громких звуков срезаны."""
+    if y.size == 0:
+        return None
+    clipped = int(np.count_nonzero(np.abs(y) >= CLIPPING_LEVEL))
+    if clipped / y.size < CLIPPING_MIN_RATIO:
+        return None
+    peak_db = 20 * math.log10(max(float(np.max(np.abs(y))), 1e-6))
+    return (
+        f"Запись перегружена: {clipped / y.size * 100:.1f}% отсчётов упираются в потолок "
+        f"шкалы (пик {peak_db:.1f} дБ). Микрофон срезает вершины громких звуков, и модель "
+        f"склонирует искажения вместе с тембром. Убавьте усиление микрофона или отойдите "
+        f"дальше и запишите заново."
+    )
+
+
+def _band_mean(spectrum: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> float | None:
+    """Средняя амплитуда спектра в полосе [lo, hi)."""
+    mask = (freqs >= lo) & (freqs < hi)
+    if not mask.any():
+        return None
+    return float(np.mean(spectrum[mask]))
+
+
+def estimate_high_band_db(y: np.ndarray, sr: int) -> float | None:
+    """Уровень полосы 7–11 кГц относительно ядра речи (300–3400 Гц), дБ.
+
+    Средний спектр берётся по всем кадрам, а не по самым громким: усредняются
+    амплитуды, а вклад тихих кадров на порядки меньше речи, поэтому длинная пауза
+    в записи оценку не сдвигает (проверено на записи, где речи — треть). Зато
+    шипящие, которые тише гласных, остаются в расчёте — а именно они и пропадают
+    у узкополосных записей.
+    """
+    if y.size < BAND_FRAME or float(np.max(np.abs(y))) < 1e-4:
+        return None
+    frames = np.lib.stride_tricks.sliding_window_view(y, BAND_FRAME)[:: BAND_FRAME // 2]
+    spectrum = np.abs(np.fft.rfft(frames * np.hanning(BAND_FRAME), axis=1)).mean(axis=0)
+    freqs = np.fft.rfftfreq(BAND_FRAME, d=1 / sr)
+    core = _band_mean(spectrum, freqs, *BAND_CORE_HZ)
+    high = _band_mean(spectrum, freqs, *BAND_HIGH_HZ)
+    if not core or high is None:
+        return None
+    return 20 * math.log10(high / core)
+
+
+def check_narrow_band(high_db: float | None) -> str | None:
+    """Предупреждение, если в записи нет верха: тембр выйдет глухим. Иначе None."""
+    if high_db is None or high_db >= BAND_HIGH_MIN_DB:
+        return None
+    return (
+        f"Запись узкополосная: выше 7 кГц в ней практически ничего нет "
+        f"(уровень {high_db:.0f} дБ от ядра речи). Так звучат телефонные записи и сильно "
+        f"сжатые mp3 — синтез унаследует глухой тембр, и настройками это не лечится. "
+        f"Запишите референс заново в полной полосе."
+    )
+
+
+def analyze(data: bytes | bytearray | str | Path, suffix: str = "") -> ReferenceReport:
+    """Проверка референса: F0, дефекты записи и полоса частот. Ошибки декодирования не пробрасываются."""
     try:
         y, sr = load_mono(data, suffix)
     except Exception as exc:  # noqa: BLE001 — проверка не должна блокировать загрузку голоса
-        logger.warning("Не удалось прочитать аудио для оценки F0: %s", exc)
-        return F0Estimate(f0_hz=None, yin_hz=None)
+        logger.warning("Не удалось прочитать аудио для проверки референса: %s", exc)
+        return ReferenceReport(f0_hz=None, yin_hz=None, duration_sec=0.0, clipping_warning=None)
     f0 = estimate_f0_harmonic(y, sr)
     yin = estimate_f0_yin(y, sr)
-    logger.info("F0 референса: разнос гармоник %s Гц, yin %s Гц", f0, yin)
-    return F0Estimate(f0_hz=f0, yin_hz=yin)
+    clipping = check_clipping(y)
+    duration = y.size / sr
+    # Полоса меряется отдельной декодировкой на 24 кГц: на 16 кГц выше 8 кГц
+    # ничего нет, а сравнивать нужно именно 6–8 кГц.
+    try:
+        wide, wide_sr = load_mono(data, suffix, target_sr=BAND_SR)
+        band_high = estimate_high_band_db(wide, wide_sr)
+    except Exception as exc:  # noqa: BLE001 — проверка полосы не должна ронять F0
+        logger.warning("Не удалось измерить полосу референса: %s", exc)
+        band_high = None
+    band_warning = check_narrow_band(band_high)
+    logger.info(
+        "Референс: %.1f с, F0: разнос гармоник %s Гц, yin %s Гц, полоса 7–11 кГц %s дБ%s",
+        duration, f0, yin,
+        f"{band_high:.1f}" if band_high is not None else "—",
+        " (узкая полоса)" if band_warning else "",
+    )
+    return ReferenceReport(
+        f0_hz=f0,
+        yin_hz=yin,
+        duration_sec=duration,
+        clipping_warning=clipping,
+        band_high_db=band_high,
+        band_warning=band_warning,
+    )
 
 
 def check_gender_mismatch(f0: float | None, declared_gender: str) -> str | None:

@@ -4,23 +4,94 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   voices: [],
+  engines: {},         // id -> паспорт движка из /api/engines
+  engineTouched: false, // пользователь сам выбрал движок в форме нового голоса
   voiceKeys: [],       // ["#1", "#2", "ИВАН"] — голоса, встреченные в тексте
   voiceMeta: {},       // key -> {key, label, slot}
-  configs: {},         // key -> {voice_id, speed, cfg_strength, nfe_step}
-  preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, text}
+  configs: {},         // key -> {voice_id, speed, cfg_strength, nfe_step, engine_params}
+  preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, engine_params, text}
+  textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
+  textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
   jobId: null,
   pollTimer: null,
+  doneJobId: null,      // id последней готовой задачи — по нему перегенерация реплик
+  regenTimer: null,
+  regenIndex: null,
+  variantKey: null,     // "индекс:вариант" того варианта, что играет в плеере вариантов
   statusTimer: null,
   previewJob: null,    // {jobId, voiceId}
   previewTimer: null,
   textJobId: null,     // задача режима «Сплошной текст»
   textPollTimer: null,
+  record: {            // запись голоса с микрофона
+    recorder: null,
+    stream: null,
+    chunks: [],
+    suffix: 'webm',
+    file: null,
+    url: null,
+    startedAt: 0,
+    peak: 0,
+    analyser: null,
+    ctx: null,
+    raf: null,
+    autoStop: null,
+    tick: null,
+  },
 };
 
 const NFE_OPTIONS = [8, 16, 32];
 const PREVIEW_TEXT = 'Привет! Так звучит этот голос в диалоге.';
 const DROP_HINT = 'Перетащите сюда аудио (wav/mp3/m4a) или кликните';
+
+// Идентификаторы движков совпадают с backend/engines/base.py. Нужны здесь только
+// для подсказки по полу: паспорта всех движков приходят из /api/engines.
+const ENGINE_F5 = 'f5';
+const ENGINE_XTTS = 'xtts';
+
+// Фразы для референса. F5-TTS клонирует голос по паре «запись + её дословная
+// расшифровка», поэтому текст известен заранее — в отличие от загруженного файла,
+// где его приходится распознавать после записи. Фразы разные по составу звуков и
+// интонации: модель копирует то, что слышит, и на однотипных утверждениях
+// клонирует слишком узкий кусок голосового диапазона.
+const RECORD_PHRASES = [
+  {
+    label: 'Вопрос и утверждение',
+    text: 'Добрый вечер. Мы договаривались встретиться у метро, но я вас так и не увидел. Вы точно получили моё сообщение?',
+  },
+  {
+    label: 'Восклицания, много шипящих',
+    text: 'Осторожно, здесь очень скользко! Я чуть не упал, когда выбегал из подъезда. И это уже третий раз за неделю.',
+  },
+  {
+    label: 'Спокойная просьба (короче)',
+    text: 'Дайте пройти, пожалуйста. Я вас совсем не знаю, и мне нечего вам сказать.',
+  },
+  {
+    label: 'Только вопросы',
+    text: 'Ты уверен, что мы правильно свернули? Кажется, этот поворот был раньше. Может, спросим дорогу у кого-нибудь?',
+  },
+  {
+    label: 'Сложные сочетания согласных',
+    text: 'Съешь ещё этих мягких французских булочек, а потом расскажешь, как прошла твоя поездка в Ярославль.',
+  },
+];
+
+// MediaRecorder отдаёт то, что умеет браузер: Chrome — webm/opus, Safari — mp4/aac.
+// Все три формата бэкенд принимает и читает через ffmpeg.
+const RECORD_FORMATS = [
+  ['audio/webm;codecs=opus', 'webm'],
+  ['audio/webm', 'webm'],
+  ['audio/mp4', 'm4a'],
+  ['audio/ogg;codecs=opus', 'ogg'],
+];
+// За фразы из списка длиннее 12 секунд брать не нужно: F5-TTS всё равно обрежет
+// референс. Потолок нужен, чтобы забытая запись не тянулась минутами.
+const RECORD_MAX_MS = 20000;
+// Порог перегрузки — тот же, что в audio_analysis.CLIPPING_LEVEL: индикатор должен
+// показывать красное ровно там, где бэкенд потом скажет «запись перегружена».
+const CLIPPING_LEVEL = 0.99;
 
 // --- утилиты ------------------------------------------------------------------
 const esc = (value) =>
@@ -58,11 +129,128 @@ const nfeOptions = (selected) => NFE_OPTIONS
   .map((n) => `<option value="${n}"${n === selected ? ' selected' : ''}>${n}${n === 32 ? ' (максимум качества)' : ''}</option>`)
   .join('');
 
+// --- движки синтеза -----------------------------------------------------------
+// Движок выбирается отдельно для каждого голоса, поэтому один и тот же диалог
+// может озвучиваться несколькими моделями: бэкенд держит их поднятыми в одном
+// процессе и ходит в них по очереди (см. backend/engines, audio_pipeline).
+// Подписи ручек и их границы объявлены на бэкенде (/api/engines) — здесь только
+// отрисовка того, что он прислал: иначе фронт и модель разошлись бы в допустимых
+// значениях, и ползунок обещал бы одно, а бэкенд молча обрезал значение.
+
+const voiceById = (voiceId) => state.voices.find((v) => v.id === voiceId) || null;
+
+function engineInfo(engineId) {
+  return state.engines[engineId] || null;
+}
+
+function engineLabel(engineId) {
+  const info = engineInfo(engineId);
+  return info ? info.label : engineId;
+}
+
+function engineOptionsHtml(selected) {
+  return Object.values(state.engines)
+    .map((info) => `<option value="${esc(info.id)}"${info.id === selected ? ' selected' : ''}>${esc(info.label)}</option>`)
+    .join('');
+}
+
+// Подсказка движка по полу повторяет default_engine_for_gender из backend/engines/base.py
+// (F5 обучен на разметке ударений и ровнее на мужских голосах, базовая XTTS — наоборот).
+// Это предзаполнение формы, а не правило.
+function suggestedEngine(gender) {
+  return gender === 'female' ? ENGINE_XTTS : ENGINE_F5;
+}
+
+// Короткая строка про движок голоса: что за модель и работает ли с ней RUAccent.
+function engineNote(engineId) {
+  const info = engineInfo(engineId);
+  if (!info) return 'движок не выбран';
+  return info.supports_accents
+    ? `${info.label} · ударения расставляются автоматически`
+    : `${info.label} · ударения не поддерживаются — текст идёт как есть`;
+}
+
+const fmtByStep = (value, step) =>
+  (step >= 1 ? String(Math.round(value)) : value.toFixed(step < 0.1 ? 2 : 1));
+
+// Значения ручек движка: то, что уже сохранено у голоса или набрано в карточке,
+// иначе — дефолт из паспорта. Ручки чужого движка отбрасываются: у XTTS нет
+// nfe_step, а у F5 нет temperature, и тащить их через запрос незачем.
+function engineParamsFor(engineId, values) {
+  const info = engineInfo(engineId);
+  const result = {};
+  if (!info) return result;
+  info.params.forEach((param) => {
+    const raw = values ? values[param.name] : undefined;
+    result[param.name] = typeof raw === 'number' ? raw : param.default;
+  });
+  return result;
+}
+
+function engineParamsHtml(engineId, values) {
+  const info = engineInfo(engineId);
+  if (!info || !info.params.length) return '';
+  const current = engineParamsFor(engineId, values);
+  return `<div class="grid-2">${info.params.map((param) => `
+    <label class="field">
+      <span class="slider-head">${esc(param.label)}
+        <b data-param-label="${esc(param.name)}">${fmtByStep(current[param.name], param.step)}</b></span>
+      <input type="range" data-engine-param="${esc(param.name)}"
+             min="${param.min}" max="${param.max}" step="${param.step}" value="${current[param.name]}" />
+      ${param.hint ? `<span class="muted">${esc(param.hint)}</span>` : ''}
+    </label>`).join('')}</div>`;
+}
+
+function readEngineParams(container) {
+  const result = {};
+  container.querySelectorAll('[data-engine-param]').forEach((input) => {
+    result[input.dataset.engineParam] = parseFloat(input.value);
+  });
+  return result;
+}
+
+function updateEngineParamLabel(container, input) {
+  const label = container.querySelector(`[data-param-label="${input.dataset.engineParam}"]`);
+  if (label) label.textContent = fmtByStep(parseFloat(input.value), parseFloat(input.step));
+}
+
+async function loadEngines() {
+  const data = await api('/api/engines');
+  state.engines = {};
+  data.engines.forEach((info) => { state.engines[info.id] = info; });
+  const select = $('new-voice-engine');
+  select.innerHTML = engineOptionsHtml(select.value || suggestedEngine($('new-voice-gender').value));
+  updateNewVoiceEngineNote();
+}
+
+function updateNewVoiceEngineNote() {
+  const info = engineInfo($('new-voice-engine').value);
+  $('new-voice-engine-note').textContent = info
+    ? `${info.description}${info.note ? ` ${info.note}` : ''}`
+    : '';
+}
+
 function defaultConfig() {
   // Голос не подставляем: одинаковый голос на все слоты — это ровно та ошибка,
   // из-за которой диалог читается одним голосом. Выбор должен быть осознанным.
-  return { voice_id: '', speed: 1.0, cfg_strength: 2.0, nfe_step: 32 };
+  return {
+    voice_id: '',
+    speed: 1.0,
+    cfg_strength: 2.0,
+    nfe_step: 32,
+    target_rms: 0.1,
+    gain_db: 0,
+    pitch_semitones: 0,
+    pause_override_ms: null,  // null — пауза общая для всего диалога
+    engine_params: {},        // ручки движка, переопределённые для этого слота
+  };
 }
+
+// Подписи «ещё настроек» спикера: одинаковы при отрисовке и при движении ползунка.
+const fmtGain = (value) => `${value.toFixed(1)} дБ`;
+const fmtPitch = (value) => `${value.toFixed(1)} пт`;
+const fmtRms = (value) => value.toFixed(2);
+const fmtPause = (value) => (value === null ? 'общая' : `${value} мс`);
 
 function voiceTags(voice) {
   const label = voice.gender === 'male' ? 'муж.' : voice.gender === 'female' ? 'жен.' : '—';
@@ -80,7 +268,18 @@ function voiceTags(voice) {
   if (voice.ref_text_warning) {
     tags.push(`<span class="tag warn" title="${esc(voice.ref_text_warning)}">⚠ расшифровка</span>`);
   }
+  if (voice.band_warning) {
+    tags.push(`<span class="tag warn" title="${esc(voice.band_warning)}">⚠ узкая полоса</span>`);
+  }
   return tags.join('');
+}
+
+// Монограмма в карточке: первые буквы первых двух слов имени (Марго → МА).
+// Служебные символы выкидываются, иначе у имени вида «[demo] REF_EN» в квадрат
+// попадала бы скобка.
+function initials(name) {
+  const words = String(name || '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(/\s+/).filter(Boolean);
+  return words.length ? words.slice(0, 2).map((word) => word[0]).join('').toUpperCase() : '??';
 }
 
 // --- вкладки ------------------------------------------------------------------
@@ -105,7 +304,15 @@ async function loadVoices() {
 
 function previewState(voiceId) {
   if (!state.preview[voiceId]) {
-    state.preview[voiceId] = { speed: 1.0, cfg_strength: 2.0, nfe_step: 32, text: PREVIEW_TEXT };
+    const voice = voiceById(voiceId);
+    state.preview[voiceId] = {
+      speed: 1.0,
+      cfg_strength: 2.0,
+      nfe_step: 32,
+      // Ручки движка начинаются с сохранённых у голоса — тех же, что уйдут в диалог.
+      engine_params: voice ? { ...voice.engine_params } : {},
+      text: PREVIEW_TEXT,
+    };
   }
   return state.preview[voiceId];
 }
@@ -122,42 +329,61 @@ function renderVoiceCards() {
   }
   box.innerHTML = state.voices.map((voice) => {
     const cfg = previewState(voice.id);
+    const isF5 = voice.engine === ENGINE_F5;
+    // Движок читается по монограмме и тегу справа, поэтому подпись движка в
+    // подзаголовке короткая — расшифровка «ударения/не поддерживаются» ушла в
+    // подсказку тега (engineNote).
+    const tags = voiceTags(voice)
+      + (voice.ref_text ? '' : '<span class="tag warn" title="Без референс-текста синтез невозможен">нет текста</span>');
     return `
       <div class="card" data-voice-id="${esc(voice.id)}">
-        <div class="card-title">
-          <span class="swatch"></span>${esc(voice.name)}
-          ${voiceTags(voice)}
-          ${voice.ref_text ? '' : '<span class="tag warn" title="Без референс-текста синтез невозможен">нет текста</span>'}
+        <div class="voice-top">
+          <span class="avatar${isF5 ? '' : ' violet'}">${esc(initials(voice.name))}</span>
+          <div class="voice-name">
+            <h3>${esc(voice.name)}</h3>
+            <p data-role="engine-note" title="${esc(engineNote(voice.engine))}">${esc(engineLabel(voice.engine))}</p>
+          </div>
+          <span class="engine-tag${isF5 ? '' : ' violet'}" title="${esc(engineNote(voice.engine))}">${esc(voice.engine.toUpperCase())}</span>
+        </div>
+        <div class="tag-row">
+          ${tags}
           <button class="tiny ghost danger" data-role="delete" style="margin-left:auto">удалить</button>
         </div>
-        ${voice.ref_text ? `<div class="muted ref-text">в референсе: «${esc(voice.ref_text)}»</div>` : ''}
+        ${voice.ref_text ? `<div class="ref-text">в референсе: «${esc(voice.ref_text)}»</div>` : ''}
+
+        <label class="field">
+          <span>Движок синтеза</span>
+          <select data-role="engine">${engineOptionsHtml(voice.engine)}</select>
+        </label>
 
         <div class="grid-2">
           <label class="field">
             <span class="slider-head">Скорость речи <b data-role="speed-label">${cfg.speed.toFixed(2)}x</b></span>
             <input type="range" data-role="speed" min="0.5" max="2" step="0.05" value="${cfg.speed}" />
           </label>
-          <label class="field">
+          <label class="field" data-role="f5-params" ${isF5 ? '' : 'hidden'}>
             <span class="slider-head">CFG strength <b data-role="cfg-label">${cfg.cfg_strength.toFixed(1)}</b></span>
             <input type="range" data-role="cfg" min="1" max="4" step="0.1" value="${cfg.cfg_strength}" />
           </label>
         </div>
 
-        <label class="field">
+        <label class="field" data-role="f5-params" ${isF5 ? '' : 'hidden'}>
           <span>NFE steps — быстрее ↔ качественнее</span>
           <select data-role="nfe">
             ${nfeOptions(cfg.nfe_step)}
           </select>
         </label>
 
+        <div data-role="engine-params">${engineParamsHtml(voice.engine, cfg.engine_params)}</div>
+
         <label class="field">
           <span>Фраза для прослушивания</span>
           <input type="text" data-role="preview-text" value="${esc(cfg.text)}" />
         </label>
 
-        <div class="row">
+        <div class="test-row">
           <button class="tiny primary" data-role="preview">Прослушать</button>
-          <span class="muted" data-role="preview-status"></span>
+          <span class="muted preview-status" data-role="preview-status"></span>
         </div>
         <audio data-role="player" controls hidden></audio>
       </div>`;
@@ -181,6 +407,8 @@ async function previewVoice(card) {
   if (state.previewJob) { setPreviewStatus(card, 'дождитесь окончания текущей генерации'); return; }
 
   setPreviewStatus(card, 'ставлю в очередь…');
+  // Движок голоса может подниматься прямо сейчас — следим за его состоянием в шапке.
+  watchEngines();
   try {
     const job = await api('/api/preview', {
       method: 'POST',
@@ -191,6 +419,7 @@ async function previewVoice(card) {
         speed: cfg.speed,
         cfg_strength: cfg.cfg_strength,
         nfe_step: cfg.nfe_step,
+        engine_params: cfg.engine_params,
       }),
     });
     state.previewJob = { jobId: job.job_id, voiceId };
@@ -235,6 +464,43 @@ async function pollPreview() {
   }
 }
 
+// Смена движка у готового голоса: выбор сохраняется на бэкенде, запись референса
+// не трогается. Ручки прошлого движка к новому не относятся, поэтому бэкенд их
+// сбрасывает (voices_store.update) — перечитываем голоса, чтобы карточка показала
+// набор настроек нового движка.
+async function changeVoiceEngine(card, engineId) {
+  const voiceId = card.dataset.voiceId;
+  showAlert($('voice-error'), '');
+  try {
+    const voice = await api(`/api/voices/${voiceId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ engine: engineId }),
+    });
+    delete state.preview[voiceId];
+    await loadVoices();
+    showAlert($('voice-error'), `Голос «${voice.name}» переведён на ${engineLabel(voice.engine)}`, 'info');
+  } catch (error) {
+    // Селект уже показывает новый движок, которого на бэкенде нет — возвращаем как было.
+    showAlert($('voice-error'), error.message);
+    renderVoiceCards();
+  }
+}
+
+// Ручки движка сохраняются у голоса и работают его настройками по умолчанию:
+// карточка слота в диалоге может их переопределить на одну генерацию.
+async function saveVoiceEngineParams(voiceId, params) {
+  try {
+    await api(`/api/voices/${voiceId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ engine_params: params }),
+    });
+  } catch (error) {
+    showAlert($('voice-error'), error.message);
+  }
+}
+
 async function recognizeRefText() {
   const file = $('new-voice-file').files[0];
   const status = $('recognize-status');
@@ -266,19 +532,29 @@ async function createVoice() {
   const file = $('new-voice-file').files[0];
   const status = $('new-voice-status');
   const refText = $('new-voice-ref-text').value.trim();
+  const verify = $('new-voice-verify').checked;
+  const denoise = $('new-voice-denoise').checked;
   showAlert($('voice-error'), '');
-  if (!file) { status.textContent = 'выберите аудиофайл'; return; }
+  if (!file) { status.textContent = 'выберите аудиофайл или запишите голос'; return; }
 
   const form = new FormData();
   form.append('name', $('new-voice-name').value.trim() || 'Новый голос');
   form.append('gender', $('new-voice-gender').value);
+  // Движок сохраняется вместе с голосом: все диалоги этим голосом пойдут через него.
+  form.append('engine', $('new-voice-engine').value);
   form.append('ref_text', refText);
+  // Без сверки бэкенд берёт расшифровку как есть: для записанного голоса текст
+  // прочитан с экрана, и распознавание здесь было бы лишними десятками секунд.
+  form.append('verify_ref_text', verify ? '1' : '0');
+  // Очистка референса — опциональная зависимость: бэкенд чистит запись до всех
+  // проверок, чтобы F0, полоса и расшифровка считались по той же записи, что уйдёт в модель.
+  form.append('denoise', denoise ? '1' : '0');
   form.append('file', file);
 
-  // Пустое поле бэкенд заполняет расшифровкой сам — это десятки секунд.
-  status.textContent = refText
-    ? 'сверяю расшифровку с записью и сохраняю…'
-    : 'распознаю речь и сохраняю… это занимает до минуты';
+  const cleaning = denoise ? 'чищу запись от шума, ' : '';
+  if (!verify) status.textContent = `${cleaning}сохраняю голос…`;
+  else if (refText) status.textContent = `${cleaning}сверяю расшифровку с записью и сохраняю…`;
+  else status.textContent = `${cleaning}распознаю речь и сохраняю… это занимает до минуты`;
   try {
     const voice = await api('/api/voices', { method: 'POST', body: form });
     status.textContent = 'голос сохранён';
@@ -286,11 +562,19 @@ async function createVoice() {
     $('new-voice-name').value = '';
     $('new-voice-ref-text').value = '';
     $('recognize-status').textContent = '';
+    // Очистка — разовая операция при сохранении, а не свойство голоса: снимаем галочку.
+    $('new-voice-denoise').checked = false;
     resetDropZone();
+    resetRecording();
+    // Форма обнуляется вместе с выбором движка: подсказка по полу снова в силе.
+    state.engineTouched = false;
+    $('new-voice-engine').value = suggestedEngine($('new-voice-gender').value);
+    updateNewVoiceEngineNote();
     await loadVoices();
     const notes = [];
     if (voice.gender_warning) notes.push(voice.gender_warning);
     if (voice.ref_text_warning) notes.push(voice.ref_text_warning);
+    if (voice.band_warning) notes.push(voice.band_warning);
     if (voice.is_demo) notes.push(`Загружена копия демо-файла F5-TTS (${voice.demo_source}) — это не пользовательская запись.`);
     if (notes.length) showAlert($('voice-error'), notes.join('\n'), 'info');
   } catch (error) {
@@ -303,6 +587,248 @@ function resetDropZone() {
   const drop = $('new-voice-drop');
   drop.textContent = DROP_HINT;
   drop.classList.remove('has-file', 'over');
+}
+
+// --- запись голоса с микрофона -------------------------------------------------
+function recordFormat() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  return RECORD_FORMATS.find(([mime]) => MediaRecorder.isTypeSupported(mime)) || null;
+}
+
+function showRecordPhrase() {
+  const index = parseInt($('record-phrase').value || '0', 10);
+  const phrase = RECORD_PHRASES[index] || RECORD_PHRASES[0];
+  $('record-phrase-text').textContent = phrase.text;
+}
+
+function renderRecordPhrases() {
+  $('record-phrase').innerHTML = RECORD_PHRASES
+    .map((phrase, index) => `<option value="${index}">${esc(phrase.label)}</option>`)
+    .join('');
+  showRecordPhrase();
+}
+
+function setRecordStatus(message) {
+  $('record-status').textContent = message;
+}
+
+// Встроенный браузер IDE (Electron) до микрофона не допускается: разрешение выдаёт
+// оболочка приложения, а не страница, поэтому запрос даже не показывается — вызов
+// отклоняется сразу. Отличить его от обычного браузера можно по UA, иначе
+// пользователь ищет настройку в браузере, которого перед ним нет.
+const isEmbeddedBrowser = () => /Electron/i.test(navigator.userAgent || '');
+
+function recordErrorMessage(error) {
+  switch (error.name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      if (isEmbeddedBrowser()) {
+        return 'Микрофон недоступен: дашборд открыт во встроенном браузере IDE, а он доступа '
+          + 'к микрофону не имеет. Разрешите IDE доступ в «Системные настройки → '
+          + 'Конфиденциальность и безопасность → Микрофон» и перезапустите её — либо откройте '
+          + `${location.origin} в Safari или Chrome, там запрос появится сам.`;
+      }
+      return 'Доступ к микрофону запрещён. Разрешите его для этой страницы в настройках браузера и нажмите «Записать» снова.';
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'Микрофон не найден. Подключите его или загрузите готовый файл слева.';
+    case 'NotReadableError':
+      return 'Микрофон занят другим приложением — закройте его и попробуйте снова.';
+    default:
+      return `Не удалось начать запись: ${error.message || error.name}`;
+  }
+}
+
+async function startRecording() {
+  showAlert($('record-error'), '');
+  showAlert($('record-notes'), '');
+
+  const format = recordFormat();
+  if (!format) {
+    showAlert($('record-error'), 'Браузер не умеет записывать звук. Загрузите готовый файл.');
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    // getUserMedia работает только в защищённом контексте: localhost тоже подходит.
+    showAlert($('record-error'), 'Запись с микрофона доступна только на localhost или по https.');
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (error) {
+    showAlert($('record-error'), recordErrorMessage(error));
+    return;
+  }
+
+  const record = state.record;
+  const recorder = new MediaRecorder(stream, { mimeType: format[0] });
+  record.stream = stream;
+  record.recorder = recorder;
+  record.chunks = [];
+  record.suffix = format[1];
+  record.startedAt = Date.now();
+  record.peak = 0;
+
+  recorder.addEventListener('dataavailable', (event) => {
+    if (event.data.size) record.chunks.push(event.data);
+  });
+  recorder.addEventListener('stop', finishRecording);
+  recorder.start();
+
+  // Индикатор уровня: без него не видно ни «говорю в тишину», ни перегрузки.
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  record.ctx = ctx;
+  record.analyser = analyser;
+  $('record-meter').hidden = false;
+  drawRecordMeter();
+
+  // Остановка по таймеру — страховка от забытой записи: распознавать минуту
+  // молчания всё равно нечего, а референс длиннее 12 секунд модель обрежет.
+  record.autoStop = setTimeout(stopRecording, RECORD_MAX_MS);
+  record.tick = setInterval(() => {
+    setRecordStatus(`идёт запись · ${((Date.now() - record.startedAt) / 1000).toFixed(1)} с`);
+  }, 200);
+
+  $('btn-record').textContent = 'Стоп';
+  setRecordStatus('идёт запись · 0.0 с');
+}
+
+function stopRecording() {
+  const record = state.record;
+  if (!record.recorder) return;
+  clearTimeout(record.autoStop);
+  clearInterval(record.tick);
+  record.autoStop = null;
+  record.tick = null;
+  if (record.recorder.state !== 'inactive') record.recorder.stop();
+}
+
+function drawRecordMeter() {
+  const record = state.record;
+  const canvas = $('record-meter');
+  if (!record.analyser || canvas.hidden) return;
+  const data = new Uint8Array(record.analyser.fftSize);
+  record.analyser.getByteTimeDomainData(data);
+  let peak = 0;
+  for (const sample of data) peak = Math.max(peak, Math.abs(sample - 128) / 128);
+  // Пик держим с затуханием: мгновенное значение мелькает быстрее, чем глаз успевает
+  // заметить перегрузку.
+  record.peak = Math.max(peak, record.peak * 0.9);
+  drawMeterBar(canvas, record.peak);
+  record.raf = requestAnimationFrame(drawRecordMeter);
+}
+
+function drawMeterBar(canvas, peak) {
+  const ctx = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const barHeight = height - 14;
+  const level = Math.min(peak, 1);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#12151c';
+  ctx.fillRect(0, 0, width, barHeight);
+  ctx.fillStyle = peak >= CLIPPING_LEVEL ? '#e2585f' : peak >= 0.7 ? '#e8a33d' : '#34c38f';
+  ctx.fillRect(0, 0, level * width, barHeight);
+  ctx.fillStyle = '#2c3444';
+  ctx.fillRect(CLIPPING_LEVEL * width, 0, Math.max(width - CLIPPING_LEVEL * width, 1), barHeight);
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.fillStyle = peak >= CLIPPING_LEVEL ? '#ffb9bd' : '#8d99ab';
+  ctx.fillText(
+    peak >= CLIPPING_LEVEL ? 'перегрузка — убавьте усиление микрофона' : 'уровень записи',
+    2,
+    height - 2,
+  );
+}
+
+function finishRecording() {
+  const record = state.record;
+  record.recorder = null;
+  // Дорожку и аудиоконтекст закрываем всегда: иначе браузер продолжает считать,
+  // что идёт захват микрофона, и не гасит индикатор записи.
+  if (record.stream) record.stream.getTracks().forEach((track) => track.stop());
+  record.stream = null;
+  if (record.raf) cancelAnimationFrame(record.raf);
+  record.raf = null;
+  if (record.ctx) record.ctx.close();
+  record.ctx = null;
+  record.analyser = null;
+  $('record-meter').hidden = true;
+  $('btn-record').textContent = 'Записать заново';
+
+  const blob = new Blob(record.chunks, { type: record.chunks.length ? record.chunks[0].type : '' });
+  record.chunks = [];
+  if (!blob.size) {
+    setRecordStatus('—');
+    showAlert($('record-error'), 'Запись получилась пустой — проверьте, что выбран верный микрофон.');
+    return;
+  }
+
+  const file = new File([blob], `recording.${record.suffix}`, { type: blob.type });
+  const player = $('record-player');
+  if (record.url) URL.revokeObjectURL(record.url);
+  record.url = URL.createObjectURL(file);
+  player.src = record.url;
+  player.hidden = false;
+
+  // Записанный файл кладём в тот же input, что и загруженный: дальше сохранение,
+  // кнопка «распознать» и все проверки работают без отдельной ветки кода.
+  const transfer = new DataTransfer();
+  transfer.items.add(file);
+  $('new-voice-file').files = transfer.files;
+  record.file = file;
+  const drop = $('new-voice-drop');
+  drop.textContent = `${file.name} · запись с микрофона`;
+  drop.classList.add('has-file');
+
+  // Текст прочитан с экрана и известен точно, поэтому сверку через Whisper
+  // (десятки секунд) по умолчанию выключаем — включить её можно галочкой ниже.
+  $('new-voice-ref-text').value = $('record-phrase-text').textContent;
+  $('new-voice-verify').checked = false;
+
+  analyzeRecording(file);
+}
+
+async function analyzeRecording(file) {
+  setRecordStatus('проверяю запись…');
+  const form = new FormData();
+  form.append('file', file);
+  form.append('gender', $('new-voice-gender').value);
+  try {
+    const report = await api('/api/voices/analyze', { method: 'POST', body: form });
+    const tone = report.f0_hz ? ` · тон ~${Math.round(report.f0_hz)} Гц` : '';
+    setRecordStatus(`записано ${report.duration_sec.toFixed(1)} с${tone}`);
+    if (report.warnings.length) {
+      showAlert($('record-notes'), report.warnings.join('\n\n'));
+    } else {
+      showAlert(
+        $('record-notes'),
+        `Запись в порядке: ${report.duration_sec.toFixed(1)} с${tone}. Текст взят из эталонной `
+          + 'фразы, поэтому сверка через Whisper выключена — включите её, если хотите подстраховаться.',
+        'info',
+      );
+    }
+  } catch (error) {
+    setRecordStatus('запись готова, но проверить её не удалось');
+    showAlert($('record-notes'), error.message);
+  }
+}
+
+function resetRecording() {
+  const record = state.record;
+  if (record.url) URL.revokeObjectURL(record.url);
+  record.url = null;
+  record.file = null;
+  $('record-player').hidden = true;
+  $('record-player').removeAttribute('src');
+  $('btn-record').textContent = 'Записать';
+  $('new-voice-verify').checked = true;
+  setRecordStatus('до 20 секунд');
+  showAlert($('record-error'), '');
+  showAlert($('record-notes'), '');
 }
 
 // --- голоса диалога (слоты из маркеров и имена спикеров) ----------------------
@@ -321,9 +847,29 @@ function renderVoiceConfigs() {
     const markerTag = meta.slot === null
       ? ''
       : `<span class="tag">маркер (${meta.slot})</span>`;
+    // Набор настроек диктует движок выбранного голоса: у XTTS вместо CFG и NFE
+    // температура и штраф за повторы. Движок можно смешивать в одном диалоге —
+    // каждый слот считает свой набор.
+    const voice = voiceById(cfg.voice_id);
+    // Слот стартует с ручек, сохранённых у голоса: иначе он отправил бы дефолты
+    // движка и молча перекрыл бы настройки голоса (см. audio_pipeline._engine_params).
+    if (voice && !Object.keys(cfg.engine_params).length) {
+      cfg.engine_params = engineParamsFor(voice.engine, voice.engine_params);
+    }
+    const note = voice
+      ? engineNote(voice.engine)
+      : 'выберите голос — набор настроек появится под движок этого голоса';
     return `
       <div class="card" data-voice="${esc(key)}">
-        <div class="card-title"><span class="swatch"></span>${esc(meta.label)} ${markerTag}</div>
+        <div class="voice-top">
+          <span class="avatar${voice && voice.engine !== ENGINE_F5 ? ' violet' : ''}">${esc(initials(meta.label))}</span>
+          <div class="voice-name">
+            <h3>${esc(meta.label)}</h3>
+            <p data-role="engine-note">${esc(note)}</p>
+          </div>
+          ${voice ? `<span class="engine-tag${voice.engine === ENGINE_F5 ? '' : ' violet'}" title="${esc(engineNote(voice.engine))}">${esc(voice.engine.toUpperCase())}</span>` : ''}
+        </div>
+        ${markerTag ? `<div class="tag-row">${markerTag}</div>` : ''}
 
         <label class="field">
           <span>Голос</span>
@@ -337,16 +883,45 @@ function renderVoiceConfigs() {
           <span class="slider-head">Скорость речи <b data-role="speed-label">${cfg.speed.toFixed(2)}x</b></span>
           <input type="range" data-role="speed" min="0.5" max="2" step="0.05" value="${cfg.speed}" />
         </label>
-        <label class="field">
-          <span class="slider-head">CFG strength — стабильность ↔ выразительность <b data-role="cfg-label">${cfg.cfg_strength.toFixed(1)}</b></span>
-          <input type="range" data-role="cfg" min="1" max="4" step="0.1" value="${cfg.cfg_strength}" />
-        </label>
-        <label class="field" style="margin-bottom:0">
-          <span>NFE steps — быстрее ↔ качественнее</span>
-          <select data-role="nfe">
-            ${nfeOptions(cfg.nfe_step)}
-          </select>
-        </label>
+        <div data-role="engine-params">${voice ? engineParamsHtml(voice.engine, cfg.engine_params) : ''}</div>
+        <div data-role="f5-params" ${voice && voice.engine === ENGINE_F5 ? '' : 'hidden'}>
+          <label class="field">
+            <span class="slider-head">CFG strength — стабильность ↔ выразительность <b data-role="cfg-label">${cfg.cfg_strength.toFixed(1)}</b></span>
+            <input type="range" data-role="cfg" min="1" max="4" step="0.1" value="${cfg.cfg_strength}" />
+          </label>
+          <label class="field" style="margin-bottom:0">
+            <span>NFE steps — быстрее ↔ качественнее</span>
+            <select data-role="nfe">
+              ${nfeOptions(cfg.nfe_step)}
+            </select>
+          </label>
+        </div>
+
+        <details class="advanced">
+          <summary>Ещё настройки голоса</summary>
+          <label class="field">
+            <span class="slider-head">Громкость <b data-role="gain-label">${fmtGain(cfg.gain_db)}</b></span>
+            <input type="range" data-role="gain" min="-20" max="20" step="0.5" value="${cfg.gain_db}" />
+          </label>
+          <label class="field">
+            <span class="slider-head">Питч-шифт <b data-role="pitch-label">${fmtPitch(cfg.pitch_semitones)}</b></span>
+            <input type="range" data-role="pitch" min="-12" max="12" step="0.5" value="${cfg.pitch_semitones}" />
+            <span class="muted">экспериментально: меняет высоту тона, а не пол голоса</span>
+          </label>
+          <label class="field">
+            <span class="slider-head">Целевая громкость куска (RMS) <b data-role="rms-label">${fmtRms(cfg.target_rms)}</b></span>
+            <input type="range" data-role="rms" min="0.02" max="0.3" step="0.01" value="${cfg.target_rms}" />
+          </label>
+          <div class="field" style="margin-bottom:0">
+            <span class="slider-head">Пауза перед репликами <b data-role="pause-label">${fmtPause(cfg.pause_override_ms)}</b></span>
+            <input type="range" data-role="pause-override" min="0" max="5000" step="50"
+                   value="${cfg.pause_override_ms ?? 400}" ${cfg.pause_override_ms === null ? 'disabled' : ''} />
+            <label class="toggle">
+              <input type="checkbox" data-role="pause-inherit" ${cfg.pause_override_ms === null ? 'checked' : ''} />
+              как в общих настройках
+            </label>
+          </div>
+        </details>
       </div>`;
   }).join('');
 }
@@ -361,7 +936,10 @@ async function syncVoices({ silent = false } = {}) {
     parsed = await api('/api/parse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dialogue_text: $('dialogue').value }),
+      body: JSON.stringify({
+        dialogue_text: $('dialogue').value,
+        chunk_strategy: $('chunk-strategy').value,
+      }),
     });
   } catch (error) {
     if (!silent) showAlert($('parse-error'), error.message);
@@ -410,6 +988,15 @@ function readCardConfigs() {
     cfg.speed = parseFloat(card.querySelector('[data-role="speed"]').value);
     cfg.cfg_strength = parseFloat(card.querySelector('[data-role="cfg"]').value);
     cfg.nfe_step = parseInt(card.querySelector('[data-role="nfe"]').value, 10);
+    cfg.gain_db = parseFloat(card.querySelector('[data-role="gain"]').value);
+    cfg.pitch_semitones = parseFloat(card.querySelector('[data-role="pitch"]').value);
+    cfg.target_rms = parseFloat(card.querySelector('[data-role="rms"]').value);
+    cfg.pause_override_ms = card.querySelector('[data-role="pause-inherit"]').checked
+      ? null
+      : parseInt(card.querySelector('[data-role="pause-override"]').value, 10);
+    // Ручки движка (temperature у XTTS и т.п.) — в слот идут как переопределение
+    // настроек голоса; F5-специфичные cfg/nfe остаются отдельными полями.
+    cfg.engine_params = readEngineParams(card);
   });
 }
 
@@ -449,11 +1036,17 @@ async function generate() {
     cross_fade_duration: parseFloat($('crossfade').value),
     auto_accent: $('auto-accent').checked,
     output_format: $('output-format').value,
+    chunk_strategy: $('chunk-strategy').value,
   };
 
   $('btn-generate').disabled = true;
   $('player').hidden = true;
   $('download-link').hidden = true;
+  // Список реплик относится к прошлому файлу — до готовности нового он неактуален.
+  state.doneJobId = null;
+  stopVariant();
+  $('replicas-block').hidden = true;
+  $('replica-list').innerHTML = '';
   setProgress(0);
 
   try {
@@ -465,6 +1058,7 @@ async function generate() {
     state.jobId = job.job_id;
     $('job-status').textContent = `задача ${job.job_id}: в очереди`;
     state.pollTimer = setInterval(pollJob, 1500);
+    watchEngines();
   } catch (error) {
     showAlert($('job-error'), error.message);
     state.jobId = null;
@@ -506,6 +1100,8 @@ async function pollJob() {
       link.href = `${job.audio_url}?download=true`;
       link.download = `dialogue.${job.output_format}`;
       link.hidden = false;
+      state.doneJobId = job.job_id;
+      renderReplicas(job.replicas);
     }
     updateGenerateButton();
   } catch (error) {
@@ -517,6 +1113,164 @@ async function pollJob() {
   }
 }
 
+// --- перегенерация отдельной реплики ------------------------------------------
+function renderReplicas(replicas) {
+  const block = $('replicas-block');
+  const box = $('replica-list');
+  if (!replicas || !replicas.length) {
+    block.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  // Разметка строк пересобирается целиком, поэтому прослушивание варианта,
+  // начатое до обновления статуса, надо остановить — иначе кнопка осталась бы
+  // в состоянии «стоп» у строки, которой уже нет.
+  stopVariant();
+  // Текст реплики длинный — в строке он обрезается CSS, полный виден в подсказке.
+  box.innerHTML = replicas.map((replica) => `
+    <div class="replica-row" data-index="${replica.index}">
+      <span class="replica-label">${esc(replica.label)}</span>
+      <span class="replica-text" title="${esc(replica.text)}">${esc(replica.text)}</span>
+      <span class="replica-seed muted">${seedText(replica.seed)}</span>
+      <button class="tiny" data-role="regen">заново</button>
+    </div>
+    ${renderVariants(replica)}`).join('');
+  block.hidden = false;
+}
+
+// Список вариантов появляется после первой перегенерации: пока звучание одно,
+// список из одного пункта был бы шумом. Активный вариант — то, что в файле.
+function renderVariants(replica) {
+  const variants = replica.variants || [];
+  if (variants.length < 2) return '';
+  const rows = variants.map((variant) => `
+    <div class="variant-row" data-index="${replica.index}" data-variant="${esc(variant.id)}">
+      <button class="tiny" data-role="variant-play">слушать</button>
+      <span class="variant-label">${esc(variant.label)}${variant.active ? ' · в файле' : ''}</span>
+      <span class="muted">${variant.duration_sec} с · ${seedText(variant.seed)}</span>
+      ${variant.active ? '' : '<button class="tiny" data-role="variant-pick">поставить</button>'}
+    </div>`).join('');
+  return `<div class="variant-list">${rows}</div>`;
+}
+
+function seedText(seed) {
+  return seed === null || seed === undefined ? 'без сида' : `сид ${seed}`;
+}
+
+function setRegenBusy(busy) {
+  document.querySelectorAll('#replica-list button').forEach((button) => {
+    button.disabled = busy;
+  });
+  if (!busy) {
+    document.querySelectorAll('#replica-list [data-role="regen"]').forEach((button) => {
+      button.textContent = 'заново';
+    });
+  }
+}
+
+async function regenerateReplica(index, button) {
+  const jobId = state.doneJobId;
+  if (!jobId || state.regenTimer) return;
+  showAlert($('job-error'), '');
+  setRegenBusy(true);
+  button.textContent = 'генерирую…';
+  try {
+    await api(`/api/jobs/${jobId}/replicas/${index}/regenerate`, { method: 'POST' });
+  } catch (error) {
+    setRegenBusy(false);
+    showAlert($('job-error'), error.message);
+    return;
+  }
+  startRegenPoll(jobId, index);
+}
+
+async function selectVariant(index, variantId, button) {
+  const jobId = state.doneJobId;
+  if (!jobId || state.regenTimer) return;
+  showAlert($('job-error'), '');
+  setRegenBusy(true);
+  button.textContent = 'ставлю…';
+  try {
+    await api(`/api/jobs/${jobId}/replicas/${index}/variants/${variantId}`, { method: 'POST' });
+  } catch (error) {
+    setRegenBusy(false);
+    showAlert($('job-error'), error.message);
+    return;
+  }
+  startRegenPoll(jobId, index);
+}
+
+// Опрос один на перегенерацию и на выбор варианта: для интерфейса это одно
+// состояние — «реплика занята, файл скоро обновится».
+function startRegenPoll(jobId, index) {
+  state.regenIndex = index;
+  state.regenTimer = setInterval(() => pollRegenerate(jobId), 1500);
+}
+
+async function pollRegenerate(jobId) {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    // Бэкенд снимает флаг в самом конце — и при успехе, и при ошибке.
+    if (job.regenerating_replica !== null) return;
+    clearInterval(state.regenTimer);
+    state.regenTimer = null;
+    setRegenBusy(false);
+    if (job.regen_error) {
+      showAlert($('job-error'), `Не удалось пересобрать реплику: ${job.regen_error}`);
+      return;
+    }
+    $('job-status').textContent = `готово · ${job.duration_sec} с аудио`;
+    // Варианты и сид изменились вместе с файлом — список реплик берём из статуса,
+    // а не правим на месте: так он не разойдётся с тем, что лежит на диске.
+    if (job.replicas) renderReplicas(job.replicas);
+    // Тот же URL, но содержимое файла новое — без метки времени браузер отдал бы кэш.
+    $('player').src = `${job.audio_url}?t=${Date.now()}`;
+  } catch (error) {
+    clearInterval(state.regenTimer);
+    state.regenTimer = null;
+    setRegenBusy(false);
+    showAlert($('job-error'), error.message);
+  }
+}
+
+// --- прослушивание вариантов реплики ------------------------------------------
+function variantKey(index, variantId) {
+  return `${index}:${variantId}`;
+}
+
+function toggleVariant(index, variantId) {
+  const player = $('variant-player');
+  const key = variantKey(index, variantId);
+  if (state.variantKey === key && !player.paused) {
+    player.pause();
+    return;
+  }
+  state.variantKey = key;
+  player.src = `/api/jobs/${state.doneJobId}/replicas/${index}/variants/${variantId}/audio`;
+  // play() отказывается промисом, а не исключением: молча оставить это нельзя —
+  // кнопка показывала бы «стоп» у варианта, который не звучит.
+  player.play().catch((error) => {
+    state.variantKey = null;
+    markVariantPlaying(false);
+    showAlert($('job-error'), `Не удалось воспроизвести вариант: ${error.message}`);
+  });
+}
+
+function markVariantPlaying(playing) {
+  document.querySelectorAll('#replica-list [data-role="variant-play"]').forEach((button) => {
+    const row = button.closest('.variant-row');
+    const key = variantKey(row.dataset.index, row.dataset.variant);
+    button.textContent = playing && key === state.variantKey ? 'стоп' : 'слушать';
+  });
+}
+
+function stopVariant() {
+  const player = $('variant-player');
+  player.pause();
+  player.removeAttribute('src');
+  state.variantKey = null;
+}
+
 // --- сплошной текст (один голос на весь файл) ---------------------------------
 function renderTextVoiceOptions() {
   const select = $('text-voice');
@@ -525,7 +1279,35 @@ function renderTextVoiceOptions() {
     state.voices.map((v) => `<option value="${esc(v.id)}">${esc(v.name)}</option>`).join('');
   const fallback = state.voices.length ? state.voices[0].id : '';
   select.value = state.voices.some((v) => v.id === current) ? current : fallback;
+  renderTextEngineParams();
   updateTextButton();
+}
+
+// Набор настроек здесь тоже диктует движок голоса: CFG и NFE есть только у F5,
+// у XTTS — температура и штраф за повторы.
+function renderTextEngineParams() {
+  const voice = voiceById($('text-voice').value);
+  const box = $('text-engine-params');
+  if (!voice) {
+    box.innerHTML = '';
+    $('text-engine-note').textContent = '';
+    $('text-f5-params').hidden = true;
+    state.textEngineVoice = '';
+    state.textEngineParams = {};
+    return;
+  }
+  // Правки в блоке относятся к конкретному голосу: при смене голоса берём
+  // сохранённые ручки нового, а не значения предыдущего. Перерисовка блока по
+  // другой причине (обновился список голосов) значения не сбрасывает.
+  const sameVoice = state.textEngineVoice === voice.id;
+  state.textEngineVoice = voice.id;
+  state.textEngineParams = engineParamsFor(
+    voice.engine,
+    sameVoice ? readEngineParams(box) : voice.engine_params,
+  );
+  box.innerHTML = engineParamsHtml(voice.engine, state.textEngineParams);
+  $('text-engine-note').textContent = engineNote(voice.engine);
+  $('text-f5-params').hidden = voice.engine !== ENGINE_F5;
 }
 
 function updateTextSummary() {
@@ -571,10 +1353,15 @@ async function renderText() {
     speed: parseFloat($('text-speed').value),
     cfg_strength: parseFloat($('text-cfg').value),
     nfe_step: parseInt($('text-nfe').value, 10),
+    engine_params: readEngineParams($('text-engine-params')),
+    gain_db: parseFloat($('text-gain').value),
+    pitch_semitones: parseFloat($('text-pitch').value),
+    target_rms: parseFloat($('text-rms').value),
     pause_ms: parseInt($('text-pause').value, 10),
     cross_fade_duration: parseFloat($('text-crossfade').value),
     auto_accent: $('text-auto-accent').checked,
     output_format: $('text-output-format').value,
+    chunk_strategy: $('text-chunk-strategy').value,
   };
 
   $('btn-render-text').disabled = true;
@@ -591,6 +1378,7 @@ async function renderText() {
     state.textJobId = job.job_id;
     $('text-job-status').textContent = `задача ${job.job_id}: кусков ${job.total_replicas}`;
     state.textPollTimer = setInterval(pollTextJob, 1500);
+    watchEngines();
   } catch (error) {
     showAlert($('text-job-error'), error.message);
     state.textJobId = null;
@@ -639,46 +1427,100 @@ async function pollTextJob() {
 }
 
 // --- статус модели ------------------------------------------------------------
+// Состояние движков видно в шапке: XTTS поднимается 20–40 секунд при первом
+// обращении к ней, и без этого в интерфейсе не отличить «ещё грузится» от «упало».
+const ENGINE_STATES = {
+  idle: 'не загружен',
+  loading: 'загружается',
+  ready: 'готов',
+  failed: 'ОШИБКА',
+};
+
+// Опрос статуса прекращается, когда F5 и RUAccent устоялись, — но движок,
+// выбранный у голоса, поднимается позже, уже во время генерации. Поэтому перед
+// запуском задачи опрос включаем снова.
+function watchEngines() {
+  if (!state.statusTimer) state.statusTimer = setInterval(refreshStatus, 4000);
+  refreshStatus();
+}
+
 async function refreshStatus() {
   const dot = $('status-dot');
   const text = $('status-text');
   try {
     const status = await api('/api/status');
     state.modelReady = status.model_loaded;
+    const engines = status.engines || [];
+    const failedEngine = engines.find((e) => e.state === 'failed');
+    const loadingEngines = engines.filter((e) => e.state === 'loading');
 
     // Устройство известно только после загрузки модели: не показываем «на null».
     const model = status.model_loaded
       ? `модель готова · ${status.device || 'устройство неизвестно'}`
       : `загружаю модель${status.device ? ` на ${status.device}` : ''}…`;
     const accent = {
-      ready: 'ударения: вкл',
-      failed: 'ударения: ОШИБКА',
-      loading: 'ударения: загружаются',
-      idle: 'ударения: загружаются',
-    }[status.accentizer_state] || `ударения: ${status.accentizer_state}`;
-    text.textContent = `${model} · ${accent}`;
+      ready: 'вкл',
+      failed: 'ОШИБКА',
+      loading: 'загружается',
+      idle: 'загружается',
+    }[status.accentizer_state] || status.accentizer_state;
+    const ready = status.model_loaded && !loadingEngines.length;
 
-    if (status.accentizer_state === 'failed') {
-      dot.className = 'dot err';
+    // Чипы в шапке показывают то же состояние, что раньше умещалось в одну строку,
+    // но по отдельным полям: подробности (модель, ошибки движка и ударений) уходят
+    // в подсказки, чтобы шапка не разрасталась.
+    text.textContent = failedEngine ? 'ошибка' : ready ? 'готов' : 'загрузка';
+    $('status-device').textContent = status.device || '—';
+    $('status-engines').textContent = engines.length
+      ? engines.map((e) => `${e.id.toUpperCase()} ${ENGINE_STATES[e.state] || e.state}`).join(' · ')
+      : 'не поднят';
+    $('status-accent').textContent = accent;
+    // Очистка референса — опциональная зависимость (DeepFilterNet). Нет её — гасим
+    // тумблер, а не роняем сохранение голоса ошибкой уже после нажатия кнопки.
+    const denoiseReady = status.denoise_available !== false;
+    $('new-voice-denoise').disabled = !denoiseReady;
+    $('new-voice-denoise-block').title = denoiseReady
+      ? ''
+      : 'Не установлен DeepFilterNet: ./venv/bin/pip install --no-deps -r requirements-denoise.txt';
+    if (!denoiseReady) $('new-voice-denoise').checked = false;
+    if (typeof status.rss_mb === 'number') {
+      $('status-mem').textContent = `${Math.round(status.rss_mb)} МБ`;
+      // Полоса показывает занятость памяти всей системы, а число рядом — RSS этого
+      // процесса: вместе видно и «сколько съели мы», и «есть ли ещё запас».
+      $('status-mem-bar').style.width = `${Math.min(100, status.system_mem_percent || 0)}%`;
+      $('status-mem-bar').closest('.memory').title =
+        `RSS процесса: ${status.rss_mb} МБ · системная память занята на ${status.system_mem_percent ?? '?'}%`;
+    }
+
+    if (failedEngine) {
+      dot.className = 'online-dot err';
+      text.title = `Движок «${failedEngine.label}» не поднялся: ${failedEngine.error || 'причина неизвестна'}`;
+    } else if (status.accentizer_state === 'failed') {
+      dot.className = 'online-dot err';
       text.title = status.accentizer_error
         ? `RUAccent не поднялся, синтез идёт без ударений: ${status.accentizer_error}`
         : 'RUAccent не поднялся, синтез идёт без ударений';
     } else {
-      dot.className = `dot ${status.model_loaded ? 'on' : 'busy'}`;
-      text.title = '';
+      dot.className = `online-dot${ready ? '' : ' busy'}`;
+      text.title = `${model} · ударения: ${accent}`;
     }
 
     // Прекращаем опрос, только когда устоялось и то, и другое: иначе статус
     // ударений замирал на «загружаются» — модель-то уже готова.
     const accentSettled = status.accentizer_state === 'ready' || status.accentizer_state === 'failed';
-    if (status.model_loaded && accentSettled) {
+    if (status.model_loaded && accentSettled && !loadingEngines.length) {
       clearInterval(state.statusTimer);
       state.statusTimer = null;
     }
   } catch (error) {
-    dot.className = 'dot err';
-    text.textContent = 'бэкенд недоступен';
+    dot.className = 'online-dot err';
+    text.textContent = 'нет связи';
     text.title = '';
+    $('status-device').textContent = '—';
+    $('status-engines').textContent = '—';
+    $('status-accent').textContent = '—';
+    $('status-mem').textContent = '—';
+    $('status-mem-bar').style.width = '0';
   }
   updateGenerateButton();
   updateTextButton();
@@ -692,11 +1534,37 @@ function bindEvents() {
 
   $('btn-detect').addEventListener('click', detectVoices);
   $('btn-generate').addEventListener('click', generate);
+  $('replica-list').addEventListener('click', (event) => {
+    const row = event.target.closest('.replica-row');
+    const regen = event.target.closest('button[data-role="regen"]');
+    if (regen && row) {
+      regenerateReplica(parseInt(row.dataset.index, 10), regen);
+      return;
+    }
+    const variant = event.target.closest('.variant-row');
+    if (!variant) return;
+    const index = parseInt(variant.dataset.index, 10);
+    const play = event.target.closest('button[data-role="variant-play"]');
+    if (play) {
+      toggleVariant(index, variant.dataset.variant);
+      return;
+    }
+    const pick = event.target.closest('button[data-role="variant-pick"]');
+    if (pick) selectVariant(index, variant.dataset.variant, pick);
+  });
+  const variantPlayer = $('variant-player');
+  variantPlayer.addEventListener('play', () => markVariantPlaying(true));
+  variantPlayer.addEventListener('pause', () => markVariantPlaying(false));
+  variantPlayer.addEventListener('ended', () => markVariantPlaying(false));
+  // Основной трек и отдельный вариант одновременно звучать не должны.
+  $('player').addEventListener('play', stopVariant);
   $('btn-reload-voices').addEventListener('click', () => loadVoices().catch((e) => alert(e.message)));
   $('btn-save-voice').addEventListener('click', createVoice);
   $('btn-recognize-voice').addEventListener('click', recognizeRefText);
 
   $('pause').addEventListener('input', (e) => { $('pause-value').textContent = `${e.target.value} мс`; });
+  // Смена стратегии меняет число реплик — сводка должна обновиться сама.
+  $('chunk-strategy').addEventListener('change', () => { syncVoices({ silent: true }); });
   $('crossfade').addEventListener('input', (e) => {
     $('crossfade-value').textContent = `${parseFloat(e.target.value).toFixed(2)} с`;
   });
@@ -727,7 +1595,10 @@ function bindEvents() {
   });
 
   $('text-body').addEventListener('input', () => { updateTextSummary(); updateTextButton(); });
-  $('text-voice').addEventListener('change', updateTextButton);
+  $('text-voice').addEventListener('change', () => { renderTextEngineParams(); updateTextButton(); });
+  $('text-engine-params').addEventListener('input', (event) => {
+    if (event.target.dataset.engineParam) updateEngineParamLabel($('text-engine-params'), event.target);
+  });
   $('btn-render-text').addEventListener('click', renderText);
   $('text-pause').addEventListener('input', (e) => { $('text-pause-value').textContent = `${e.target.value} мс`; });
   $('text-crossfade').addEventListener('input', (e) => {
@@ -739,6 +1610,15 @@ function bindEvents() {
   $('text-cfg').addEventListener('input', (e) => {
     $('text-cfg-label').textContent = parseFloat(e.target.value).toFixed(1);
   });
+  $('text-gain').addEventListener('input', (e) => {
+    $('text-gain-label').textContent = fmtGain(parseFloat(e.target.value));
+  });
+  $('text-pitch').addEventListener('input', (e) => {
+    $('text-pitch-label').textContent = fmtPitch(parseFloat(e.target.value));
+  });
+  $('text-rms').addEventListener('input', (e) => {
+    $('text-rms-label').textContent = fmtRms(parseFloat(e.target.value));
+  });
 
   // --- форма нового голоса ---
   const drop = $('new-voice-drop');
@@ -749,6 +1629,8 @@ function bindEvents() {
     if (!file) return;
     drop.textContent = file.name;
     drop.classList.add('has-file');
+    // У загруженного файла расшифровку проверить больше нечем — возвращаем сверку.
+    $('new-voice-verify').checked = true;
   });
   drop.addEventListener('dragover', (event) => {
     event.preventDefault();
@@ -763,6 +1645,29 @@ function bindEvents() {
     fileInput.files = event.dataTransfer.files;
     drop.textContent = file.name;
     drop.classList.add('has-file');
+    $('new-voice-verify').checked = true;
+  });
+
+  // --- запись голоса с микрофона ---
+  $('record-phrase').addEventListener('change', showRecordPhrase);
+  $('btn-record').addEventListener('click', () => {
+    // Одна кнопка на весь цикл: записать → стоп → записать заново.
+    if (state.record.recorder) stopRecording();
+    else startRecording();
+  });
+  // Пол проверяется по измеренному тону, поэтому смена пола пересчитывает проверку:
+  // иначе на карточке предупреждение будет, а до сохранения его не покажут.
+  $('new-voice-gender').addEventListener('change', () => {
+    if (state.record.file) analyzeRecording(state.record.file);
+    // Движок подсказывается полом, пока пользователь не выбрал его сам.
+    if (!state.engineTouched) {
+      $('new-voice-engine').value = suggestedEngine($('new-voice-gender').value);
+      updateNewVoiceEngineNote();
+    }
+  });
+  $('new-voice-engine').addEventListener('change', () => {
+    state.engineTouched = true;
+    updateNewVoiceEngineNote();
   });
 
   // --- карточки голосов ---
@@ -781,13 +1686,31 @@ function bindEvents() {
       card.querySelector('[data-role="cfg-label"]').textContent = cfg.cfg_strength.toFixed(1);
     }
     if (role === 'preview-text') cfg.text = event.target.value;
+    // Ручки движка проверяются прослушиванием, поэтому на движении ползунка их
+    // только запоминаем: запись на бэкенд происходит по отпусканию (change).
+    if (event.target.dataset.engineParam) {
+      updateEngineParamLabel(card, event.target);
+      cfg.engine_params = readEngineParams(card);
+    }
   });
 
   voiceCards.addEventListener('change', (event) => {
     const card = event.target.closest('.card');
     if (!card) return;
-    if (event.target.dataset.role === 'nfe') {
-      state.preview[card.dataset.voiceId].nfe_step = parseInt(event.target.value, 10);
+    const voiceId = card.dataset.voiceId;
+    const role = event.target.dataset.role;
+    if (role === 'nfe') {
+      state.preview[voiceId].nfe_step = parseInt(event.target.value, 10);
+    }
+    if (role === 'engine') {
+      changeVoiceEngine(card, event.target.value);
+    }
+    if (event.target.dataset.engineParam) {
+      // Значения ручек сохраняются у голоса — это его настройки по умолчанию,
+      // карточка слота в диалоге может переопределить их на одну генерацию.
+      const params = readEngineParams(card);
+      state.preview[voiceId].engine_params = params;
+      saveVoiceEngineParams(voiceId, params);
     }
   });
 
@@ -815,15 +1738,38 @@ function bindEvents() {
     const card = event.target.closest('.card');
     if (!card) return;
     const role = event.target.dataset.role;
-    if (role === 'speed') card.querySelector('[data-role="speed-label"]').textContent = `${parseFloat(event.target.value).toFixed(2)}x`;
-    if (role === 'cfg') card.querySelector('[data-role="cfg-label"]').textContent = parseFloat(event.target.value).toFixed(1);
+    const value = parseFloat(event.target.value);
+    if (role === 'speed') card.querySelector('[data-role="speed-label"]').textContent = `${value.toFixed(2)}x`;
+    if (role === 'cfg') card.querySelector('[data-role="cfg-label"]').textContent = value.toFixed(1);
+    if (role === 'gain') card.querySelector('[data-role="gain-label"]').textContent = fmtGain(value);
+    if (role === 'pitch') card.querySelector('[data-role="pitch-label"]').textContent = fmtPitch(value);
+    if (role === 'rms') card.querySelector('[data-role="rms-label"]').textContent = fmtRms(value);
+    if (role === 'pause-override') {
+      card.querySelector('[data-role="pause-label"]').textContent = fmtPause(parseInt(event.target.value, 10));
+    }
+    if (event.target.dataset.engineParam) updateEngineParamLabel(card, event.target);
     readCardConfigs();
     updateGenerateButton();
   });
 
   voiceConfigs.addEventListener('change', (event) => {
-    if (event.target.dataset.role === 'voice') {
+    const role = event.target.dataset.role;
+    if (role === 'pause-inherit') {
+      const card = event.target.closest('.card');
+      const range = card.querySelector('[data-role="pause-override"]');
+      range.disabled = event.target.checked;
+      card.querySelector('[data-role="pause-label"]').textContent = event.target.checked
+        ? fmtPause(null)
+        : fmtPause(parseInt(range.value, 10));
       readCardConfigs();
+      return;
+    }
+    if (role === 'voice') {
+      readCardConfigs();
+      // Набор ручек диктует движок голоса: значения прошлого движка к новому не
+      // относятся, поэтому блок пересобирается с сохранёнными ручками нового голоса.
+      state.configs[event.target.closest('.card').dataset.voice].engine_params = {};
+      renderVoiceConfigs();
       updateGenerateButton();
     }
   });
@@ -831,11 +1777,14 @@ function bindEvents() {
 
 // --- старт --------------------------------------------------------------------
 async function init() {
+  renderRecordPhrases();
   bindEvents();
   // Таймер создаём до первого опроса: если всё уже готово, refreshStatus его снимет.
   state.statusTimer = setInterval(refreshStatus, 4000);
   await refreshStatus();
   try {
+    // Паспорта движков — до голосов: и карточки, и форма рисуют по ним набор настроек.
+    await loadEngines();
     await loadVoices();
   } catch (error) {
     showAlert($('voice-error'), error.message);

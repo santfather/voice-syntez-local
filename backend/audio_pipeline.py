@@ -2,23 +2,27 @@
 
 import asyncio
 import logging
+import math
+import random
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from . import config
 from .accentizer import accentuate
 from .dialogue_parser import Replica
-from .tts_engine import SAMPLE_RATE, get_engine
+from .engines.base import SAMPLE_RATE, SynthesisEngine
+from .engines.registry import get_engine
+from .text_preprocess import normalize
 from .voices_store import Voice, get_store
 
 logger = logging.getLogger(__name__)
 
-# Целевая громкость куска: реплики разных голосов не должны «прыгать» по уровню.
-_TARGET_RMS = 0.1
+# Ограничитель пика после нормализации: выше 0 dBFS файл клипует.
 _PEAK_LIMIT = 0.99
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -30,14 +34,31 @@ class SpeakerSettings:
     speed: float = config.DEFAULT_SPEED
     cfg_strength: float = config.DEFAULT_CFG_STRENGTH
     nfe_step: int = config.DEFAULT_NFE_STEP
+    target_rms: float = config.DEFAULT_TARGET_RMS
+    gain_db: float = config.DEFAULT_GAIN_DB
+    pitch_semitones: float = config.DEFAULT_PITCH_SEMITONES
+    # Пауза перед репликами этого спикера; None — брать общую из RenderSettings.
+    # Имя отличается от общего `RenderSettings.pause_ms`: в одной модели запроса
+    # (режим «Сплошной текст») оба поля соседствуют, и совпадающие имена слились бы.
+    pause_override_ms: int | None = None
+    # Ручки движка этого голоса, переопределённые на одну генерацию (у XTTS —
+    # температура и штраф за повторы). То, чего здесь нет, берётся из карточки голоса.
+    engine_params: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "SpeakerSettings":
+        raw_pause = data.get("pause_override_ms")
+        raw_params = data.get("engine_params")
         return cls(
             voice_id=str(data.get("voice_id", "")),
             speed=float(data.get("speed", config.DEFAULT_SPEED)),
             cfg_strength=float(data.get("cfg_strength", config.DEFAULT_CFG_STRENGTH)),
             nfe_step=int(data.get("nfe_step", config.DEFAULT_NFE_STEP)),
+            target_rms=float(data.get("target_rms", config.DEFAULT_TARGET_RMS)),
+            gain_db=float(data.get("gain_db", config.DEFAULT_GAIN_DB)),
+            pitch_semitones=float(data.get("pitch_semitones", config.DEFAULT_PITCH_SEMITONES)),
+            pause_override_ms=None if raw_pause is None else int(raw_pause),
+            engine_params=dict(raw_params) if isinstance(raw_params, dict) else {},
         )
 
 
@@ -54,6 +75,29 @@ class RenderResult:
     output_path: Path
     duration_sec: float
     replicas_done: int
+    # Границы кусков в сэмплах: по ним можно заменить одну реплику, не трогая остальное.
+    segments: list[tuple[int, int]] = field(default_factory=list)
+    # Сид каждого куска (`None` — движок сид не принимает). Хранится, чтобы кусок
+    # можно было воспроизвести: без него понравившийся вариант не повторить.
+    seeds: list[int | None] = field(default_factory=list)
+
+
+@dataclass
+class ChunkVariant:
+    """Сохранённый вариант куска: файл для прослушивания, сид и подпись.
+
+    Вариант — это готовое аудио, а не рецепт: выбор между вариантами должен быть
+    мгновенным, а повторный синтез с тем же сидом на MPS не гарантирует тот же
+    результат. Файл лежит уже финализированным (`_finalize_track`), то есть в том
+    же виде, в каком звучит в треке: варианты сравнивают на слух, и разная
+    громкость решала бы выбор вместо голоса.
+    """
+
+    id: str
+    path: Path
+    label: str
+    seed: int | None
+    duration_sec: float
 
 
 class ChunkTimeoutError(RuntimeError):
@@ -64,14 +108,135 @@ class JobAbortedError(RuntimeError):
     """Задача прервана watchdog'ом (перерасход ресурсов), а не упала сама."""
 
 
-def _normalize(chunk: np.ndarray) -> np.ndarray:
-    rms = float(np.sqrt(np.mean(np.square(chunk)))) if chunk.size else 0.0
+def _pitch_shift(chunk: np.ndarray, semitones: float) -> np.ndarray:
+    """Меняет высоту тона, не трогая длительность. Тяжёлый импорт — только по факту."""
+    if not semitones:
+        return chunk
+    import librosa
+
+    return np.asarray(
+        librosa.effects.pitch_shift(chunk, sr=SAMPLE_RATE, n_steps=float(semitones)),
+        dtype=np.float32,
+    )
+
+
+def _trim_edge_silence(chunk: np.ndarray) -> np.ndarray:
+    """Срезает тишину, которую модель оставила на краях куска.
+
+    Модель почти всегда добавляет к сгенерированному куску немного тишины, а
+    `pause_ms` добавляет паузу поверх неё. Суммарный зазор между репликами тогда
+    гуляет от куска к куску и звучит неритмично. Обрезка по энергетическому
+    порогу делает паузу ровно той, что задал пользователь.
+    """
+    frame = int(SAMPLE_RATE * config.EDGE_SILENCE_FRAME_MS / 1000)
+    if frame <= 0 or chunk.size < 4 * frame:
+        return chunk
+    usable = chunk.size - chunk.size % frame
+    frames = chunk[:usable].reshape(-1, frame)
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    loud = np.flatnonzero(rms > 10.0 ** (config.EDGE_SILENCE_DB / 20.0))
+    if loud.size == 0:  # кусок целиком тихий — резать нечего
+        return chunk
+    margin = int(SAMPLE_RATE * config.EDGE_SILENCE_MARGIN_MS / 1000)
+    start = max(0, int(loud[0]) * frame - margin)
+    end = min(chunk.size, (int(loud[-1]) + 1) * frame + margin)
+    if end - start < 2 * frame:
+        return chunk
+    return chunk[start:end]
+
+
+def _prepare_chunk(chunk: np.ndarray, settings: SpeakerSettings) -> np.ndarray:
+    """Готовит кусок к склейке: края, тембр и громкость.
+
+    Один проход с одной копией: на длинных репликах лишние копии waveform заметны
+    и по памяти, и по времени. Gain применяется после нормализации RMS — иначе
+    нормализация обнулила бы ручную балансировку громкости.
+    """
+    trimmed = _trim_edge_silence(np.asarray(chunk, dtype=np.float32))
+    result = np.array(_pitch_shift(trimmed, settings.pitch_semitones),
+                      dtype=np.float32, copy=True)
+
+    fade = int(SAMPLE_RATE * config.EDGE_FADE_MS / 1000)
+    # Модель иногда оставляет на самом краю куска щелчок. Кроссфейд с соседним
+    # куском такой щелчок не убирает — он его только смешивает с чужим звуком.
+    if fade > 0 and result.size >= 2 * fade:
+        result[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        result[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+
+    rms = float(np.sqrt(np.mean(np.square(result)))) if result.size else 0.0
     if rms > 1e-6:
-        chunk = chunk * (_TARGET_RMS / rms)
-    peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+        result *= settings.target_rms / rms
+
+    if settings.gain_db:
+        result *= 10.0 ** (settings.gain_db / 20.0)
+
+    peak = float(np.max(np.abs(result))) if result.size else 0.0
     if peak > _PEAK_LIMIT:
-        chunk = chunk * (_PEAK_LIMIT / peak)
-    return chunk.astype(np.float32)
+        result *= _PEAK_LIMIT / peak
+    return result
+
+
+def _normalize_loudness(audio: np.ndarray, target_lufs: float) -> np.ndarray:
+    """Подтягивает громкость всего трека к target_lufs (ITU-R BS.1770).
+
+    Нормализация кусков по RMS выравнивает их между собой, но не даёт равной
+    *воспринимаемой* громкости: плотность звука у F5 и XTTS разная, поэтому на
+    стыке движков слышен скачок даже при одинаковом `target_rms`. LUFS считает
+    громкость целого файла и лечит именно это.
+    """
+    import pyloudnorm as pyln
+
+    try:
+        loudness = float(pyln.Meter(SAMPLE_RATE).integrated_loudness(audio))
+    except ValueError:  # короче 400 мс — измерять нечего, Meter бросает ValueError
+        return audio
+    if not math.isfinite(loudness):  # цифровая тишина даёт -inf
+        return audio
+    gain_db = target_lufs - loudness
+    if abs(gain_db) < 0.1:
+        return audio
+    logger.info("Громкость трека: %.1f LUFS → %.1f LUFS (%+.1f дБ)", loudness, target_lufs, gain_db)
+    return audio * (10.0 ** (gain_db / 20.0))
+
+
+def _limit_peaks(audio: np.ndarray, ceiling: float = _PEAK_LIMIT) -> np.ndarray:
+    """Лимитер: придерживает пики выше потолка, не трогая громкость остального.
+
+    Нужен после подъёма до целевого LUFS: без него пики уходят за 0 dBFS и файл
+    клипует. Усиление считается по блокам (не по отсчётам) — иначе на резких
+    пиках лимитер сам даёт щелчки; атака берётся с запасом вперёд, восстановление
+    плавное.
+    """
+    block = int(SAMPLE_RATE * config.LIMITER_BLOCK_MS / 1000)
+    if block <= 0 or audio.size < 4 * block:
+        return audio
+    usable = audio.size - audio.size % block
+    peaks = np.abs(audio[:usable]).reshape(-1, block).max(axis=1)
+    needed = np.minimum(1.0, ceiling / np.maximum(peaks, 1e-9))
+
+    attacked = needed.copy()
+    for shift in range(1, max(config.LIMITER_LOOKAHEAD_BLOCKS, 1)):
+        attacked[:-shift] = np.minimum(attacked[:-shift], needed[shift:])
+
+    release_ratio = 1.0 + config.LIMITER_BLOCK_MS / config.LIMITER_RELEASE_MS
+    gains = np.empty_like(attacked)
+    gain = 1.0
+    for index, target in enumerate(attacked):
+        gain = float(target) if target < gain else min(float(target), gain * release_ratio)
+        gains[index] = gain
+
+    limited = audio[:usable] * np.repeat(gains, block)
+    tail = audio[usable:] * gains[-1]
+    return np.concatenate((limited, tail))
+
+
+def _finalize_track(audio: np.ndarray) -> np.ndarray:
+    """Финальный проход по собранному треку: воспринимаемая громкость и потолок.
+
+    Применяется и к целиком собранному диалогу, и после замены одной реплики:
+    иначе перегенерированный кусок остался бы на другой громкости, чем файл.
+    """
+    return _limit_peaks(_normalize_loudness(np.asarray(audio, dtype=np.float32), config.OUTPUT_LUFS))
 
 
 def _resolve_voice(label: str, settings: SpeakerSettings) -> Voice:
@@ -93,12 +258,159 @@ def _settings_for(replica: Replica, base: SpeakerSettings) -> SpeakerSettings:
     """Параметры куска: значения из маркера в тексте перекрывают карточку."""
     if not replica.overrides:
         return base
-    return SpeakerSettings(
-        voice_id=base.voice_id,
+    return replace(
+        base,
         speed=float(replica.overrides.get("speed", base.speed)),
         cfg_strength=float(replica.overrides.get("cfg_strength", base.cfg_strength)),
         nfe_step=int(replica.overrides.get("nfe_step", base.nfe_step)),
     )
+
+
+def _engine_for(voice: Voice) -> SynthesisEngine:
+    """Движок, выбранный для этого голоса."""
+    try:
+        return get_engine(voice.engine)
+    except ValueError as exc:
+        raise ValueError(f"У голоса «{voice.name}» неизвестный движок «{voice.engine}»") from exc
+
+
+def _text_for_engine(text: str, engine: SynthesisEngine, auto_accent: bool) -> str:
+    """Готовит текст куска к отправке в модель.
+
+    Порядок важен: сначала числа и латиница (`text_preprocess`), потом ударения.
+    RUAccent ставит «+» перед гласной, и на развёрнутых числах он тоже должен
+    отработать — иначе «две тысячи двадцать шестом» уйдёт без разметки. Ударения
+    при этом остаются только у F5: XTTS знак «+» читает как отдельный символ.
+    """
+    prepared = normalize(text)
+    if auto_accent and engine.supports_accents:
+        return accentuate(prepared)
+    return prepared
+
+
+async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:
+    """Грузит движки всех голосов диалога до первой реплики.
+
+    Модель XTTS поднимается 20–40 секунд. Если грузить её лениво, эта пауза
+    придётся на середину диалога — а прогретая модель нужна до начала синтеза,
+    ровно как это было с единственным F5-TTS.
+    """
+    engines: dict[str, SynthesisEngine] = {}
+    for voice in voices:
+        engine = _engine_for(voice)
+        if engine.id in engines:
+            continue
+        engines[engine.id] = engine
+        await asyncio.to_thread(engine.load)
+        logger.info("Движок %s готов (%s)", engine.id, voice.name)
+    return engines
+
+
+def _engine_params(
+    voice: Voice, speaker: SpeakerSettings, render: RenderSettings, seed: int | None
+) -> dict:
+    """Ручки движка для одного куска.
+
+    Значения, сохранённые у голоса, — это дефолты, а карточка слота их
+    переопределяет. Общие ручки пайплайна (`target_rms`, `cross_fade_duration`)
+    добавляются последними: они относятся к сборке куска, и движок читает их
+    только если они у него есть. `seed` передаётся только движкам, которые его
+    принимают (см. `SynthesisEngine.supports_seed`), и то же значение уходит в
+    карточку куска — чтобы вариант можно было воспроизвести, а не только принять.
+    """
+    return {
+        **voice.engine_params,
+        **speaker.engine_params,
+        "cfg_strength": speaker.cfg_strength,
+        "nfe_step": speaker.nfe_step,
+        "target_rms": speaker.target_rms,
+        "cross_fade_duration": render.cross_fade_duration,
+        "seed": seed,
+    }
+
+
+def _pause_samples(speaker: SpeakerSettings, render: RenderSettings) -> int:
+    """Пауза перед репликами спикера: его личное значение важнее общего."""
+    pause_ms = render.pause_ms if speaker.pause_override_ms is None else speaker.pause_override_ms
+    return int(SAMPLE_RATE * max(pause_ms, 0) / 1000)
+
+
+def _synthesize_in_thread(
+    engine: SynthesisEngine, **kwargs: Any
+) -> tuple[tuple[np.ndarray, int] | None, Exception | None]:
+    """Вызывает движок и возвращает исключение значением, а не наружу.
+
+    `asyncio.wait_for` ловит `TimeoutError`, а с Python 3.10 `socket.timeout` — тот же
+    самый класс. Поэтому любой чужой таймаут (сетевой запрос внутри движка, таймаут
+    нативной библиотеки) выглядел бы как «инференс не уложился в CHUNK_TIMEOUT_SEC»
+    и уводил бы поиск причины в сторону. Исключение возвращается значением и
+    поднимается уже после ожидания — с настоящим типом и текстом.
+    """
+    try:
+        return engine.synthesize(**kwargs), None
+    except Exception as exc:  # noqa: BLE001 — исключение не глотаем, а переносим наверх
+        return None, exc
+
+
+async def _synthesize_chunk(
+    engine: SynthesisEngine,
+    voice: Voice,
+    text: str,
+    tuning: SpeakerSettings,
+    settings: RenderSettings,
+    position: str,
+    label: str,
+) -> tuple[np.ndarray, int | None]:
+    """Синтезирует один кусок, отделяя свой таймаут от чужой ошибки движка.
+
+    Разделение принципиальное: `TimeoutError` от `asyncio.wait_for` означает, что
+    зависла именно наша задача, а всё остальное — ошибку внутри движка, которую
+    нужно показать пользователю такой, какая она есть (см. `_synthesize_in_thread`).
+    Общий помощник на два места — сборку диалога и перегенерацию одной реплики —
+    ещё и потому, что вторая копия этой обвязки однажды уже разошлась с первой.
+
+    Сид выбирается здесь, а не в движке: пайплайн — единственное место, которое
+    знает и про поддержку сида движком, и про то, что значение надо вернуть
+    наверх вместе с куском.
+    """
+    seed = random.randrange(config.SEED_MAX) if engine.supports_seed else None
+    started = time.monotonic()
+    try:
+        outcome, failure = await asyncio.wait_for(
+            asyncio.to_thread(
+                _synthesize_in_thread,
+                engine,
+                text=text,
+                ref_audio_path=str(voice.audio_path),
+                ref_text=voice.ref_text,
+                speed=tuning.speed,
+                **_engine_params(voice, tuning, settings, seed),
+            ),
+            timeout=config.CHUNK_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning(
+            "Таймаут синтеза: реплика %s не готова за %.0f c (движок %s, голос %s, %s знаков): %.200s",
+            position, config.CHUNK_TIMEOUT_SEC, engine.id, tuning.voice_id, len(text), text,
+        )
+        raise ChunkTimeoutError(
+            f"Реплика {position} не синтезировалась за {config.CHUNK_TIMEOUT_SEC:.0f} c "
+            "— возможно, завис инференс"
+        ) from exc
+    if failure is not None:
+        logger.error(
+            "Реплика %s (%s): движок %s упал (%s)",
+            position, label, engine.id, type(failure).__name__, exc_info=failure,
+        )
+        raise failure
+    assert outcome is not None  # при пустом failure результат синтеза всегда есть
+    chunk, _ = outcome
+    logger.info(
+        "Реплика %s (%s, %s) — %.1f c, %.1f c аудио, сид %s",
+        position, label, engine.id, time.monotonic() - started,
+        len(chunk) / SAMPLE_RATE, seed,
+    )
+    return chunk, seed
 
 
 async def render_dialogue(
@@ -114,13 +426,14 @@ async def render_dialogue(
     Блокирующие шаги (загрузка модели, ударения, инференс, запись файла) уводятся
     в отдельный поток, чтобы не встал event loop. Инференс ограничен
     `config.CHUNK_TIMEOUT_SEC`, а между кусками проверяется `should_abort`.
+
+    Движок выбирается у каждого голоса отдельно, поэтому в одном файле спокойно
+    соседствуют куски F5-TTS и XTTS: реплики идут строго последовательно, и
+    склейка для неё одинакова — все движки отдают 24 кГц.
     """
     replicas = list(replicas)
     if not replicas:
         raise ValueError("Диалог пуст")
-
-    engine = get_engine()
-    await asyncio.to_thread(engine.load)
 
     labels = {r.voice: r.label for r in replicas}
     unknown = sorted({r.voice for r in replicas if r.voice not in speakers})
@@ -132,13 +445,13 @@ async def render_dialogue(
     for replica in replicas:
         if replica.voice not in resolved:
             resolved[replica.voice] = _resolve_voice(replica.label, speakers[replica.voice])
-
-    pause_samples = int(SAMPLE_RATE * max(settings.pause_ms, 0) / 1000)
-    silence = np.zeros(pause_samples, dtype=np.float32) if pause_samples else None
+    engines = await _load_engines(list(resolved.values()))
 
     pieces: list[np.ndarray] = []
+    segments: list[tuple[int, int]] = []
+    seeds: list[int | None] = []
     total = len(replicas)
-
+    cursor = 0
     for index, replica in enumerate(replicas, start=1):
         if should_abort and should_abort():
             raise JobAbortedError(
@@ -148,64 +461,189 @@ async def render_dialogue(
             on_progress(index, total, replica.label)
         settings_for_replica = _settings_for(replica, speakers[replica.voice])
         voice = resolved[replica.voice]
+        engine = engines[voice.engine]
 
-        text = replica.text
-        if settings.auto_accent:
-            text = await asyncio.to_thread(accentuate, text)
-
-        started = time.monotonic()
-        try:
-            chunk = await asyncio.wait_for(
-                asyncio.to_thread(
-                    engine.synthesize,
-                    text=text,
-                    ref_audio_path=str(voice.audio_path),
-                    ref_text=voice.ref_text,
-                    speed=settings_for_replica.speed,
-                    nfe_step=settings_for_replica.nfe_step,
-                    cfg_strength=settings_for_replica.cfg_strength,
-                    cross_fade_duration=settings.cross_fade_duration,
-                ),
-                timeout=config.CHUNK_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError as exc:
-            logger.warning(
-                "Таймаут синтеза: реплика %s/%s не готова за %.0f c (голос %s, %s знаков): %.200s",
-                index, total, config.CHUNK_TIMEOUT_SEC, settings_for_replica.voice_id,
-                len(text), text,
-            )
-            raise ChunkTimeoutError(
-                f"Реплика {index} из {total} не синтезировалась за "
-                f"{config.CHUNK_TIMEOUT_SEC:.0f} c — возможно, завис инференс"
-            ) from exc
-        logger.info(
-            "Реплика %s/%s (%s) — %.1f c, %.1f c аудио",
-            index, total, replica.label, time.monotonic() - started, len(chunk) / SAMPLE_RATE,
+        # Текст куска готовит _text_for_engine: числа и латиница для всех движков,
+        # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
+        text = await asyncio.to_thread(
+            _text_for_engine, replica.text, engine, settings.auto_accent
         )
 
-        if pieces and silence is not None:
-            pieces.append(silence)
-        pieces.append(await asyncio.to_thread(_normalize, chunk))
+        chunk, seed = await _synthesize_chunk(
+            engine,
+            voice,
+            text,
+            settings_for_replica,
+            settings,
+            position=f"{index} из {total}",
+            label=replica.label,
+        )
+        seeds.append(seed)
+
+        pause = _pause_samples(settings_for_replica, settings)
+        if pieces and pause:
+            pieces.append(np.zeros(pause, dtype=np.float32))
+            cursor += pause
+        prepared = await asyncio.to_thread(_prepare_chunk, chunk, settings_for_replica)
+        segments.append((cursor, cursor + prepared.size))
+        cursor += prepared.size
+        pieces.append(prepared)
 
     final = await asyncio.to_thread(np.concatenate, pieces)
+    final = await asyncio.to_thread(_finalize_track, final)
     output_path = await asyncio.to_thread(_write_output, job_id, final, settings.output_format)
     return RenderResult(
         output_path=output_path,
         duration_sec=len(final) / SAMPLE_RATE,
         replicas_done=total,
+        segments=segments,
+        seeds=seeds,
     )
 
 
-def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
+async def synthesize_replica(
+    replica: Replica,
+    speaker: SpeakerSettings,
+    settings: RenderSettings,
+    index: int,
+) -> tuple[np.ndarray, int | None]:
+    """Синтезирует и готовит один кусок — без записи в готовый файл.
+
+    Возвращает подготовленный кусок и сид, которым он получен: и то, и другое
+    нужно вызывающему, чтобы сохранить вариант и уже его поставить в файл.
+    Пересобирать весь диалог из-за одной неудачной реплики — десятки секунд на
+    каждый кусок, поэтому перегенерация трогает ровно один кусок.
+    """
+    voice = _resolve_voice(replica.label, speaker)
+    engine = _engine_for(voice)
+    await asyncio.to_thread(engine.load)
+    # Параметры из маркера в тексте важнее карточки — ровно как при первой сборке,
+    # иначе перегенерация дала бы кусок, несовместимый с соседями по звучанию.
+    resolved = _settings_for(replica, speaker)
+
+    text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
+
+    chunk, seed = await _synthesize_chunk(
+        engine,
+        voice,
+        text,
+        resolved,
+        settings,
+        position=str(index + 1),
+        label=replica.label,
+    )
+    prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
+    logger.info(
+        "Реплика %s (%s) пересинтезирована: %.2f c аудио, сид %s",
+        index + 1, replica.label, prepared.size / SAMPLE_RATE, seed,
+    )
+    return prepared, seed
+
+
+def variant_path(job_id: str, index: int, variant_id: str) -> Path:
+    """Файл варианта куска.
+
+    Отдельный от `output/{job_id}.{fmt}`, а не «кусок внутри него»: варианты
+    живут своей жизнью — их прослушивают и сравнивают между собой, тогда как в
+    готовый файл попадает только один из них.
+    """
+    return config.OUTPUT_DIR / f"{job_id}-r{index + 1}-{variant_id}.wav"
+
+
+def save_chunk_variant(
+    job_id: str,
+    index: int,
+    variant_id: str,
+    chunk: np.ndarray,
+    seed: int | None,
+    label: str,
+) -> ChunkVariant:
+    """Сохраняет кусок вариантом: файл для прослушивания + сид в карточке.
+
+    Вариант финализируется здесь же (LUFS + лимитер). Куски в готовом файле
+    нормализованы вместе, а вырезанный из файла кусок лежит на другой громкости,
+    чем только что сгенерированный, — и сравнение двух вариантов на слух
+    превращалось бы в сравнение громкости.
+    """
+    path = variant_path(job_id, index, variant_id)
+    _write_audio(path, _finalize_track(np.asarray(chunk, dtype=np.float32)), "wav")
+    return ChunkVariant(
+        id=variant_id,
+        path=path,
+        label=label,
+        seed=seed,
+        duration_sec=chunk.size / SAMPLE_RATE,
+    )
+
+
+def read_variant(variant: ChunkVariant) -> np.ndarray:
+    return _read_audio(variant.path, "wav")
+
+
+def drop_variant(variant: ChunkVariant) -> None:
+    """Удаляет файл вытесненного варианта: держать его больше не для чего."""
+    variant.path.unlink(missing_ok=True)
+
+
+def read_segment(source_path: Path, output_format: str, bounds: tuple[int, int]) -> np.ndarray:
+    """Вырезает текущий кусок из готового файла.
+
+    Нужно, чтобы до первой замены сохранить исходный вариант: иначе
+    «перегенерировать» означает «потерять то, что было», и сравнивать новое
+    будет не с чем.
+    """
+    audio = _read_audio(source_path, output_format)
+    start, end = bounds
+    return audio[start:end]
+
+
+async def apply_variant(
+    source_path: Path,
+    settings: RenderSettings,
+    segments: list[tuple[int, int]],
+    index: int,
+    variant: ChunkVariant,
+) -> tuple[float, tuple[int, int]]:
+    """Ставит сохранённый вариант в готовый файл.
+
+    Возвращает длительность файла и новые границы куска. Единая точка и для
+    «сгенерировать заново», и для «оставить другой вариант»: обе операции должны
+    давать ровно один и тот же файл, иначе выбор варианта в интерфейсе менял бы
+    звук не так, как та же сгенерированная реплика.
+    """
+    content = await asyncio.to_thread(read_variant, variant)
+    audio = await asyncio.to_thread(_read_audio, source_path, settings.output_format)
+    start, end = segments[index]
+    updated = np.concatenate((audio[:start], content, audio[end:]))
+    updated = await asyncio.to_thread(_finalize_track, updated)
+    await asyncio.to_thread(_write_audio, source_path, updated, settings.output_format)
+    return len(updated) / SAMPLE_RATE, (start, start + content.size)
+
+
+def _read_audio(path: Path, output_format: str) -> np.ndarray:
+    """Читает готовый файл обратно в float32-моно при SAMPLE_RATE."""
+    if (output_format or "wav").lower() == "wav":
+        import soundfile as sf
+
+        data, _ = sf.read(path, dtype="float32")
+        return np.asarray(data, dtype=np.float32).reshape(-1)
+
+    from pydub import AudioSegment
+
+    segment = AudioSegment.from_file(path, format=output_format)
+    samples = np.frombuffer(segment.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples
+
+
+def _write_audio(target: Path, audio: np.ndarray, output_format: str) -> None:
     import soundfile as sf
 
     output_format = (output_format or "wav").lower()
-    target = config.OUTPUT_DIR / f"{job_id}.{output_format}"
     if output_format == "wav":
         sf.write(target, audio, SAMPLE_RATE)
-        return target
+        return
 
-    tmp_wav = config.OUTPUT_DIR / f"{job_id}.tmp.wav"
+    tmp_wav = target.with_suffix(".tmp.wav")
     sf.write(tmp_wav, audio, SAMPLE_RATE)
     try:
         from pydub import AudioSegment
@@ -213,6 +651,12 @@ def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
         AudioSegment.from_wav(tmp_wav).export(target, format=output_format, bitrate="192k")
     finally:
         tmp_wav.unlink(missing_ok=True)
+
+
+def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
+    output_format = (output_format or "wav").lower()
+    target = config.OUTPUT_DIR / f"{job_id}.{output_format}"
+    _write_audio(target, audio, output_format)
     return target
 
 

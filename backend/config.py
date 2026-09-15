@@ -52,6 +52,22 @@ VOCAB_FILE = Path(os.environ.get("TTS_VOCAB_FILE", MODELS_DIR / HF_VOCAB_PATH))
 F5_MODEL_NAME = os.environ.get("TTS_F5_MODEL_NAME", "F5TTS_v1_Base")
 VOCAB_SIZE = 10000
 
+# --- Веса XTTS v2 (второй движок синтеза) -------------------------------------
+# Базовая модель: coqui/XTTS-v2 — скачана целиком, чтобы первый синтез работал
+# офлайн (каталог лежит в models/, а не в кеше huggingface_hub под именем хеша).
+# Русский файнтюн Ftfyhh/xttsv2_banana: путь ищется рекурсивно, потому что
+# huggingface_hub раскладывает репозиторий по вложенным папкам (model_banana/v2.0.2).
+XTTS_BASE_DIR = Path(os.environ.get("TTS_XTTS_BASE_DIR", MODELS_DIR / "xtts_v2"))
+XTTS_BANANA_DIR = Path(os.environ.get("TTS_XTTS_BANANA_DIR", MODELS_DIR / "xtts_v2_banana"))
+# Русский — единственный язык, который нужен всем голосам проекта.
+XTTS_LANGUAGE = os.environ.get("TTS_XTTS_LANGUAGE", "ru")
+# Сколько секунд референса идёт в conditioning latents. Референс длиннее модель
+# всё равно обрежет, а расчёт латентов кешируется на голос.
+XTTS_COND_LEN_SEC = int(os.environ.get("TTS_XTTS_COND_LEN_SEC", "6"))
+XTTS_MAX_REF_SEC = int(os.environ.get("TTS_XTTS_MAX_REF_SEC", "30"))
+# Сколько голосов держать в кеше conditioning latents (по одному набору тензоров на голос).
+XTTS_LATENTS_CACHE_SIZE = int(os.environ.get("TTS_XTTS_LATENTS_CACHE", "8"))
+
 # --- Ресурсы ------------------------------------------------------------------
 # Не занимать все P-ядра разом: модель крутится строго последовательно.
 # По умолчанию совпадает с TTS_THREAD_LIMIT (см. блок лимитов потоков в начале файла).
@@ -61,12 +77,51 @@ TORCH_NUM_THREADS = int(os.environ.get("TTS_TORCH_THREADS", _THREAD_LIMIT))
 # поэтому дефолт взят с четырёхкратным запасом.
 CHUNK_TIMEOUT_SEC = float(os.environ.get("TTS_CHUNK_TIMEOUT_SEC", "600"))
 # Потолок памяти процесса (МБ): при устойчивом превышении watchdog прерывает
-# текущую задачу (сам процесс не убивается).
-MAX_RSS_MB = int(os.environ.get("TTS_MAX_RSS_MB", "4096"))
+# текущую задачу (сам процесс не убивается). Считается по RSS из psutil, а RSS
+# на Apple Silicon не включает память, выделенную моделями через Metal (MPS):
+# с поднятыми движками RSS остаётся десятками мегабайт при физическом следе в
+# гигабайты (проверено `footprint`: F5 + обе XTTS ≈ 8.9 ГБ против 36 МБ в RSS).
+# То есть лимит ловит буферы пайплайна и нативные аллокации, а вес моделей —
+# нет; за перегрузку всей машины отвечает SYSTEM_MEM_THRESHOLD_PERCENT ниже.
+MAX_RSS_MB = int(os.environ.get("TTS_MAX_RSS_MB", "5120"))
+# Порог общей памяти системы (проценты): вторая, независимая от MAX_RSS_MB
+# проверка — она видит нагрузку чужих процессов, которую свой RSS не показывает.
+SYSTEM_MEM_THRESHOLD_PERCENT = int(os.environ.get("TTS_SYSTEM_MEM_THRESHOLD", "85"))
 # Сколько хранить готовые файлы в output/
 OUTPUT_TTL_HOURS = float(os.environ.get("TTS_OUTPUT_TTL_HOURS", "24"))
-# Максимальная длина одной реплики (символов) — защита от случайных "полотен"
+# Максимальная длина куска (символов), который уходит в модель за один прогон.
+# Реплика длиннее режется по границам предложений (см. dialogue_parser).
 MAX_REPLICA_CHARS = int(os.environ.get("TTS_MAX_REPLICA_CHARS", "600"))
+# Стратегия нарезки текста на куски — выбирается в интерфейсе, а не средой
+# окружения: это разовый выбор под задачу, а не свойство установки. Короткий
+# кусок реже «уплывает» по интонации, длинный — реже рвёт мысль на границе.
+CHUNK_STRATEGY_SHORT = "short"
+CHUNK_STRATEGY_PARAGRAPH = "paragraph"
+CHUNK_STRATEGY_DEFAULT = CHUNK_STRATEGY_PARAGRAPH
+SHORT_CHUNK_CHARS = 200
+
+
+def chunk_chars(strategy: str | None) -> int:
+    """Лимит куска в знаках для выбранной стратегии нарезки."""
+    if strategy == CHUNK_STRATEGY_SHORT:
+        return SHORT_CHUNK_CHARS
+    return MAX_REPLICA_CHARS
+
+
+# Верхняя граница сида генерации, [0, SEED_MAX). Значение не «на глаз»: F5-TTS
+# прокидывает сид в `seed_everything`, а тот пишет его в os.environ
+# ["PYTHONHASHSEED"] (f5_tts/model/utils.py). При seed=None библиотека берёт
+# random.randint(0, sys.maxsize) — это больше допустимого максимума 4294967295,
+# и унаследовавший переменную подпроцесс падает с
+# "Fatal Python error: config_init_hash_seed". Граница общая для всех движков:
+# сид задаёт пайплайн, а не движок, чтобы его можно было записать рядом с куском.
+SEED_MAX = 2 ** 32
+
+# Сколько вариантов одного куска хранить. Вариант — это аудио, уже побывавшее в
+# файле: без него «перегенерировать» означает потерять предыдущий результат, а
+# A/B на слух без предыдущего невозможен.
+MAX_REPLICA_VARIANTS = int(os.environ.get("TTS_MAX_REPLICA_VARIANTS", "3"))
+
 # Максимальная длина сплошного текста для одной задачи (символов).
 # ~50 000 знаков — это примерно час готового аудио; защита от случайной
 # вставки книги целиком в режиме «Сплошной текст».
@@ -86,6 +141,44 @@ DEFAULT_SWAY_SAMPLING_COEF = -1.0
 DEFAULT_CROSS_FADE_DURATION = 0.15
 DEFAULT_PAUSE_MS = 400
 DEFAULT_OUTPUT_FORMAT = "mp3"
+# Целевая громкость куска (RMS). Одно значение и для модели (`target_rms` в F5-TTS),
+# и для пост-нормализации: иначе куски приходят с разным уровнем и «скачут» на стыках.
+DEFAULT_TARGET_RMS = float(os.environ.get("TTS_TARGET_RMS", "0.1"))
+# Сглаживание самых краёв куска: модель иногда оставляет на границе щелчок,
+# который кроссфейд не убирает, а только смешивает с соседним звуком.
+EDGE_FADE_MS = float(os.environ.get("TTS_EDGE_FADE_MS", "10"))
+# Балансировка голосов по громкости (дБ) — применяется после выравнивания RMS.
+DEFAULT_GAIN_DB = 0.0
+# Питч-шифт меняет высоту, но не пол голоса: тембр остаётся от референса.
+DEFAULT_PITCH_SEMITONES = 0.0
+
+# --- Громкость и паузы собранного трека ---------------------------------------
+# Финальный проход по готовому файлу. Нормализация кусков по RMS выравнивает их
+# между собой, но не даёт одинаковой *воспринимаемой* громкости: плотность звука
+# у F5 и XTTS разная, и на стыке движков слышен «скачок» даже при равном RMS.
+# LUFS (ITU-R BS.1770) выравнивает громкость файла целиком.
+OUTPUT_LUFS = float(os.environ.get("TTS_OUTPUT_LUFS", "-16"))
+# Лимитер после нормализации: без него подъём громкости до целевого LUFS
+# упирается в клиппинг на пиках (потолок — тот же _PEAK_LIMIT в audio_pipeline).
+# Блочный, с запасом на атаку и медленным восстановлением: усиление меняется по
+# блокам, а не по отсчётам, иначе на резких пиках лимитер сам даёт щелчки.
+LIMITER_BLOCK_MS = 5.0
+LIMITER_LOOKAHEAD_BLOCKS = 4  # 20 мс: усиление падает раньше, чем придёт пик
+LIMITER_RELEASE_MS = 60.0
+# Порог тишины на краях куска (дБFS) и запас вокруг найденной речи (мс). Модель
+# сама оставляет тишину на краях, а pause_ms добавляет паузу поверх — суммарный
+# зазор между репликами гуляет. Обрезав края, получаем ровно заданную паузу.
+EDGE_SILENCE_DB = float(os.environ.get("TTS_EDGE_SILENCE_DB", "-45"))
+EDGE_SILENCE_FRAME_MS = 20.0
+EDGE_SILENCE_MARGIN_MS = 30.0
+
+# --- Дефолтные параметры XTTS v2 ----------------------------------------------
+# Значения совпадают с тем, что записано в config.json базовой модели и
+# рекомендовано её авторами: на них XTTS v2 стабильно и разборчиво читает русский.
+DEFAULT_XTTS_TEMPERATURE = float(os.environ.get("TTS_XTTS_TEMPERATURE", "0.75"))
+DEFAULT_XTTS_REPETITION_PENALTY = float(os.environ.get("TTS_XTTS_REPETITION_PENALTY", "5.0"))
+DEFAULT_XTTS_TOP_K = 50
+DEFAULT_XTTS_TOP_P = 0.85
 
 # Фраза для прослушивания голоса во вкладке «Голоса»
 DEFAULT_PREVIEW_TEXT = "Привет! Так звучит этот голос в диалоге."
@@ -102,6 +195,14 @@ CFG_RANGE = (1.0, 4.0)
 NFE_ALLOWED = (8, 16, 32)
 PAUSE_MS_RANGE = (0, 5000)
 CROSS_FADE_RANGE = (0.0, 1.0)
+GAIN_DB_RANGE = (-20.0, 20.0)
+PITCH_SEMITONES_RANGE = (-12.0, 12.0)
+# Ниже 0.02 кусок звучит как шёпот, выше 0.3 модель упирается в клиппинг.
+TARGET_RMS_RANGE = (0.02, 0.3)
+# Границы ручек XTTS v2: ниже 0.1 модель «заикается» на одном слоге, выше 1.5
+# распадается в шум; штраф за повторы ниже 1.0 бессмыслен, выше 20 речь становится рваной.
+XTTS_TEMPERATURE_RANGE = (0.1, 1.5)
+XTTS_REPETITION_PENALTY_RANGE = (1.0, 20.0)
 
 _torch = None
 

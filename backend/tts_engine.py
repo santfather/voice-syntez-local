@@ -15,13 +15,10 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24_000
 
-# F5-TTS при каждом `infer` вызывает `seed_everything`, который пишет сид в
-# os.environ["PYTHONHASHSEED"] (f5_tts/model/utils.py). При seed=None библиотека
-# берёт random.randint(0, sys.maxsize) — это больше допустимого максимума
-# 4294967295, и унаследовавший переменную подпроцесс падает с
-# "Fatal Python error: config_init_hash_seed". Сид задаём сами, в допустимых
-# границах: распределение остаётся случайным, как и раньше.
-HASH_SEED_MAX = 2 ** 32
+# Верхняя граница сида — в config.SEED_MAX, там же и причина такого максимума.
+# Случайный сид здесь теперь только запасной путь для прямого вызова: в пайплайне
+# сид задаёт audio_pipeline, чтобы его можно было записать рядом с куском.
+HASH_SEED_MAX = config.SEED_MAX
 
 
 class _InlineExecutor:
@@ -148,16 +145,25 @@ class TTSEngine:
         cfg_strength: float = config.DEFAULT_CFG_STRENGTH,
         sway_sampling_coef: float = config.DEFAULT_SWAY_SAMPLING_COEF,
         cross_fade_duration: float = config.DEFAULT_CROSS_FADE_DURATION,
+        target_rms: float = config.DEFAULT_TARGET_RMS,
+        seed: int | None = None,
     ) -> np.ndarray:
-        """Синтез одной реплики. Возвращает float32 waveform, sr = 24000."""
+        """Синтез одной реплики. Возвращает float32 waveform, sr = 24000.
+
+        `target_rms` передаём явно: при дефолте модели громкость куска зависит от
+        того, что попало в референс и в текст, и соседние реплики звучат по-разному.
+        `seed` приходит из пайплайна (`audio_pipeline`): он же записывает его в
+        карточку куска, поэтому генерация перестаёт быть лотереей без следов.
+        """
         if self._model is None:
             self.load()
+        seed = random.randrange(HASH_SEED_MAX) if seed is None else int(seed)
 
         with self._infer_lock:  # очередь последовательная, но перестрахуемся
             try:
                 return self._infer(
                     text, ref_audio_path, ref_text, speed, nfe_step, cfg_strength,
-                    sway_sampling_coef, cross_fade_duration,
+                    sway_sampling_coef, cross_fade_duration, target_rms, seed,
                 )
             except Exception as exc:
                 if self.device != "mps":
@@ -168,12 +174,12 @@ class TTSEngine:
                 self.load(device="cpu")
                 return self._infer(
                     text, ref_audio_path, ref_text, speed, nfe_step, cfg_strength,
-                    sway_sampling_coef, cross_fade_duration,
+                    sway_sampling_coef, cross_fade_duration, target_rms, seed,
                 )
 
     def _infer(
         self, text, ref_audio_path, ref_text, speed, nfe_step, cfg_strength,
-        sway_sampling_coef, cross_fade_duration,
+        sway_sampling_coef, cross_fade_duration, target_rms, seed,
     ) -> np.ndarray:
         wav, sr, _ = self._model.infer(
             ref_file=str(ref_audio_path),
@@ -185,7 +191,8 @@ class TTSEngine:
             speed=float(speed),
             sway_sampling_coef=float(sway_sampling_coef),
             cross_fade_duration=float(cross_fade_duration),
-            seed=random.randrange(HASH_SEED_MAX),
+            target_rms=float(target_rms),
+            seed=int(seed),
         )
         wav = np.asarray(wav, dtype=np.float32).reshape(-1)
         if sr != SAMPLE_RATE:

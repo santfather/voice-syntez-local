@@ -9,6 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import audio_analysis, config, transcribe
+from .denoise import clean_bytes as clean_reference_bytes
+from .engines.base import (
+    ENGINE_F5,
+    ENGINE_INFOS,
+    default_engine_for_gender,
+    normalize_engine_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +29,30 @@ def _with_demo_prefix(name: str) -> str:
     return name if name.lower().startswith(DEMO_PREFIX) else f"{DEMO_PREFIX} {name}"
 
 
+def _resolve_engine(engine: str | None, gender: str) -> str:
+    """Движок голоса: явный выбор пользователя, иначе подсказка по полу.
+
+    Терпимо относится к неизвестному id: `voices.json` могли дописать руками или
+    откатить, и терять из-за этого весь список голосов незачем. Явный выбор
+    через API проверяется отдельно (`check_engine`) — там ошибку видно сразу.
+    """
+    if engine in ENGINE_INFOS:
+        return engine
+    if engine:
+        logger.warning("Неизвестный движок «%s» у голоса — беру подсказку по полу", engine)
+    return default_engine_for_gender(gender)
+
+
+def check_engine(engine: str) -> str:
+    """Проверяет движок, пришедший от пользователя: опечатка должна быть ошибкой."""
+    if engine not in ENGINE_INFOS:
+        known = ", ".join(sorted(ENGINE_INFOS))
+        raise ValueError(f"Неизвестный движок синтеза: {engine or '(пусто)'}. Доступны: {known}")
+    return engine
+
+
 def _inspect_reference(audio_bytes: bytes, suffix: str, name: str, gender: str) -> dict:
-    """Проверяет референс перед сохранением: F0 против заявленного пола и демо-файлы F5-TTS.
+    """Проверяет референс перед сохранением: F0 против заявленного пола, полоса частот и демо-файлы F5-TTS.
 
     Ничего не блокирует — только собирает метки для карточки голоса и лога.
     """
@@ -34,6 +63,7 @@ def _inspect_reference(audio_bytes: bytes, suffix: str, name: str, gender: str) 
     return {
         "f0_hz": estimate.f0_hz,
         "gender_warning": audio_analysis.check_gender_mismatch(estimate.f0_hz, gender),
+        "band_warning": estimate.band_warning,
         "is_demo": bool(demo_source),
         "demo_source": demo_source,
         "name": _with_demo_prefix(name) if demo_source else name,
@@ -50,9 +80,16 @@ class Voice:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     f0_hz: float | None = None  # измеренная высота тона референса, Гц
     gender_warning: str | None = None  # F0 противоречит заявленному полу
+    band_warning: str | None = None  # запись узкополосная: верх срезан кодеком/телефоном
     is_demo: bool = False  # файл — копия демо-клипа из пакета f5_tts
     demo_source: str | None = None  # имя этого демо-файла
     ref_text_warning: str | None = None  # расшифровка не совпала с записью
+    # Движок синтеза выбирается отдельно для каждого голоса (см. engines/base):
+    # один и тот же текст может озвучиваться разными моделями в одном диалоге.
+    engine: str = ENGINE_F5
+    # Значения ручек выбранного движка (температура и т.п.) — дефолты для этого
+    # голоса; карточка слота может переопределить их на одну генерацию.
+    engine_params: dict = field(default_factory=dict)
 
     @property
     def audio_path(self) -> Path:
@@ -88,7 +125,14 @@ class VoicesStore:
             # версией) не должны ронять весь список голосов.
             known = {key: value for key, value in item.items() if key in _VOICE_FIELDS}
             try:
-                voices.append(Voice(**known))
+                voice = Voice(**known)
+                # Движок и его ручки приводим к известным значениям: файл могли
+                # править руками, а дальше эти данные уходят прямо в модель.
+                voice.engine = _resolve_engine(voice.engine, voice.gender)
+                voice.engine_params = normalize_engine_params(
+                    voice.engine, voice.engine_params if isinstance(voice.engine_params, dict) else {}
+                )
+                voices.append(voice)
             except TypeError as exc:  # запись без обязательного поля — пропускаем
                 logger.warning("Пропускаю некорректную запись в voices.json: %s", exc)
         return voices
@@ -99,13 +143,25 @@ class VoicesStore:
             encoding="utf-8",
         )
 
-    def _resolve_ref_text(self, audio_path: Path, ref_text: str) -> tuple[str, str | None]:
+    def _resolve_ref_text(self, audio_path: Path, ref_text: str, verify: bool) -> tuple[str, str | None]:
         """Готовит дословную расшифровку референса и сверяет её с введённой вручную.
 
         Пустое поле заполняем распознанным текстом: без него F5-TTS поднимает
         собственный ASR уже во время синтеза, в основном процессе.
+
+        `verify=False` — запись сделана в браузере по показанной на экране фразе:
+        текст известен точно, и распознавание (десятки секунд) превратилось бы из
+        проверки в лишний шаг. Отключает его пользователь осознанно, галочкой.
         """
         declared = ref_text.strip()
+        if not verify:
+            if not declared:
+                raise ValueError(
+                    "Нет расшифровки записи — впишите текст вручную или включите сверку с записью"
+                )
+            logger.info("Расшифровка референса %s взята из формы без распознавания", audio_path.name)
+            return declared, None
+
         try:
             result = transcribe.transcribe_file(audio_path)
         except RuntimeError as exc:
@@ -133,7 +189,17 @@ class VoicesStore:
     def get(self, voice_id: str) -> Voice | None:
         return next((v for v in self.list() if v.id == voice_id), None)
 
-    def create(self, name: str, gender: str, ref_text: str, audio_filename: str, audio_bytes: bytes) -> Voice:
+    def create(
+        self,
+        name: str,
+        gender: str,
+        ref_text: str,
+        audio_filename: str,
+        audio_bytes: bytes,
+        verify_ref_text: bool = True,
+        engine: str = "",
+        denoise: bool = False,
+    ) -> Voice:
         suffix = Path(audio_filename).suffix.lower()
         if suffix not in ALLOWED_AUDIO_SUFFIXES:
             raise ValueError(f"Неподдерживаемый формат аудио: {suffix or '(нет расширения)'}")
@@ -145,6 +211,12 @@ class VoicesStore:
             raise ValueError("Не задано имя голоса")
 
         gender = gender if gender in ("male", "female", "other") else "other"
+        engine = check_engine(engine) if engine else default_engine_for_gender(gender)
+        if denoise:
+            # Чистим до всех проверок и до записи файла: и F0, и полоса, и расшифровка
+            # должны считаться по той записи, которая реально уйдёт в модель.
+            audio_bytes = clean_reference_bytes(audio_bytes, suffix)
+            suffix = ".wav"  # денойзер всегда отдаёт wav, чем бы ни был исходник
         checks = _inspect_reference(audio_bytes, suffix, name.strip(), gender)
 
         voice_id = uuid.uuid4().hex[:12]
@@ -154,7 +226,7 @@ class VoicesStore:
         try:
             # Распознавание — до захвата блокировки: это десятки секунд, и держать
             # на них список голосов (GET /api/voices) незачем.
-            final_text, text_warning = self._resolve_ref_text(audio_path, ref_text)
+            final_text, text_warning = self._resolve_ref_text(audio_path, ref_text, verify_ref_text)
             with self._lock:
                 voices = self._read()
                 voice = Voice(
@@ -165,9 +237,11 @@ class VoicesStore:
                     audio_file=filename,
                     f0_hz=checks["f0_hz"],
                     gender_warning=checks["gender_warning"],
+                    band_warning=checks["band_warning"],
                     is_demo=checks["is_demo"],
                     demo_source=checks["demo_source"],
                     ref_text_warning=text_warning,
+                    engine=engine,
                 )
                 voices.append(voice)
                 self._write(voices)
@@ -175,7 +249,9 @@ class VoicesStore:
             # Запись не сохранилась — не оставляем осиротевший файл в voices/.
             audio_path.unlink(missing_ok=True)
             raise
-        logger.info("Добавлен голос %s (%s), F0=%s Гц", voice.name, voice.id, voice.f0_hz)
+        logger.info(
+            "Добавлен голос %s (%s), движок %s, F0=%s Гц", voice.name, voice.id, voice.engine, voice.f0_hz
+        )
         if voice.is_demo:
             logger.warning(
                 "Голос «%s» — это демо-клип F5-TTS (%s), а не пользовательская запись",
@@ -183,8 +259,34 @@ class VoicesStore:
             )
         if voice.gender_warning:
             logger.warning("Голос «%s»: %s", voice.name, voice.gender_warning)
+        if voice.band_warning:
+            logger.warning("Голос «%s»: %s", voice.name, voice.band_warning)
         if voice.ref_text_warning:
             logger.warning("Голос «%s»: %s", voice.name, voice.ref_text_warning)
+        return voice
+
+    def update(self, voice_id: str, engine: str | None = None, engine_params: dict | None = None) -> Voice:
+        """Меняет движок и его ручки у существующего голоса.
+
+        Записи голоса не трогаются: движок — это свойство голоса, а не проекта,
+        и его смена не требует перезаписи референса или его расшифровки.
+        """
+        engine = check_engine(engine) if engine else None
+        with self._lock:
+            voices = self._read()
+            voice = next((v for v in voices if v.id == voice_id), None)
+            if voice is None:
+                raise KeyError(voice_id)
+            if engine is not None:
+                voice.engine = engine
+            if engine_params is not None:
+                voice.engine_params = normalize_engine_params(voice.engine, engine_params)
+            # Ручки прошлого движка к новому не относятся (у XTTS нет nfe_step),
+            # поэтому при смене движка набор значений пересобирается заново.
+            elif engine is not None:
+                voice.engine_params = {}
+            self._write(voices)
+        logger.info("Голос %s: движок %s", voice_id, voice.engine)
         return voice
 
     def inspect_existing(self) -> int:
