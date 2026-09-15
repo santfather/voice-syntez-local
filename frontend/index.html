@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TTS-дашборд — озвучка диалогов</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>Озвучка диалогов</h1>
+  <span class="muted">F5-TTS Russian · accent tune</span>
+  <div class="status">
+    <span class="dot" id="status-dot"></span>
+    <span id="status-text">проверяю состояние…</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="voices">Голоса</button>
+  <button class="tab" data-tab="dialogue">Озвучка диалога</button>
+  <button class="tab" data-tab="text">Сплошной текст</button>
+</nav>
+
+<!-- Вкладка 1: голоса -->
+<main class="tab-panel" id="tab-voices">
+  <div class="column">
+    <section class="panel">
+      <h2>Мои голоса</h2>
+      <div class="row between">
+        <span class="muted">Настройте голос и прослушайте фразу — и только потом переходите к озвучке диалога.</span>
+        <button class="tiny ghost" id="btn-reload-voices">обновить</button>
+      </div>
+      <div id="voice-cards"></div>
+    </section>
+  </div>
+
+  <div class="column">
+    <section class="panel">
+      <h2>Новый голос</h2>
+      <div class="drop" id="new-voice-drop">Перетащите сюда аудио (wav/mp3/m4a) или кликните</div>
+      <input type="file" accept="audio/*" hidden id="new-voice-file" />
+      <label class="field" style="margin-top: 12px">
+        <span>Имя голоса</span>
+        <input type="text" id="new-voice-name" placeholder="Например: Иван" />
+      </label>
+      <label class="field">
+        <span>Пол</span>
+        <select id="new-voice-gender">
+          <option value="male">мужской</option>
+          <option value="female">женский</option>
+          <option value="other">другое</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Что сказано в референсе (точная расшифровка)</span>
+        <div class="row">
+          <input type="text" id="new-voice-ref-text" placeholder="Текст, который произнесён в записи" style="flex: 1 1 160px" />
+          <button class="tiny" id="btn-recognize-voice" type="button">распознать</button>
+        </div>
+        <span class="muted" id="recognize-status"></span>
+      </label>
+      <div class="row">
+        <button class="primary" id="btn-save-voice">Сохранить голос</button>
+        <span class="muted" id="new-voice-status"></span>
+      </div>
+      <p class="hint muted">
+        Референс: 5–15 секунд чистой речи одного человека, без музыки и шума.
+        Расшифровка должна совпадать с записью дословно — если она от другой записи,
+        синтез выйдет невнятным. Поэтому при сохранении расшифровка сверяется с
+        записью, а пустое поле заполняется автоматически (нужны десятки секунд).
+        Для F5-TTS используется только первый фрагмент до ~12 секунд.
+        После сохранения дашборд измеряет высоту тона записи и предупредит, если она
+        не сходится с выбранным полом или файл оказался демо-клипом F5-TTS.
+      </p>
+      <div class="alert error" id="voice-error"></div>
+    </section>
+  </div>
+</main>
+
+<!-- Вкладка 2: озвучка диалога -->
+<main class="tab-panel" id="tab-dialogue" hidden>
+  <div class="column">
+    <!-- Панель 1 -->
+    <section class="panel">
+      <h2>1 · Текст диалога</h2>
+      <textarea id="dialogue" spellcheck="false"
+        placeholder="АРТЕМ(1): Привет! МАРГО(2): И тебе привет. Как дела? (3) — спросила девушка."></textarea>
+      <div class="row" style="margin-top: 12px">
+        <button id="btn-detect" class="primary">Определить голоса</button>
+        <span class="muted" id="parse-summary"></span>
+      </div>
+      <p class="hint muted">
+        <b>Голос задаётся маркером <code>(N)</code></b> — номером слота, которому в панели справа
+        назначен голос. Маркер работает в любом месте текста и переключает голос для всего,
+        что идёт до следующего маркера:<br />
+        <code>АРТЕМ(1): Привет!</code> — имя-метка (в аудио не читается) + слот 1;<br />
+        <code>(2) Как дела?</code> — слот 2 без имени, можно прямо посреди строки;<br />
+        <code>(3 speed=1.2 cfg=2.5 nfe=16) — спросила девушка.</code> — параметры прямо в маркере,
+        они важнее настроек карточки.<br />
+        Старый формат <code>Имя: реплика</code> тоже работает и свободно смешивается со слотами;
+        текст до первого маркера читает <b>слот 1</b>.
+        Ударения расставляются автоматически; можно указать вручную знаком <code>+</code> перед гласной.
+      </p>
+      <div class="alert error" id="parse-error"></div>
+    </section>
+
+    <!-- Панель 3 -->
+    <section class="panel">
+      <h2>3 · Глобальные настройки</h2>
+      <div class="grid-2">
+        <label class="field">
+          <span class="slider-head">Пауза между репликами <b id="pause-value">400 мс</b></span>
+          <input type="range" id="pause" min="0" max="2000" step="50" value="400" />
+        </label>
+        <label class="field">
+          <span class="slider-head">Кроссфейд <b id="crossfade-value">0.15 с</b></span>
+          <input type="range" id="crossfade" min="0" max="0.5" step="0.05" value="0.15" />
+        </label>
+      </div>
+      <div class="grid-2" style="margin-top: 4px">
+        <label class="toggle">
+          <input type="checkbox" id="auto-accent" checked />
+          Автоматически расставлять ударения (RUAccent)
+        </label>
+        <label class="field" style="margin: 0">
+          <span>Формат вывода</span>
+          <select id="output-format">
+            <option value="mp3">MP3</option>
+            <option value="wav">WAV</option>
+          </select>
+        </label>
+      </div>
+    </section>
+  </div>
+
+  <div class="column">
+    <!-- Панель 2 -->
+    <section class="panel">
+      <h2>2 · Голоса: слоты и спикеры</h2>
+      <div id="voice-configs" class="muted">
+        Вставьте диалог и нажмите «Определить голоса».
+      </div>
+      <p class="hint muted">
+        «Слот N» — голос для маркера <code>(N)</code> из текста, имя — для реплик вида
+        <code>Имя:</code>. Нужен новый голос? Загрузите и прослушайте его во вкладке <b>«Голоса»</b>.
+      </p>
+    </section>
+
+    <!-- Панель 4 -->
+    <section class="panel">
+      <h2>4 · Генерация</h2>
+      <div class="row">
+        <button id="btn-generate" class="primary" disabled>Сгенерировать</button>
+        <span class="muted" id="job-status">—</span>
+      </div>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div class="alert error" id="job-error"></div>
+      <audio id="player" controls hidden></audio>
+      <div class="row" style="margin-top: 12px">
+        <a id="download-link" class="muted" href="#" download hidden>скачать файл</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- Вкладка 3: сплошной текст -->
+<main class="tab-panel" id="tab-text" hidden>
+  <div class="column">
+    <section class="panel">
+      <h2>1 · Текст</h2>
+      <div class="drop" id="text-drop">Перетащите сюда .txt или .md — или кликните</div>
+      <input type="file" accept=".txt,.md,text/plain,text/markdown" hidden id="text-file" />
+      <textarea id="text-body" spellcheck="false" style="margin-top: 12px"
+        placeholder="Вставьте сплошной текст — он будет озвучен одним голосом."></textarea>
+      <div class="row" style="margin-top: 12px">
+        <span class="muted" id="text-summary"></span>
+      </div>
+      <p class="hint muted">
+        Весь файл читает один голос. Текст режется на куски <b>по границам предложений и абзацев</b>,
+        а не по числу символов: F5-TTS синтезирует каждый кусок с нуля и не помнит предыдущие,
+        поэтому обрыв внутри фразы дал бы сброс интонации посреди мысли. Пунктуация передаётся
+        модели как есть — паузы и интонацию она расставляет сама. На стыках кусков возможен
+        небольшой сброс темпа — это свойство блочной генерации.
+      </p>
+      <div class="alert error" id="text-error"></div>
+    </section>
+
+    <section class="panel">
+      <h2>3 · Настройки</h2>
+      <div class="grid-2">
+        <label class="field">
+          <span class="slider-head">Пауза между кусками <b id="text-pause-value">400 мс</b></span>
+          <input type="range" id="text-pause" min="0" max="2000" step="50" value="400" />
+        </label>
+        <label class="field">
+          <span class="slider-head">Кроссфейд <b id="text-crossfade-value">0.15 с</b></span>
+          <input type="range" id="text-crossfade" min="0" max="0.5" step="0.05" value="0.15" />
+        </label>
+      </div>
+      <div class="grid-2" style="margin-top: 4px">
+        <label class="toggle">
+          <input type="checkbox" id="text-auto-accent" checked />
+          Автоматически расставлять ударения (RUAccent)
+        </label>
+        <label class="field" style="margin: 0">
+          <span>Формат вывода</span>
+          <select id="text-output-format">
+            <option value="mp3">MP3</option>
+            <option value="wav">WAV</option>
+          </select>
+        </label>
+      </div>
+    </section>
+  </div>
+
+  <div class="column">
+    <section class="panel">
+      <h2>2 · Голос и параметры</h2>
+      <label class="field">
+        <span>Голос</span>
+        <select id="text-voice">
+          <option value="">— выберите голос —</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="slider-head">Скорость речи <b id="text-speed-label">1.00x</b></span>
+        <input type="range" id="text-speed" min="0.5" max="2" step="0.05" value="1" />
+      </label>
+      <label class="field">
+        <span class="slider-head">CFG strength — стабильность ↔ выразительность <b id="text-cfg-label">2.0</b></span>
+        <input type="range" id="text-cfg" min="1" max="4" step="0.1" value="2" />
+      </label>
+      <label class="field" style="margin-bottom:0">
+        <span>NFE steps — быстрее ↔ качественнее</span>
+        <select id="text-nfe">
+          <option value="8">8</option>
+          <option value="16">16</option>
+          <option value="32" selected>32 (максимум качества)</option>
+        </select>
+      </label>
+      <p class="hint muted">
+        Нужен новый голос? Загрузите и прослушайте его во вкладке <b>«Голоса»</b>.
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>4 · Генерация</h2>
+      <div class="row">
+        <button id="btn-render-text" class="primary" disabled>Озвучить текст</button>
+        <span class="muted" id="text-job-status">—</span>
+      </div>
+      <div class="progress"><div id="text-progress-bar"></div></div>
+      <div class="alert error" id="text-job-error"></div>
+      <audio id="text-player" controls hidden></audio>
+      <div class="row" style="margin-top: 12px">
+        <a id="text-download-link" class="muted" href="#" download hidden>скачать файл</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
