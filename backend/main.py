@@ -11,10 +11,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
+from starlette.background import BackgroundTask
 
 from . import (
     audio_analysis,
@@ -24,6 +25,7 @@ from . import (
     denoise,
     engine_lifecycle,
     model_manager,
+    project_export,
     resource_guard,
     take_quality,
     timeline,
@@ -1617,6 +1619,121 @@ async def delete_project(project_id: str) -> dict:
     if not get_projects_store().delete_project(project_id):
         raise HTTPException(status_code=404, detail="Проект не найден")
     return {"deleted": project_id}
+
+
+# --- экспорт и импорт проекта --------------------------------------------------
+# Ни один из этих роутов не синтезирует: экспорт собирает файл из уже готовых
+# take'ов по таймлайну, импорт разворачивает архив. Поэтому здесь нет очереди и
+# статусов задач — результат отдаётся сразу файлом.
+def _attachment(path: Path, media_type: str, filename: str) -> FileResponse:
+    """Отдаёт временный файл и убирает его каталог после ответа.
+
+    Файл живёт до конца отправки, а не до выхода из обработчика: удалять его раньше
+    значит отдавать оборванный архив на большом проекте.
+    """
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        background=BackgroundTask(project_export.discard, path),
+    )
+
+
+@app.post("/api/projects/{project_id}/export")
+async def export_project(project_id: str) -> FileResponse:
+    """Скачать проект целиком архивом `.ttsproject`.
+
+    Внутри — метаданные, спикеры, реплики, take'ы и референсы используемых голосов.
+    Веса моделей в архив не попадают: проект переносится между машинами, а не
+    чекпоинты.
+    """
+    project = _project_or_404(project_id)
+    path = await asyncio.to_thread(project_export.export_project_archive, project)
+    name = f"{project_export.safe_name(project.get('name'))}{project_export.ARCHIVE_SUFFIX}"
+    return _attachment(path, "application/zip", name)
+
+
+@app.get("/api/projects/{project_id}/export/audio")
+async def export_project_audio(
+    project_id: str, file_format: Annotated[str, Query(alias="format")] = "wav"
+) -> FileResponse:
+    """Итоговый трек проекта: WAV или MP3.
+
+    Собирается из активных take'ов с паузами таймлайна, поэтому его длительность
+    совпадает с `GET /api/projects/{id}/timeline`, а звучание — с рендером.
+    """
+    project = _project_or_404(project_id)
+    try:
+        path = await asyncio.to_thread(project_export.export_final_audio, project, file_format)
+    except project_export.ProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    media_type = "audio/wav" if file_format == "wav" else "audio/mpeg"
+    name = f"{project_export.safe_name(project.get('name'))}.{file_format}"
+    return _attachment(path, media_type, name)
+
+
+@app.get("/api/projects/{project_id}/export/replicas")
+async def export_project_replicas(project_id: str) -> FileResponse:
+    """ZIP с отдельными WAV: по одному файлу на каждую звучащую реплику."""
+    project = _project_or_404(project_id)
+    try:
+        path = await asyncio.to_thread(project_export.export_replicas_archive, project)
+    except project_export.ProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    name = f"{project_export.safe_name(project.get('name'))}-replicas.zip"
+    return _attachment(path, "application/zip", name)
+
+
+@app.get("/api/projects/{project_id}/export/stems")
+async def export_project_stems(project_id: str) -> FileResponse:
+    """ZIP со stems по спикерам: дорожки синхронны друг с другом и с итоговым треком."""
+    project = _project_or_404(project_id)
+    try:
+        path = await asyncio.to_thread(project_export.export_stems_archive, project)
+    except project_export.ProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    name = f"{project_export.safe_name(project.get('name'))}-stems.zip"
+    return _attachment(path, "application/zip", name)
+
+
+@app.get("/api/projects/{project_id}/export/transcript")
+async def export_project_transcript(project_id: str) -> FileResponse:
+    """Транскрипт JSON: реплика, спикер, голос, текст и реальные start/end."""
+    project = _project_or_404(project_id)
+    path = await asyncio.to_thread(project_export.export_transcript, project)
+    name = f"{project_export.safe_name(project.get('name'))}-transcript.json"
+    return _attachment(path, "application/json", name)
+
+
+@app.get("/api/projects/{project_id}/export/subtitles")
+async def export_project_subtitles(
+    project_id: str, file_format: Annotated[str, Query(alias="format")] = "srt"
+) -> FileResponse:
+    """Субтитры SRT или VTT по реальным таймстемпам таймлайна."""
+    project = _project_or_404(project_id)
+    try:
+        path = await asyncio.to_thread(project_export.export_subtitles, project, file_format)
+    except project_export.ProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    media_type = "application/x-subrip" if file_format == "srt" else "text/vtt"
+    name = f"{project_export.safe_name(project.get('name'))}.{file_format}"
+    return _attachment(path, media_type, name)
+
+
+@app.post("/api/projects/import", status_code=201)
+async def import_project(file: Annotated[UploadFile, File()]) -> dict:
+    """Импорт архива `.ttsproject` — новый проект, ничего не перезаписывая.
+
+    Голоса сопоставляются по имени: уже существующие не перезаписываются,
+    отсутствующие создаются из референсов внутри архива. Ошибка импорта — 400 с
+    понятным текстом, и ни проекта, ни файлов после неё не остаётся.
+    """
+    data = await file.read()
+    try:
+        project = await asyncio.to_thread(project_export.import_archive, data)
+    except project_export.ProjectExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _project_payload(project)
 
 
 @app.post("/api/projects/{project_id}/parse")

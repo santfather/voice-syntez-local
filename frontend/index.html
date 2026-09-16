@@ -390,6 +390,53 @@
           </p>
         </div>
       </section>
+
+      <!-- Панель 6 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">06</span>
+          <div>
+            <h2>ЭКСПОРТ И ИМПОРТ</h2>
+            <p>Архив проекта <code>.ttsproject</code>, аудио и субтитры.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="grid-2">
+            <label class="field" style="margin: 0">
+              <span>Что выгрузить</span>
+              <select id="export-kind">
+                <option value="archive">Архив проекта (.ttsproject)</option>
+                <option value="wav">Итоговый трек — WAV</option>
+                <option value="mp3">Итоговый трек — MP3</option>
+                <option value="replicas">Реплики отдельными WAV (ZIP)</option>
+                <option value="stems">Stems по спикерам (ZIP)</option>
+                <option value="transcript">Транскрипт (JSON)</option>
+                <option value="srt">Субтитры SRT</option>
+                <option value="vtt">Субтитры VTT</option>
+              </select>
+            </label>
+            <label class="field" style="margin: 0">
+              <span>Импорт на этой машине</span>
+              <button id="btn-import-project" class="outline-button" type="button">
+                Выбрать .ttsproject
+              </button>
+            </label>
+          </div>
+          <input type="file" accept=".ttsproject,.zip,application/zip" hidden id="import-file" />
+          <div class="row" style="margin-top: 12px">
+            <button id="btn-export-project" class="primary" disabled>Экспорт</button>
+            <span class="muted" id="export-status">—</span>
+          </div>
+          <div class="alert error" id="export-error"></div>
+          <p class="hint muted">
+            Архив несёт метаданные, спикеров, реплики, take'ы и референсы используемых
+            голосов — <b>без весов моделей</b>. При импорте новый проект создаётся рядом:
+            существующий диалог не перезаписывается. Голоса сопоставляются по имени,
+            отсутствующие создаются из референсов архива. Субтитры и stems идут по
+            реальным таймстемпам таймлайна, поэтому совпадают с итоговым треком.
+          </p>
+        </div>
+      </section>
     </div>
   </div>
 </div>

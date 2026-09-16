@@ -298,6 +298,90 @@ class ProjectsStore:
             replicas.select_take(int(replica["id"]), take_id)
         return self.get_project(project_id)  # type: ignore[return-value]
 
+    # -- импорт проекта --------------------------------------------------------
+    def import_project_content(
+        self,
+        project_id: str,
+        speakers: dict[str, dict],
+        replicas: list[dict],
+        takes: dict[int, list[dict]],
+        status: str | None = None,
+    ) -> dict:
+        """Наполняет пустой проект содержимым архива за одну транзакцию.
+
+        Импорт — это не «разобрать текст»: у реплик уже есть тексты, голоса,
+        статусы и готовые take'ы, а порядок take'ов и активный из них несут смысл.
+        Разбор (`parse_project`) пересоздал бы их из исходного текста и потерял бы
+        всё это, поэтому строки пишутся напрямую, а выбор take'а восстанавливается
+        после вставки — по id, которого до неё ещё нет.
+
+        Одна транзакция на весь проект: частично восстановленный диалог
+        (спикеры есть, take'ов нет) выглядел бы рабочим, но звучал бы иначе.
+        """
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            if projects.get(project_id) is None:
+                raise KeyError(project_id)
+            projects.replace_speakers(project_id, speakers)
+            replicas_repo = ReplicasRepository(connection)
+            replicas_repo.replace(
+                project_id,
+                [
+                    {
+                        "index": int(item["index"]),
+                        "text": str(item.get("text") or ""),
+                        "speaker": str(item.get("speaker") or ""),
+                        "voice_id": str(item.get("voice_id") or ""),
+                        "overrides": item.get("overrides") or {},
+                    }
+                    for item in replicas
+                ],
+            )
+            by_index = {
+                int(item["index"]): item for item in replicas_repo.list_for_project(project_id)
+            }
+            takes_repo = TakesRepository(connection)
+            for item in replicas:
+                index = int(item["index"])
+                replica = by_index.get(index)
+                if replica is None:
+                    continue
+                replica_id = int(replica["id"])
+                override = item.get("voice_override")
+                if override:
+                    replicas_repo.set_voice(replica_id, str(override))
+                selected = False
+                for take in takes.get(index, []):
+                    saved = takes_repo.add(
+                        replica_id=replica_id,
+                        audio_path=str(take["audio_path"]),
+                        label=str(take.get("label") or ""),
+                        seed=take.get("seed"),
+                        engine=str(take.get("engine") or ""),
+                        parameters=take.get("parameters") or {},
+                        duration_sec=float(take.get("duration_sec") or 0.0),
+                        qa=take.get("qa"),
+                        quality=take.get("quality"),
+                    )
+                    if take.get("selected") and not selected:
+                        replicas_repo.select_take(replica_id, int(saved["id"]))
+                        selected = True
+                # Статус восстанавливается только у реплики без активного take:
+                # выбор take'а сам ставит `rendered`, и переписывать его нечем.
+                if not selected:
+                    replicas_repo.set_status(
+                        replica_id, str(item.get("status") or config.REPLICA_STATUS_PENDING)
+                    )
+            if status is None:
+                projects.update(project_id)
+            else:
+                projects.update(project_id, status=status)
+        logger.info(
+            "Проект %s: импортировано %s спикеров и %s реплик",
+            project_id, len(speakers), len(replicas),
+        )
+        return self.get_project(project_id)  # type: ignore[return-value]
+
     # -- результат рендера -----------------------------------------------------
     def save_render_takes(self, project_id: str, job_id: str, takes: list[dict]) -> None:
         """Сохраняет куски готового рендера вариантами реплик.
