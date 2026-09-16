@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio_pipeline, config, resource_guard
+from . import audio_pipeline, benchmark, config, resource_guard
 from .audio_pipeline import (
     NoteCallback,
     ProgressCallback,
@@ -21,6 +21,7 @@ from .audio_pipeline import (
 )
 from .db.store import get_projects_store
 from .dialogue_parser import Replica
+from .voices_store import Voice
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,24 @@ class ProjectTakeTask:
     settings: RenderSettings
 
 
+@dataclass
+class BenchmarkTask:
+    """Сравнение голоса на нескольких движках: одна фраза, один reference.
+
+    Голос передаётся снимком, готовым на момент постановки: очередь про
+    хранилище голосов не знает (как и про проекты), а сравнение не должно
+    менять движок посреди прогона, если пользователь переключил его в карточке.
+    """
+
+    job_id: str
+    run_id: str
+    voice: Voice
+    text: str
+    engines: list[str]
+    qa: str
+    auto_accent: bool
+
+
 class JobQueue:
     """Единственный воркер: следующая задача не начнётся, пока не закончится текущая."""
 
@@ -288,6 +307,56 @@ class JobQueue:
         logger.info("Проект %s: пересинтез реплики %s", project_id, index + 1)
         return job
 
+    def submit_benchmark(
+        self,
+        voice: Voice,
+        text: str,
+        engines: list[str],
+        qa: str,
+        auto_accent: bool,
+    ) -> tuple[Job, benchmark.BenchmarkRun]:
+        """Ставит в очередь сравнение голоса на нескольких движках.
+
+        Через ту же очередь, что и синтез: сравнение поднимает и держит модели
+        ровно так же, и второй параллельный прогон — это гонка за Metal-контекст
+        и двойной расход памяти. Запуск регистрируется в реестре `benchmark`
+        сразу, ещё до старта: интерфейс, опросивший его до начала работы, должен
+        увидеть «в очереди», а не «запуск не найден».
+        """
+        if self._queue is None:
+            raise RuntimeError("Очередь не запущена")
+        engines = list(engines)
+        job = Job(
+            id=uuid.uuid4().hex[:12],
+            total_replicas=len(engines),
+            output_format="wav",
+            message="Сравнение движков: в очереди",
+        )
+        self._jobs[job.id] = job
+        self._order.append(job.id)
+        self._prune()
+        run = benchmark.register(
+            benchmark.BenchmarkRun(
+                id=benchmark.make_run_id(),
+                voice_id=voice.id,
+                text=text,
+                engines=engines,
+            )
+        )
+        self._queue.put_nowait(
+            BenchmarkTask(
+                job_id=job.id,
+                run_id=run.id,
+                voice=voice,
+                text=text,
+                engines=engines,
+                qa=qa,
+                auto_accent=auto_accent,
+            )
+        )
+        logger.info("Сравнение %s: голос %s, движки %s", run.id, voice.id, ", ".join(engines))
+        return job, run
+
     @staticmethod
     def find_variant(job: Job, index: int, variant_id: str) -> "audio_pipeline.ChunkVariant":
         """Вариант по id; отсутствие — ошибка запроса, а не пустая ветка.
@@ -335,7 +404,8 @@ class JobQueue:
         return job, job.payload
 
     def _enqueue(
-        self, task: RenderTask | RegenerateTask | SelectVariantTask | ProjectTakeTask
+        self,
+        task: RenderTask | RegenerateTask | SelectVariantTask | ProjectTakeTask | BenchmarkTask,
     ) -> None:
         queue = self._queue
         if queue is None:
@@ -374,6 +444,8 @@ class JobQueue:
                     await self._select_variant(task)
                 elif isinstance(task, ProjectTakeTask):
                     await self._project_take(task)
+                elif isinstance(task, BenchmarkTask):
+                    await self._benchmark(task)
                 else:
                     await self._render(task)
             finally:
@@ -691,6 +763,62 @@ class JobQueue:
         finally:
             self._current_job_id = None
             job.finished_at = _now_iso()
+
+    async def _benchmark(self, task: BenchmarkTask) -> None:
+        """Сравнивает голос на выбранных движках тем же единственным воркером.
+
+        Ошибка одного движка живёт в его строке результата, а не в задаче: run
+        завершается `done`, если прогон состоялся, — иначе пропала бы и та
+        часть сравнения, которая получилась.
+        """
+        job = self._jobs.get(task.job_id)
+        run = benchmark.get_run(task.run_id)
+        if job is None or run is None:
+            return
+        self._current_job_id = job.id
+        self._abort_requested = False
+        job.status = JobStatus.PROCESSING
+        job.started_at = _now_iso()
+        run.status = benchmark.RUN_RUNNING
+        # Свой счётчик, а не общий прогресс рендера: у сравнения шаг — движок,
+        # а не реплика, и «Реплика 1 из 3» в статусе читалось бы неверно.
+        def on_progress(index: int, total: int, label: str) -> None:
+            job.current_replica = index - 1
+            job.current_voice = label
+            job.message = f"Движок {index} из {total} — {label}"
+
+        try:
+            await benchmark.run_benchmark(
+                run,
+                task.voice,
+                qa_mode=task.qa,
+                auto_accent=task.auto_accent,
+                wait_for_memory=lambda: self._wait_for_memory(job.id),
+                on_note=self._note_callback(job),
+                on_progress=on_progress,
+            )
+            job.current_replica = job.total_replicas
+            job.message = "Сравнение готово"
+            job.status = JobStatus.DONE
+            run.status = benchmark.RUN_DONE
+        except asyncio.CancelledError:
+            job.status = JobStatus.ERROR
+            job.error = "Отменено (остановка сервера)"
+            run.status = benchmark.RUN_ERROR
+            run.error = job.error
+            raise
+        except Exception as exc:
+            job.status = JobStatus.ERROR
+            job.error = str(exc)
+            job.message = "Ошибка"
+            run.status = benchmark.RUN_ERROR
+            run.error = str(exc)
+            logger.exception("Сравнение %s упало", task.run_id)
+        finally:
+            self._current_job_id = None
+            self._abort_requested = False
+            job.finished_at = _now_iso()
+            run.finished_at = job.finished_at
 
     async def _keep_current(
         self, job: Job, index: int, settings: RenderSettings, source_path: Path

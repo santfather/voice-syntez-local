@@ -432,6 +432,19 @@ def _engine_for(voice: Voice) -> SynthesisEngine:
         raise ValueError(f"У голоса «{voice.name}» неизвестный движок «{voice.engine}»") from exc
 
 
+def engine_for_id(engine_id: str) -> SynthesisEngine:
+    """Движок по id, без карточки голоса.
+
+    Нужен сравнению движков: оно перебирает движки для одного и того же голоса,
+    поэтому выбирать движок «из голоса» здесь нечего. Ошибка — понятным текстом,
+    а не молчаливым F5: неизвестный id должен быть виден вызывающему.
+    """
+    try:
+        return get_engine(engine_id)
+    except ValueError as exc:
+        raise ValueError(f"Неизвестный движок синтеза: {engine_id}") from exc
+
+
 @dataclass(frozen=True)
 class TextStages:
     """Путь текста до модели по стадиям — то, что показывает preview.
@@ -992,6 +1005,52 @@ async def synthesize_replica(
     return prepared, seed, qa_outcome
 
 
+async def synthesize_take(
+    engine: SynthesisEngine,
+    voice: Voice,
+    text: str,
+    tuning: SpeakerSettings,
+    settings: RenderSettings,
+    *,
+    label: str,
+    wait_for_memory: WaitForMemory | None = None,
+    on_note: NoteCallback | None = None,
+) -> tuple[np.ndarray, int | None, QaOutcome | None]:
+    """Синтезирует одну фразу вне диалога — тем же путём, что и реплику.
+
+    Нужно сравнению движков: одну и ту же фразу и один и тот же reference читают
+    разные модели, и путь до них обязан совпадать с боевым (preprocessing текста →
+    ограничение инференса по времени → QA-цикл). Иначе замеренное время описывало
+    бы не то, что происходит при обычной генерации.
+    """
+    replica = Replica(voice=tuning.voice_id or voice.id, text=text, line_number=1)
+    return await _synthesize_checked(
+        engine,
+        voice,
+        replica,
+        tuning,
+        settings,
+        position=label,
+        label=label,
+        wait_for_memory=wait_for_memory,
+        on_note=on_note,
+    )
+
+
+def write_take(path: Path, chunk: np.ndarray, tuning: SpeakerSettings) -> float:
+    """Записывает отдельный take wav и возвращает его длительность.
+
+    Take готовится так же, как кусок трека (края, тембр, RMS, затем LUFS и
+    лимитер): сравнение движков слушают на слух, и без выравнивания громкости
+    выбор решала бы громкость, а не голос.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prepared = _prepare_chunk(chunk, tuning)
+    final = _finalize_track(prepared)
+    _write_audio(path, final, "wav")
+    return final.size / SAMPLE_RATE
+
+
 def variant_path(job_id: str, index: int, variant_id: str) -> Path:
     """Файл варианта куска.
 
@@ -1080,6 +1139,26 @@ def voice_engine(voice_id: str) -> str:
     return voice.engine if voice is not None else ""
 
 
+def tuning_parameters(tuning: SpeakerSettings) -> dict:
+    """Эффективные параметры готового резолва — то, чем получен кусок.
+
+    Отдельно от `chunk_parameters`: там параметры считаются по реплике и слоту
+    (наследование), а здесь принимается уже посчитанный результат. Сравнению
+    движков нужен именно второй — оно синтезирует не реплику, а тестовую фразу,
+    и записывает рядом с результатом фактические ручки своего движка.
+    """
+    return {
+        "speed": tuning.speed,
+        "cfg_strength": tuning.cfg_strength,
+        "nfe_step": tuning.nfe_step,
+        "target_rms": tuning.target_rms,
+        "gain_db": tuning.gain_db,
+        "pitch_semitones": tuning.pitch_semitones,
+        "pause_override_ms": tuning.pause_override_ms,
+        "engine_params": dict(tuning.engine_params),
+    }
+
+
 def chunk_parameters(replica: Replica, speaker: SpeakerSettings) -> dict:
     """Эффективные параметры куска — то, чем он реально получен.
 
@@ -1087,17 +1166,7 @@ def chunk_parameters(replica: Replica, speaker: SpeakerSettings) -> dict:
     реплики свои overrides поверх карточки спикера, и «какие настройки были»
     задним числом иначе не восстановить.
     """
-    resolved = _settings_for(replica, speaker)
-    return {
-        "speed": resolved.speed,
-        "cfg_strength": resolved.cfg_strength,
-        "nfe_step": resolved.nfe_step,
-        "target_rms": resolved.target_rms,
-        "gain_db": resolved.gain_db,
-        "pitch_semitones": resolved.pitch_semitones,
-        "pause_override_ms": resolved.pause_override_ms,
-        "engine_params": dict(resolved.engine_params),
-    }
+    return tuning_parameters(_settings_for(replica, speaker))
 
 
 async def apply_variant(
@@ -1164,13 +1233,19 @@ def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
 
 
 def cleanup_output(ttl_hours: float = config.OUTPUT_TTL_HOURS) -> int:
-    """Удаляет готовые файлы старше ttl_hours. Возвращает число удалённых."""
+    """Удаляет готовые файлы старше ttl_hours. Возвращает число удалённых.
+
+    Подкаталоги не трогаются: в `output/projects/` лежат куски проектов, а в
+    `output/benchmarks/` — результаты сравнения движков, и то и другое должно
+    переживать очистку, пока пользователь с ним работает. TTL рассчитан на
+    транзитные файлы задач, которые всегда лежат в корне `output/`.
+    """
     if ttl_hours <= 0:
         return 0
     threshold = time.time() - ttl_hours * 3600
     removed = 0
     for path in config.OUTPUT_DIR.iterdir():
-        if not path.is_file() or path.name == ".gitkeep":
+        if path.is_dir() or path.name == ".gitkeep":
             continue
         try:
             if path.stat().st_mtime < threshold:

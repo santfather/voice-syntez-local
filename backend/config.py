@@ -40,8 +40,13 @@ DB_PATH = Path(os.environ.get("TTS_DB_PATH", DATA_DIR / "voice_syntez.db"))
 # Куски (takes) проектов: по одному wav на реплику, чтобы их можно было
 # прослушать и заменить отдельно от итогового файла.
 PROJECTS_OUTPUT_DIR = OUTPUT_DIR / "projects"
+# Сравнение движков: по одному wav на движок, имя — {run_id}-{engine}.wav.
+# Отдельный каталог, а не файлы в корне output/: TTL-очистка проходит только по
+# файлам верхнего уровня (см. audio_pipeline.cleanup_output), поэтому результат
+# сравнения не пропадает посреди сессии, пока пользователь его слушает.
+BENCHMARKS_DIR = OUTPUT_DIR / "benchmarks"
 
-for _d in (MODELS_DIR, VOICES_DIR, OUTPUT_DIR, DATA_DIR, PROJECTS_OUTPUT_DIR):
+for _d in (MODELS_DIR, VOICES_DIR, OUTPUT_DIR, DATA_DIR, PROJECTS_OUTPUT_DIR, BENCHMARKS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # Режим проекта: диалог со спикерами или сплошной текст одним голосом.

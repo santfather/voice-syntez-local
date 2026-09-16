@@ -90,6 +90,7 @@ def workspace(tmp_path, monkeypatch):
     # прогон зависел бы от того, какие проекты уже созданы на машине.
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "projects.db")
     monkeypatch.setattr(config, "PROJECTS_OUTPUT_DIR", output_dir / "projects")
+    monkeypatch.setattr(config, "BENCHMARKS_DIR", output_dir / "benchmarks")
     return tmp_path
 
 

@@ -607,6 +607,35 @@ audio { width: 100%; margin-top: 12px; }
 /* Что сохранено у голоса: тем же шрифтом, что и статус прослушивания. */
 .preset-state { margin: 8px 0 0; font: 9px var(--mono); }
 
+/* --- сравнение движков -------------------------------------------------------- */
+/* Панель живёт внутри карточки голоса: сравнение — действие над самим голосом,
+   и уводить его на отдельный экран значило бы потерять голос из виду. */
+.benchmark-panel { margin-top: 12px; padding-top: 10px; border-top: 1px solid #25242c; }
+/* Авторский display перебивает [hidden] из UA-стилей — гасим панель явно. */
+.benchmark-panel[hidden] { display: none; }
+.benchmark-head { margin-bottom: 10px; color: #8b8994; font: 9px var(--mono); letter-spacing: 0.08em; }
+.benchmark-engines { display: flex; flex-wrap: wrap; gap: 2px 16px; margin-bottom: 12px; }
+.benchmark-engines .toggle { margin: 0; }
+.compare-button { margin-top: 10px; }
+/* Статус в строке кнопки: длинный текст должен сжиматься, а не выдавливать кнопку. */
+.benchmark-status { flex: 1 1 auto; min-width: 0; font: 9px var(--mono); }
+
+/* Строка одного движка: имя, прослушивание, время синтеза, WER и выбор движка. */
+.benchmark-rows { margin-top: 4px; }
+.benchmark-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid #25242c;
+  font-size: 11px;
+}
+.benchmark-row:last-child { border-bottom: 0; }
+.benchmark-engine { flex: 0 0 auto; min-width: 120px; color: #e4e3e8; font: 700 10px var(--mono); }
+.benchmark-row .muted { font: 9px var(--mono); }
+.benchmark-row button[data-role="benchmark-select"] { margin-left: auto; }
+
 /* --- подвал ------------------------------------------------------------------- */
 footer {
   display: flex;

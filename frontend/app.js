@@ -18,6 +18,7 @@ const state = {
   dictionaryLoaded: false, // словарь уже запрашивался (чтобы не мигать «загружаю»)
   dictionaryEditing: null, // id правила, которое правится в форме (null — новое)
   replicaPreview: {},  // индекс реплики -> {loading} | {data} | {error} для «что услышит модель»
+  benchmark: {},       // voice_id -> состояние панели «сравнить движки»
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
@@ -47,6 +48,10 @@ const state = {
 
 const NFE_OPTIONS = [8, 16, 32];
 const PREVIEW_TEXT = 'Привет! Так звучит этот голос в диалоге.';
+// Фраза для сравнения движков: достаточно длинная, чтобы услышать тембр и
+// интонацию, и с разными типами звуков — на односложном «привет» F5 и XTTS
+// почти неразличимы, а сравнивают именно звучание.
+const BENCHMARK_TEXT = 'Сегодня хорошая погода, и мы наконец можем спокойно обсудить одно небольшое дело.';
 const DROP_HINT = 'Перетащите сюда аудио (wav/mp3/m4a) или кликните';
 
 // Идентификаторы движков совпадают с backend/engines/base.py. Нужны здесь только
@@ -843,9 +848,16 @@ function renderVoiceCards() {
           <span class="muted preview-status" data-role="preview-status"></span>
         </div>
         <p class="muted preset-state" data-role="preset-state">${esc(presetText(voice))}</p>
+        <button class="tiny ghost compare-button" data-role="compare">⇄ Сравнить движки</button>
+        <div class="benchmark-panel" data-role="benchmark" hidden></div>
         <audio data-role="player" controls hidden></audio>
       </div>`;
   }).join('');
+  // Открытые панели сравнения пересобираются: список голосов перечитывается после
+  // правок (например, после выбора движка), и терять результаты на этом нельзя.
+  Object.keys(state.benchmark).forEach((voiceId) => {
+    if (state.benchmark[voiceId].open) renderBenchmarkPanel(voiceId);
+  });
 }
 
 function setPreviewStatus(card, message, isError = false) {
@@ -956,6 +968,274 @@ async function saveVoiceEngineParams(voiceId, params) {
     });
   } catch (error) {
     showAlert($('voice-error'), error.message);
+  }
+}
+
+// --- сравнение движков --------------------------------------------------------
+// Одна фраза и один reference, разные модели: система показывает время синтеза и
+// WER как справку и ничего не ранжирует — движок выбирает человек кнопкой.
+function benchmarkState(voiceId) {
+  if (!state.benchmark[voiceId]) {
+    state.benchmark[voiceId] = {
+      open: false,
+      text: BENCHMARK_TEXT,
+      engines: [],   // пусто — «все объявленные»; заполняется при открытии панели
+      qa: 'off',
+      runId: null,
+      data: null,
+      busy: false,
+      error: '',
+      timer: null,
+    };
+  }
+  return state.benchmark[voiceId];
+}
+
+function stopBenchmarkPoll(voiceId) {
+  const cfg = state.benchmark[voiceId];
+  if (cfg && cfg.timer) {
+    clearInterval(cfg.timer);
+    cfg.timer = null;
+  }
+}
+
+function benchmarkSeconds(value) {
+  return value === null || value === undefined ? '—' : `${Number(value).toFixed(1)} сек`;
+}
+
+function benchmarkWer(result) {
+  const wer = result.qa ? result.qa.wer : null;
+  return wer === null || wer === undefined ? 'WER: —' : `WER: ${Number(wer).toFixed(2)}`;
+}
+
+function benchmarkRowHtml(voice, result) {
+  const label = esc(result.engine_label || result.engine);
+  if (result.status === 'done') {
+    const chosen = Boolean(voice) && voice.engine === result.engine;
+    return `
+      <div class="benchmark-row">
+        <b class="benchmark-engine">${label}</b>
+        <button class="tiny" data-role="benchmark-play" data-engine="${esc(result.engine)}"
+                data-url="${esc(result.audio_url)}">Play</button>
+        <span class="muted">Render: ${benchmarkSeconds(result.render_sec)}</span>
+        <span class="muted">${benchmarkWer(result)}</span>
+        <button class="tiny${chosen ? '' : ' primary'}" data-role="benchmark-select"
+                data-engine="${esc(result.engine)}" ${chosen ? 'disabled' : ''}>
+          ${chosen ? 'движок голоса' : 'Выбрать этот движок'}
+        </button>
+      </div>`;
+  }
+  // Ошибка движка — строка с её текстом, а не сломанная панель: сравнение
+  // продолжается, и остальные строки остаются на месте.
+  const note = result.error || 'движок не ответил';
+  const kind = result.status === 'skipped' ? 'warn' : 'err';
+  const prefix = result.status === 'skipped' ? 'пропущен' : 'ошибка';
+  return `
+    <div class="benchmark-row">
+      <b class="benchmark-engine">${label}</b>
+      <span class="muted ${kind}">${prefix}: ${esc(note)}</span>
+    </div>`;
+}
+
+function benchmarkResultsHtml(voiceId) {
+  const cfg = benchmarkState(voiceId);
+  const voice = voiceById(voiceId);
+  if (cfg.error && !cfg.busy) return `<div class="alert error show">${esc(cfg.error)}</div>`;
+  if (!cfg.data) {
+    return cfg.busy
+      ? '<p class="muted">Ставлю сравнение в очередь…</p>'
+      : '<p class="muted">Отметьте движки, впишите фразу и нажмите «Сравнить».</p>';
+  }
+  if (!cfg.data.results.length) {
+    return `<p class="muted">${cfg.busy ? 'Синтезирую первый движок…' : 'Ни один движок ещё не ответил.'}</p>`;
+  }
+  return `<div class="benchmark-rows">${cfg.data.results
+    .map((result) => benchmarkRowHtml(voice, result)).join('')}</div>`;
+}
+
+function benchmarkPanelHtml(voiceId) {
+  const cfg = benchmarkState(voiceId);
+  const boxes = Object.values(state.engines).map((info) => `
+    <label class="toggle benchmark-engine-toggle">
+      <input type="checkbox" data-role="benchmark-engine" data-engine="${esc(info.id)}"
+             ${cfg.engines.includes(info.id) ? 'checked' : ''} />
+      ${esc(info.label)}
+    </label>`).join('');
+  const total = Math.max(cfg.engines.length, 1);
+  const done = cfg.data ? cfg.data.results.length : 0;
+  const percent = Math.min(100, Math.round((done / total) * 100));
+  const status = cfg.busy
+    ? `обработано ${done} из ${cfg.engines.length}`
+    : 'фраза и reference общие — отличаются только движки';
+  return `
+    <div class="benchmark-head">СРАВНИТЬ ДВИЖКИ</div>
+    <label class="field">
+      <span>Тестовая фраза</span>
+      <input type="text" data-role="benchmark-text" value="${esc(cfg.text)}" />
+    </label>
+    <div class="benchmark-engines">${boxes}</div>
+    <label class="field">
+      <span>Проверка качества</span>
+      <select data-role="benchmark-qa">
+        <option value="off"${cfg.qa === 'off' ? ' selected' : ''}>выключена</option>
+        <option value="smart"${cfg.qa === 'smart' ? ' selected' : ''}>Smart — по подозрительным</option>
+        <option value="strict"${cfg.qa === 'strict' ? ' selected' : ''}>Strict — каждый движок</option>
+      </select>
+    </label>
+    <div class="test-row">
+      <button class="tiny primary" data-role="benchmark-run" ${cfg.busy ? 'disabled' : ''}>
+        ${cfg.busy ? 'сравниваю…' : 'Сравнить'}
+      </button>
+      <span class="muted benchmark-status">${status}</span>
+    </div>
+    <div class="progress"><div style="width:${percent}%"></div></div>
+    <div data-role="benchmark-results">${benchmarkResultsHtml(voiceId)}</div>
+    <p class="hint muted">
+      WER и время — справка, а не приговор: система не выбирает лучший движок сама.
+      Прослушайте takes и нажмите «Выбрать этот движок» — reference и настройки голоса
+      при этом не меняются.
+    </p>
+    <audio data-role="benchmark-player" controls hidden></audio>`;
+}
+
+function renderBenchmarkPanel(voiceId) {
+  const card = previewCard(voiceId);
+  if (!card) return;
+  const box = card.querySelector('[data-role="benchmark"]');
+  if (!box) return;
+  const cfg = benchmarkState(voiceId);
+  if (!cfg.open) {
+    box.innerHTML = '';
+    box.hidden = true;
+    delete box.dataset.ready;
+    return;
+  }
+  if (!box.dataset.ready) {
+    box.innerHTML = benchmarkPanelHtml(voiceId);
+    box.dataset.ready = '1';
+  }
+  box.hidden = false;
+  syncBenchmarkPanel(voiceId);
+}
+
+// Обновление хода сравнения без пересборки панели: опрос статуса не должен
+// пересоздавать плеер и сбрасывать прослушивание и правки в форме.
+function syncBenchmarkPanel(voiceId) {
+  const card = previewCard(voiceId);
+  const box = card ? card.querySelector('[data-role="benchmark"]') : null;
+  if (!box) return;
+  const cfg = benchmarkState(voiceId);
+  const button = box.querySelector('[data-role="benchmark-run"]');
+  if (button) {
+    button.disabled = cfg.busy;
+    button.textContent = cfg.busy ? 'сравниваю…' : 'Сравнить';
+  }
+  const done = cfg.data ? cfg.data.results.length : 0;
+  const percent = Math.min(100, Math.round((done / Math.max(cfg.engines.length, 1)) * 100));
+  const bar = box.querySelector('.progress > div');
+  if (bar) bar.style.width = `${percent}%`;
+  const status = box.querySelector('.benchmark-status');
+  if (status) {
+    status.textContent = cfg.busy
+      ? `обработано ${done} из ${cfg.engines.length}`
+      : 'фраза и reference общие — отличаются только движки';
+  }
+  const results = box.querySelector('[data-role="benchmark-results"]');
+  if (results) results.innerHTML = benchmarkResultsHtml(voiceId);
+}
+
+function toggleBenchmark(voiceId) {
+  const cfg = benchmarkState(voiceId);
+  cfg.open = !cfg.open;
+  // По умолчанию сравниваем на всём, что установлено: отмечать руками каждый
+  // движок в самом частом сценарии — лишний шаг.
+  if (cfg.open && !cfg.engines.length) cfg.engines = Object.keys(state.engines);
+  renderBenchmarkPanel(voiceId);
+}
+
+async function runBenchmark(voiceId) {
+  const cfg = benchmarkState(voiceId);
+  const text = cfg.text.trim();
+  if (!cfg.engines.length) { cfg.error = 'Отметьте хотя бы один движок'; renderBenchmarkPanel(voiceId); return; }
+  if (!text) { cfg.error = 'Введите фразу для сравнения'; renderBenchmarkPanel(voiceId); return; }
+
+  cfg.error = '';
+  cfg.busy = true;
+  cfg.data = null;
+  renderBenchmarkPanel(voiceId);
+  // Движок сравнения поднимается впервые и может грузиться десятки секунд —
+  // состояние моделей видно в шапке.
+  watchEngines();
+  try {
+    const started = await api(`/api/voices/${voiceId}/benchmark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, engines: cfg.engines, qa: cfg.qa, auto_accent: true }),
+    });
+    cfg.runId = started.benchmark_id;
+    stopBenchmarkPoll(voiceId);
+    cfg.timer = setInterval(() => pollBenchmark(voiceId), 1500);
+  } catch (error) {
+    cfg.busy = false;
+    cfg.error = error.message;
+    renderBenchmarkPanel(voiceId);
+  }
+}
+
+async function pollBenchmark(voiceId) {
+  const cfg = state.benchmark[voiceId];
+  if (!cfg || !cfg.runId) return;
+  if (!previewCard(voiceId)) {  // карточку перерисовали или голос удалили
+    stopBenchmarkPoll(voiceId);
+    return;
+  }
+  try {
+    const data = await api(`/api/benchmarks/${cfg.runId}`);
+    cfg.data = data;
+    if (data.status === 'done' || data.status === 'error') {
+      stopBenchmarkPoll(voiceId);
+      cfg.busy = false;
+      if (data.status === 'error') cfg.error = data.error || 'Сравнение не удалось';
+    }
+    renderBenchmarkPanel(voiceId);
+  } catch (error) {
+    stopBenchmarkPoll(voiceId);
+    cfg.busy = false;
+    cfg.error = error.message;
+    renderBenchmarkPanel(voiceId);
+  }
+}
+
+function playBenchmarkTake(voiceId, url) {
+  const card = previewCard(voiceId);
+  if (!card || !url) return;
+  const player = card.querySelector('[data-role="benchmark-player"]');
+  player.src = `${url}?t=${Date.now()}`;
+  player.hidden = false;
+  player.play().catch(() => { /* автоплей может быть заблокирован — плеер виден */ });
+}
+
+async function selectBenchmarkEngine(voiceId, engine) {
+  const cfg = benchmarkState(voiceId);
+  if (!cfg.runId) return;
+  try {
+    const voice = await api(`/api/benchmarks/${cfg.runId}/select`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ engine }),
+    });
+    // Карточка перечитывается: движок голоса изменился, и это видно в её теге.
+    // Панель сравнения остаётся открытой — результаты ещё нужны для прослушивания.
+    await loadVoices();
+    renderBenchmarkPanel(voiceId);
+    showAlert(
+      $('voice-error'),
+      `Голос «${voice.name}» переведён на ${engineLabel(voice.engine)}: reference и настройки не тронуты`,
+      'info',
+    );
+  } catch (error) {
+    cfg.error = error.message;
+    renderBenchmarkPanel(voiceId);
   }
 }
 
@@ -2768,8 +3048,12 @@ function bindEvents() {
   voiceCards.addEventListener('input', (event) => {
     const card = event.target.closest('.card');
     if (!card) return;
-    const cfg = state.preview[card.dataset.voiceId];
     const role = event.target.dataset.role;
+    if (role === 'benchmark-text') {
+      benchmarkState(card.dataset.voiceId).text = event.target.value;
+      return;
+    }
+    const cfg = state.preview[card.dataset.voiceId];
     if (role === 'speed') {
       cfg.speed = parseFloat(event.target.value);
       card.querySelector('[data-role="speed-label"]').textContent = `${cfg.speed.toFixed(2)}x`;
@@ -2792,6 +3076,18 @@ function bindEvents() {
     if (!card) return;
     const voiceId = card.dataset.voiceId;
     const role = event.target.dataset.role;
+    if (role === 'benchmark-engine') {
+      const engine = event.target.dataset.engine;
+      const cfg = benchmarkState(voiceId);
+      cfg.engines = event.target.checked
+        ? cfg.engines.concat(engine)
+        : cfg.engines.filter((item) => item !== engine);
+      return;
+    }
+    if (role === 'benchmark-qa') {
+      benchmarkState(voiceId).qa = event.target.value;
+      return;
+    }
     if (role === 'nfe') {
       state.preview[voiceId].nfe_step = parseInt(event.target.value, 10);
     }
@@ -2811,14 +3107,22 @@ function bindEvents() {
     const card = event.target.closest('.card');
     const button = event.target.closest('button');
     if (!card || !button) return;
+    const voiceId = card.dataset.voiceId;
     if (button.dataset.role === 'preview') previewVoice(card);
-    if (button.dataset.role === 'save-preset') saveVoicePreset(card.dataset.voiceId);
+    if (button.dataset.role === 'save-preset') saveVoicePreset(voiceId);
+    if (button.dataset.role === 'compare') toggleBenchmark(voiceId);
+    if (button.dataset.role === 'benchmark-run') runBenchmark(voiceId);
+    if (button.dataset.role === 'benchmark-play') playBenchmarkTake(voiceId, button.dataset.url);
+    if (button.dataset.role === 'benchmark-select') {
+      selectBenchmarkEngine(voiceId, button.dataset.engine);
+    }
     if (button.dataset.role === 'delete') {
-      const voiceId = card.dataset.voiceId;
       if (!confirm('Удалить голос? Файл референса будет стёрт.')) return;
       try {
         await api(`/api/voices/${voiceId}`, { method: 'DELETE' });
         delete state.preview[voiceId];
+        stopBenchmarkPoll(voiceId);
+        delete state.benchmark[voiceId];
         await loadVoices();
       } catch (error) {
         showAlert($('voice-error'), error.message);

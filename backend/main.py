@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
-from . import audio_analysis, audio_pipeline, config, denoise, resource_guard, transcribe
+from . import audio_analysis, audio_pipeline, benchmark, config, denoise, resource_guard, transcribe
 from .accentizer import Accentizer
 from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettings
 from .db.connection import init_db
@@ -945,6 +945,143 @@ async def render_text(payload: RenderTextRequest) -> dict:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"job_id": job.id, "status": job.status.value, "total_replicas": job.total_replicas}
+
+
+# --- сравнение движков --------------------------------------------------------
+class BenchmarkRequest(BaseModel):
+    """Сравнение голоса на нескольких движках: одна фраза и один reference.
+
+    Пустой `engines` означает «все объявленные движки»: сравнить голос на всём,
+    что установлено, — самый частый сценарий, и заставлять отмечать их руками
+    незачем. `qa` — тот же режим проверки, что и у рендера: `off` даёт чистое
+    время синтеза, `smart`/`strict` добавляют к строке результата WER.
+    """
+
+    text: str = ""
+    engines: list[str] = Field(default_factory=list)
+    qa: QaMode = config.QA_MODE_OFF
+    auto_accent: bool = True
+
+
+class BenchmarkSelectRequest(BaseModel):
+    """Выбор движка, который после сравнения станет движком голоса."""
+
+    engine: str
+
+
+def _benchmark_engines(requested: list[str]) -> list[str]:
+    """Список движков для сравнения; пустой — все объявленные.
+
+    Неизвестный id — ошибка запроса, а не молчаливый пропуск: опечатка должна
+    быть видна сразу, иначе она выглядит как «движок почему-то не сравнился».
+    """
+    engines = list(dict.fromkeys(requested)) or list(ENGINE_INFOS)
+    unknown = [engine for engine in engines if engine not in ENGINE_INFOS]
+    if unknown:
+        known = ", ".join(sorted(ENGINE_INFOS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный движок синтеза: {', '.join(unknown)}. Доступны: {known}",
+        )
+    return engines
+
+
+@app.post("/api/voices/{voice_id}/benchmark", status_code=202)
+async def start_benchmark(voice_id: str, payload: BenchmarkRequest) -> dict:
+    """Ставит сравнение голоса на движках в очередь единственного воркера.
+
+    Сам синтез здесь не запускается: движки поднимаются и читают фразу строго по
+    одному в том же воркере, что и рендер (см. `job_queue`). Ошибки запроса —
+    400/404, а недоступность модели видна уже в строке результата и не рушит
+    остальные движки.
+    """
+    voice = get_store().get(voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="Голос не найден")
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой текст для сравнения")
+    if len(text) > config.MAX_REPLICA_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Текст длиннее {config.MAX_REPLICA_CHARS} символов — сократите фразу",
+        )
+    engines = _benchmark_engines(payload.engines)
+    try:
+        benchmark.check_reference(voice)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        job, run = get_queue().submit_benchmark(
+            voice, text, engines, payload.qa, payload.auto_accent
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"benchmark_id": run.id, "job_id": job.id, "engines": engines}
+
+
+@app.get("/api/benchmarks/{benchmark_id}")
+async def get_benchmark(benchmark_id: str) -> dict:
+    """Результаты сравнения: статус запуска и отдельная строка на каждый движок.
+
+    Система ничего не ранжирует: WER и время лежат в строках как справка, выбор
+    движка остаётся за пользователем (`.../select`).
+    """
+    run = benchmark.get_run(benchmark_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Запуск сравнения не найден")
+    return run.to_dict()
+
+
+@app.get("/api/benchmarks/{benchmark_id}/{engine}/audio")
+async def benchmark_audio(benchmark_id: str, engine: str) -> FileResponse:
+    """Файл результата одного движка — для прослушивания и сравнения на слух."""
+    run = benchmark.get_run(benchmark_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Запуск сравнения не найден")
+    result = next((item for item in run.results if item.engine == engine), None)
+    if result is None or result.audio_path is None:
+        raise HTTPException(status_code=404, detail="Для этого движка нет готового результата")
+    if not result.audio_path.exists():
+        raise HTTPException(status_code=410, detail="Файл сравнения удалён")
+    return FileResponse(result.audio_path, media_type="audio/wav")
+
+
+@app.post("/api/benchmarks/{benchmark_id}/select")
+async def select_benchmark_engine(benchmark_id: str, payload: BenchmarkSelectRequest) -> dict:
+    """Делает выбранный в сравнении движок движком голоса.
+
+    Меняется только движок: reference, его расшифровка и пресет остаются как
+    были. Ручки прошлого движка сбрасываются самим хранилищем — они к новому
+    движку не относятся (см. `voices_store.update`).
+    """
+    run = benchmark.get_run(benchmark_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Запуск сравнения не найден")
+    engine = payload.engine
+    if engine not in ENGINE_INFOS:
+        known = ", ".join(sorted(ENGINE_INFOS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный движок синтеза: {engine or '(пусто)'}. Доступны: {known}",
+        )
+    succeeded = [
+        item
+        for item in run.results
+        if item.engine == engine and item.status == benchmark.STATUS_DONE
+    ]
+    if not succeeded:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Движок «{ENGINE_INFOS[engine].label}» не дал результата — выбирать нечего",
+        )
+    try:
+        voice = get_store().update(run.voice_id, engine=engine)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Голос не найден") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return voice.to_dict()
 
 
 # --- проекты ------------------------------------------------------------------
