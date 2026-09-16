@@ -6,6 +6,7 @@ import math
 import random
 import tempfile
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -13,11 +14,18 @@ from typing import Any
 
 import numpy as np
 
-from . import config
+from . import config, qa_screening
 from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
 from .engines.registry import get_engine
+from .settings_resolution import (
+    COMMON_FIELDS,
+    effective_values,
+    engine_defaults,
+    resolve_synthesis_settings,
+    split_values,
+)
 from .text_preprocess import normalize
 from .transcribe import transcribe_audio, word_error_rate
 from .voices_store import Voice, get_store
@@ -44,7 +52,7 @@ QA_UNAVAILABLE = "unavailable"
 
 @dataclass
 class QaSettings:
-    """Параметры строгой проверки куска.
+    """Параметры проверки куска.
 
     Значения по умолчанию берутся из конфига, но живут отдельным объектом, а не
     читаются из `config` внутри цикла: в тестах цикл должен прогоняться на своих
@@ -54,6 +62,26 @@ class QaSettings:
     wer_threshold: float = config.QA_WER_THRESHOLD
     max_attempts: int = config.QA_MAX_ATTEMPTS
     budget_sec: float = config.QA_BUDGET_SEC
+    # Режим проверки: `config.QA_MODES`. По умолчанию строгий — `QaSettings()` без
+    # аргументов означает прежнее поведение «каждый кусок через Whisper».
+    mode: str = config.QA_MODE_STRICT
+
+    @classmethod
+    def for_mode(cls, mode: str) -> "QaSettings | None":
+        """Настройки для режима из запроса; None — проверка выключена.
+
+        «Выключено» — это `None`, а не объект с режимом `off`: так у проверки
+        остаётся единственное представление «её нет», и весь остальной код
+        продолжает спрашивать `settings.qa is None`.
+        """
+        if mode == config.QA_MODE_OFF:
+            return None
+        return cls(mode=mode)
+
+    @property
+    def smart(self) -> bool:
+        """Сначала дешёвый отбор, в Whisper — только подозрительные куски."""
+        return self.mode == config.QA_MODE_SMART
 
 
 @dataclass
@@ -63,12 +91,18 @@ class QaOutcome:
     status: str
     wer: float | None
     attempts: int
+    # Режим, в котором шла проверка, и вердикт дешёвого отбора. Отбора может не
+    # быть: строгий режим идёт в расшифровку сразу, и тогда `screening` — None.
+    mode: str = config.QA_MODE_STRICT
+    screening: qa_screening.Screening | None = None
 
     def to_dict(self) -> dict:
         return {
             "status": self.status,
             "wer": None if self.wer is None else round(self.wer, 4),
             "attempts": self.attempts,
+            "mode": self.mode,
+            "screening": None if self.screening is None else self.screening.to_dict(),
         }
 
 
@@ -88,12 +122,17 @@ class SpeakerSettings:
     # Ручки движка этого голоса, переопределённые на одну генерацию (у XTTS —
     # температура и штраф за повторы). То, чего здесь нет, берётся из карточки голоса.
     engine_params: dict = field(default_factory=dict)
+    # Что из значений выше выбран сам этот слот. Только эти поля перекрывают
+    # пресет голоса; остальные наследуются (см. settings_resolution). Пусто —
+    # «слот ничего не выбирал»: так выглядят проектные спикеры, у которых ручки
+    # не трогали, и это же отличает их от разовой формы, заполненной целиком.
+    overrides: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "SpeakerSettings":
         raw_pause = data.get("pause_override_ms")
         raw_params = data.get("engine_params")
-        return cls(
+        settings = cls(
             voice_id=str(data.get("voice_id", "")),
             speed=float(data.get("speed", config.DEFAULT_SPEED)),
             cfg_strength=float(data.get("cfg_strength", config.DEFAULT_CFG_STRENGTH)),
@@ -104,6 +143,15 @@ class SpeakerSettings:
             pause_override_ms=None if raw_pause is None else int(raw_pause),
             engine_params=dict(raw_params) if isinstance(raw_params, dict) else {},
         )
+        # Ключи, которые пришли в запросе, и есть выбор этого слоя: значения,
+        # досчитанные из дефолтов, в слой не попадают — иначе слот молча
+        # перекрывал бы пресет голоса тем, чего пользователь не выбирал.
+        settings.overrides = {
+            name: value
+            for name, value in data.items()
+            if value is not None and (name in COMMON_FIELDS or name == "engine_params")
+        }
+        return settings
 
 
 @dataclass
@@ -112,7 +160,7 @@ class RenderSettings:
     cross_fade_duration: float = config.DEFAULT_CROSS_FADE_DURATION
     auto_accent: bool = True
     output_format: str = config.DEFAULT_OUTPUT_FORMAT
-    # Строгая проверка куска (Фаза 7); None — обычный путь, одна попытка без
+    # Проверка куска (`config.QA_MODES`) или None — обычный путь, одна попытка без
     # расшифровки. Выбор пользователя на задачу, а не свойство установки: цена
     # проверки — синтез плюс отдельный процесс Whisper на каждую попытку.
     qa: QaSettings | None = None
@@ -308,16 +356,71 @@ def _resolve_voice(label: str, settings: SpeakerSettings) -> Voice:
     return voice
 
 
-def _settings_for(replica: Replica, base: SpeakerSettings) -> SpeakerSettings:
-    """Параметры куска: значения из маркера в тексте перекрывают карточку."""
-    if not replica.overrides:
-        return base
-    return replace(
-        base,
-        speed=float(replica.overrides.get("speed", base.speed)),
-        cfg_strength=float(replica.overrides.get("cfg_strength", base.cfg_strength)),
-        nfe_step=int(replica.overrides.get("nfe_step", base.nfe_step)),
+def voice_layer(voice: Voice) -> dict:
+    """Слой голоса в иерархии: пресет плюс подобранные ручки движка.
+
+    Два места хранения, а не одно, потому что у них разная жизнь: пресет — это
+    общие ручки (скорость, CFG, NFE), а `engine_params` привязаны к движку и
+    сбрасываются при его смене. Для резолва это один слой.
+    """
+    layer: dict[str, Any] = dict(voice.preset or {})
+    if voice.engine_params:
+        layer["engine_params"] = dict(voice.engine_params)
+    return layer
+
+
+def tuning_for(voice: Voice, base: SpeakerSettings, overrides: dict | None = None) -> SpeakerSettings:
+    """Эффективные параметры куска: движок → пресет голоса → слот → реплика.
+
+    Единственная точка склейки слоёв для синтеза: прослушивание, рендер проекта
+    и карточка куска зовут её с разными наборами правок, но порядок и зажим
+    значений считаются здесь, а не повторяются в API и на фронте.
+    """
+    values = effective_values(
+        resolve_synthesis_settings(
+            engine_defaults(voice.engine),
+            voice_layer(voice),
+            base.overrides,
+            overrides,
+        )
     )
+    common, engine = split_values(values)
+    settings = SpeakerSettings.from_dict(
+        {**common, "voice_id": voice.id, "engine_params": engine}
+    )
+    # Это готовый результат, а не слой правок: если бы `overrides` здесь остались
+    # заполненными, вложенный резолв принял бы все значения за выбор этого слоя.
+    settings.overrides = {}
+    return settings
+
+
+def settings_view(
+    voice: Voice, base: SpeakerSettings, overrides: dict | None = None
+) -> dict:
+    """Разрешённые параметры вместе с источником каждого значения.
+
+    Нужно интерфейсу: без источника «сброшено» и «подобрано здесь» выглядели бы
+    одинаково, а подпись «наследуется от голоса Анна» нечем было бы собрать.
+    """
+    return resolve_synthesis_settings(
+        engine_defaults(voice.engine),
+        voice_layer(voice),
+        base.overrides,
+        overrides,
+    )
+
+
+def _settings_for(replica: Replica, base: SpeakerSettings) -> SpeakerSettings:
+    """Параметры куска по слоям, с голосом из `voice_id`.
+
+    Оставлено для тех, кому не нужен сам голос: карточка куска и тесты. Рендер
+    диалога разрешает голос один раз на диалог и зовёт `tuning_for` напрямую —
+    читать `voices.json` на каждую реплику незачем.
+    """
+    voice = _resolve_voice(
+        replica.label, replace(base, voice_id=str(replica.voice_id or base.voice_id))
+    )
+    return tuning_for(voice, base, replica.overrides)
 
 
 def _engine_for(voice: Voice) -> SynthesisEngine:
@@ -348,36 +451,41 @@ async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:
     Модель XTTS поднимается 20–40 секунд. Если грузить её лениво, эта пауза
     придётся на середину диалога — а прогретая модель нужна до начала синтеза,
     ровно как это было с единственным F5-TTS.
+
+    Ключ — идентификатор из карточки голоса, а не `engine.id`: именно по нему
+    движок ищется на каждой реплике, и подменённый движок (тесты, будущая
+    обёртка над моделью) иначе оказался бы в словаре под другим именем.
     """
     engines: dict[str, SynthesisEngine] = {}
     for voice in voices:
-        engine = _engine_for(voice)
-        if engine.id in engines:
+        if voice.engine in engines:
             continue
-        engines[engine.id] = engine
+        engine = _engine_for(voice)
+        engines[voice.engine] = engine
         await asyncio.to_thread(engine.load)
         logger.info("Движок %s готов (%s)", engine.id, voice.name)
     return engines
 
 
 def _engine_params(
-    voice: Voice, speaker: SpeakerSettings, render: RenderSettings, seed: int | None
+    tuning: SpeakerSettings, render: RenderSettings, seed: int | None
 ) -> dict:
     """Ручки движка для одного куска.
 
-    Значения, сохранённые у голоса, — это дефолты, а карточка слота их
-    переопределяет. Общие ручки пайплайна (`target_rms`, `cross_fade_duration`)
-    добавляются последними: они относятся к сборке куска, и движок читает их
-    только если они у него есть. `seed` передаётся только движкам, которые его
-    принимают (см. `SynthesisEngine.supports_seed`), и то же значение уходит в
-    карточку куска — чтобы вариант можно было воспроизвести, а не только принять.
+    Значения приходят уже разрешёнными (`tuning_for`): движок → пресет голоса →
+    слот → реплика. Склейки здесь нет намеренно: вторая точка слияния слоёв
+    однажды уже разошлась с первой и перекрывала пресет голоса дефолтами слота.
+    Общие ручки пайплайна (`target_rms`, `cross_fade_duration`) добавляются
+    последними: они относятся к сборке куска, и движок читает их только если они
+    у него есть. `seed` передаётся только движкам, которые его принимают
+    (см. `SynthesisEngine.supports_seed`), и то же значение уходит в карточку
+    куска — чтобы вариант можно было воспроизвести, а не только принять.
     """
     return {
-        **voice.engine_params,
-        **speaker.engine_params,
-        "cfg_strength": speaker.cfg_strength,
-        "nfe_step": speaker.nfe_step,
-        "target_rms": speaker.target_rms,
+        **tuning.engine_params,
+        "cfg_strength": tuning.cfg_strength,
+        "nfe_step": tuning.nfe_step,
+        "target_rms": tuning.target_rms,
         "cross_fade_duration": render.cross_fade_duration,
         "seed": seed,
     }
@@ -438,7 +546,7 @@ async def _synthesize_chunk(
                 ref_audio_path=str(voice.audio_path),
                 ref_text=voice.ref_text,
                 speed=tuning.speed,
-                **_engine_params(voice, tuning, settings, seed),
+                **_engine_params(tuning, settings, seed),
             ),
             timeout=config.CHUNK_TIMEOUT_SEC,
         )
@@ -545,13 +653,18 @@ async def _synthesize_checked(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None]:
-    """Синтез куска: обычный или со строгой проверкой (`settings.qa`).
+    """Синтез куска: обычный или с проверкой (`settings.qa`).
 
     Без проверки это ровно один вызов движка. С проверкой каждая попытка — это
     полный синтез плюс отдельный процесс Whisper, поэтому цикл ограничен и числом
     попыток, и временем, а из проверенных берётся лучшая по WER, даже если порог
     так и не взят: выбросить уже сгенерированное аудио и вернуть ошибку значило бы
     потерять работу ради формальности.
+
+    Smart-режим отличается только входом в расшифровку: сначала кусок проходит
+    дешёвый отбор по waveform, и если брака не видно, Whisper не поднимается
+    вовсе. Отбор ошибается в сторону «подозрительный» — лишний Whisper дешевле
+    пропущенного брака.
 
     Ошибки синтеза и таймауты идут наружу, как и раньше: проверка отвечает за
     качество готового куска, а не за то, чтобы прятать зависший инференс.
@@ -560,7 +673,7 @@ async def _synthesize_checked(
     # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
     text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
     qa = settings.qa
-    if qa is None:
+    if qa is None or qa.mode == config.QA_MODE_OFF:
         chunk, seed = await _synthesize_chunk(
             engine, voice, text, tuning, settings, position=position, label=label
         )
@@ -571,6 +684,7 @@ async def _synthesize_checked(
     best: tuple[np.ndarray, int | None, float] | None = None
     attempts = 0
     status = QA_ATTEMPTS
+    screening: qa_screening.Screening | None = None
     for attempt in range(1, limit + 1):
         if attempt > 1:
             if time.monotonic() - started >= qa.budget_sec:
@@ -581,7 +695,7 @@ async def _synthesize_checked(
             if wait_for_memory is not None:
                 await wait_for_memory()
         if on_note:
-            on_note(f"Реплика {position}: строгая проверка, попытка {attempt} из {limit}")
+            on_note(f"Реплика {position}: проверка, попытка {attempt} из {limit}")
 
         chunk, seed = await _synthesize_chunk(
             engine,
@@ -593,14 +707,41 @@ async def _synthesize_checked(
             label=label,
         )
         attempts = attempt
+        screening = None
+        if qa.smart:
+            # Отбор идёт в потоке: на длинном куске это автокорреляция, и в
+            # event loop ей делать нечего.
+            screening = await asyncio.to_thread(qa_screening.screen_chunk, chunk, replica.text)
+            if not screening.suspicious:
+                logger.info(
+                    "Реплика %s: отбор не нашёл брака — расшифровка не нужна", position
+                )
+                return chunk, seed, QaOutcome(
+                    status=QA_PASSED,
+                    wer=None,
+                    attempts=attempt,
+                    mode=qa.mode,
+                    screening=screening,
+                )
+            if on_note:
+                on_note(
+                    f"Реплика {position}: отбор нашёл брак "
+                    f"({qa_screening.describe_reasons(screening.reasons)}) — расшифровка"
+                )
         try:
             wer = await _measure_wer(chunk, replica.text)
         except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не должна губить задачу
             logger.warning(
-                "Реплика %s: строгая проверка недоступна (%s: %s) — принимаю без проверки",
+                "Реплика %s: проверка недоступна (%s: %s) — принимаю без проверки",
                 position, type(exc).__name__, exc,
             )
-            return chunk, seed, QaOutcome(status=QA_UNAVAILABLE, wer=None, attempts=attempt)
+            return chunk, seed, QaOutcome(
+                status=QA_UNAVAILABLE,
+                wer=None,
+                attempts=attempt,
+                mode=qa.mode,
+                screening=screening,
+            )
 
         if best is None or wer < best[2]:
             best = (chunk, seed, wer)
@@ -613,10 +754,12 @@ async def _synthesize_checked(
     assert best is not None  # первая попытка выполняется всегда
     chunk, seed, wer = best
     logger.info(
-        "Реплика %s: строгая проверка — %s, WER %.2f, попыток %s",
+        "Реплика %s: проверка — %s, WER %.2f, попыток %s",
         position, status, wer, attempts,
     )
-    return chunk, seed, QaOutcome(status=status, wer=wer, attempts=attempts)
+    return chunk, seed, QaOutcome(
+        status=status, wer=wer, attempts=attempts, mode=qa.mode, screening=screening
+    )
 
 
 async def render_dialogue(
@@ -650,9 +793,18 @@ async def render_dialogue(
         raise ValueError(f"Не назначен голос для: {names}")
 
     resolved: dict[str, Voice] = {}
-    for replica in replicas:
-        if replica.voice not in resolved:
-            resolved[replica.voice] = _resolve_voice(replica.label, speakers[replica.voice])
+    per_replica: dict[int, SpeakerSettings] = {}
+    for index, replica in enumerate(replicas):
+        base = speakers[replica.voice]
+        # Голос разрешается один раз на голос, а не на реплику: это чтение
+        # `voices.json`, и на длинном диалоге оно заметно. Ключ — эффективный
+        # голос: у реплик одного спикера голоса могут различаться.
+        voice_id = str(replica.voice_id or base.voice_id)
+        voice = resolved.get(voice_id)
+        if voice is None:
+            voice = _resolve_voice(replica.label, replace(base, voice_id=voice_id))
+            resolved[voice_id] = voice
+        per_replica[index] = tuning_for(voice, base, replica.overrides)
     engines = await _load_engines(list(resolved.values()))
 
     pieces: list[np.ndarray] = []
@@ -668,8 +820,8 @@ async def render_dialogue(
             )
         if on_progress:
             on_progress(index, total, replica.label)
-        settings_for_replica = _settings_for(replica, speakers[replica.voice])
-        voice = resolved[replica.voice]
+        settings_for_replica = per_replica[index - 1]
+        voice = resolved[settings_for_replica.voice_id]
         engine = engines[voice.engine]
 
         chunk, seed, qa_outcome = await _synthesize_checked(
@@ -724,12 +876,16 @@ async def synthesize_replica(
     одной неудачной реплики — десятки секунд на каждый кусок, поэтому
     перегенерация трогает ровно один кусок.
     """
-    voice = _resolve_voice(replica.label, speaker)
+    # Параметры из маркера в тексте и правок карточки важнее карточки спикера —
+    # ровно как при первой сборке, иначе перегенерация дала бы кусок, несовместимый
+    # с соседями по звучанию. Голос разрешается здесь же: `tuning_for` строит
+    # результат, а не слой, и по нему уже не восстановить, чей это был `voice_id`.
+    voice = _resolve_voice(
+        replica.label, replace(speaker, voice_id=str(replica.voice_id or speaker.voice_id))
+    )
+    resolved = tuning_for(voice, speaker, replica.overrides)
     engine = _engine_for(voice)
     await asyncio.to_thread(engine.load)
-    # Параметры из маркера в тексте важнее карточки — ровно как при первой сборке,
-    # иначе перегенерация дала бы кусок, несовместимый с соседями по звучанию.
-    resolved = _settings_for(replica, speaker)
 
     chunk, seed, qa_outcome = await _synthesize_checked(
         engine,
@@ -807,6 +963,55 @@ def read_segment(source_path: Path, output_format: str, bounds: tuple[int, int])
     audio = _read_audio(source_path, output_format)
     start, end = bounds
     return audio[start:end]
+
+
+def export_project_chunks(
+    project_id: str, source_path: Path, output_format: str, segments: list[tuple[int, int]]
+) -> list[Path]:
+    """Сохраняет куски готового файла отдельными wav — по одному на реплику.
+
+    Проект хранит варианты отдельными файлами, а не вырезками из итогового трека:
+    замена одной реплики не должна менять остальные, а прослушать реплику до
+    пересборки всего файла иначе нечем. Имя уникальное: прошлые рендеры остаются
+    доступными как отдельные варианты, и перезапись их файлов ломала бы историю.
+    """
+    directory = config.PROJECTS_OUTPUT_DIR / project_id
+    directory.mkdir(parents=True, exist_ok=True)
+    audio = _read_audio(source_path, output_format)
+    paths: list[Path] = []
+    for index, (start, end) in enumerate(segments, start=1):
+        target = directory / f"r{index}-{uuid.uuid4().hex[:8]}.wav"
+        _write_audio(target, np.asarray(audio[start:end], dtype=np.float32), "wav")
+        paths.append(target)
+    return paths
+
+
+def voice_engine(voice_id: str) -> str:
+    """Движок голоса для карточки куска; пустая строка — голос не найден."""
+    if not voice_id:
+        return ""
+    voice = get_store().get(voice_id)
+    return voice.engine if voice is not None else ""
+
+
+def chunk_parameters(replica: Replica, speaker: SpeakerSettings) -> dict:
+    """Эффективные параметры куска — то, чем он реально получен.
+
+    Хранится рядом с вариантом, чтобы карточку можно было воспроизвести: у
+    реплики свои overrides поверх карточки спикера, и «какие настройки были»
+    задним числом иначе не восстановить.
+    """
+    resolved = _settings_for(replica, speaker)
+    return {
+        "speed": resolved.speed,
+        "cfg_strength": resolved.cfg_strength,
+        "nfe_step": resolved.nfe_step,
+        "target_rms": resolved.target_rms,
+        "gain_db": resolved.gain_db,
+        "pitch_semitones": resolved.pitch_semitones,
+        "pause_override_ms": resolved.pause_override_ms,
+        "engine_params": dict(resolved.engine_params),
+    }
 
 
 async def apply_variant(

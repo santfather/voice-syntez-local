@@ -19,6 +19,7 @@ from .audio_pipeline import (
     RenderSettings,
     SpeakerSettings,
 )
+from .db.store import get_projects_store
 from .dialogue_parser import Replica
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,10 @@ class JobPayload:
     replicas: list[Replica]
     speakers: dict[str, SpeakerSettings]
     settings: RenderSettings
+    # Проект, из которого пришла задача (`None` — разовая задача без проекта).
+    # Нужен, чтобы после рендера сохранить куски вариантами реплик: сама очередь
+    # про проекты ничего не знает и знать не должна.
+    project_id: str | None = None
 
 
 @dataclass
@@ -138,6 +143,23 @@ class SelectVariantTask:
     job_id: str
     index: int
     variant_id: str
+
+
+@dataclass
+class ProjectTakeTask:
+    """Пересинтез одной реплики проекта: результат идёт новым вариантом (take).
+
+    Отдельно от `RegenerateTask`: у проекта нет собираемого файла, куски которого
+    можно переставлять, — есть только варианты реплик. Поэтому результат не
+    вставляется в общий трек, а сохраняется вариантом выбранной реплики.
+    """
+
+    job_id: str
+    project_id: str
+    index: int
+    replica: Replica
+    speakers: dict[str, SpeakerSettings]
+    settings: RenderSettings
 
 
 class JobQueue:
@@ -227,6 +249,45 @@ class JobQueue:
         logger.info("Задача %s: реплика %s → вариант %s", job_id, index + 1, variant.id)
         return job
 
+    def submit_project_take(
+        self,
+        project_id: str,
+        index: int,
+        replica: Replica,
+        speakers: dict[str, SpeakerSettings],
+        settings: RenderSettings,
+    ) -> Job:
+        """Ставит в очередь пересинтез одной реплики проекта.
+
+        Через ту же очередь, что и сборка: модель в процессе одна, и параллельный
+        прогон — это и гонка за неё, и двойной расход памяти. Параметры реплики
+        передаются готовыми: очередь про проекты не знает, а собирать их здесь
+        означало бы вторую копию разбора наследования (см. audio_pipeline).
+        """
+        if self._queue is None:
+            raise RuntimeError("Очередь не запущена")
+        job = Job(
+            id=uuid.uuid4().hex[:12],
+            total_replicas=1,
+            output_format=settings.output_format,
+            message=f"Реплика {index + 1}: синтез",
+        )
+        self._jobs[job.id] = job
+        self._order.append(job.id)
+        self._prune()
+        self._queue.put_nowait(
+            ProjectTakeTask(
+                job_id=job.id,
+                project_id=project_id,
+                index=index,
+                replica=replica,
+                speakers=speakers,
+                settings=settings,
+            )
+        )
+        logger.info("Проект %s: пересинтез реплики %s", project_id, index + 1)
+        return job
+
     @staticmethod
     def find_variant(job: Job, index: int, variant_id: str) -> "audio_pipeline.ChunkVariant":
         """Вариант по id; отсутствие — ошибка запроса, а не пустая ветка.
@@ -273,7 +334,9 @@ class JobQueue:
             raise ValueError(f"Реплика {job.regenerating + 1} уже пересобирается")
         return job, job.payload
 
-    def _enqueue(self, task: RenderTask | RegenerateTask | SelectVariantTask) -> None:
+    def _enqueue(
+        self, task: RenderTask | RegenerateTask | SelectVariantTask | ProjectTakeTask
+    ) -> None:
         queue = self._queue
         if queue is None:
             raise RuntimeError("Очередь не запущена")
@@ -309,6 +372,8 @@ class JobQueue:
                     await self._regenerate(task)
                 elif isinstance(task, SelectVariantTask):
                     await self._select_variant(task)
+                elif isinstance(task, ProjectTakeTask):
+                    await self._project_take(task)
                 else:
                     await self._render(task)
             finally:
@@ -346,6 +411,7 @@ class JobQueue:
         job.message = "Готовлю модель"
         self._current_job_id = job.id
         self._abort_requested = False
+        self._mark_project(payload.project_id, config.PROJECT_STATUS_RENDERING, job.id)
         started = time.monotonic()
         try:
             result = await audio_pipeline.render_dialogue(
@@ -358,7 +424,6 @@ class JobQueue:
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
             )
-            job.status = JobStatus.DONE
             job.output_path = result.output_path
             job.duration_sec = result.duration_sec
             # Метаданные кусков нужны, чтобы задним числом заменить одну реплику.
@@ -368,7 +433,12 @@ class JobQueue:
             job.qa = result.qa
             job.current_replica = job.total_replicas
             job.eta_sec = 0.0
+            # Статус DONE ставится после записи кусков в проект: «готово» должно
+            # означать, что открытый следом проект уже показывает этот рендер, а
+            # не что файл есть, а история реплик появится когда-нибудь потом.
+            await self._persist_project_takes(job, payload, result)
             job.message = f"Готово: {result.duration_sec:.1f} c аудио"
+            job.status = JobStatus.DONE
             logger.info("Задача %s завершена за %.1f c", job.id, time.monotonic() - started)
         except asyncio.CancelledError:
             job.status = JobStatus.ERROR
@@ -378,16 +448,88 @@ class JobQueue:
             job.status = JobStatus.ERROR
             job.error = str(exc)
             job.message = "Прервано"
+            self._mark_project(payload.project_id, config.PROJECT_STATUS_ERROR, job.id, str(exc))
             logger.warning("Задача %s прервана watchdog'ом: %s", job.id, exc)
         except Exception as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
             job.message = "Ошибка"
+            self._mark_project(payload.project_id, config.PROJECT_STATUS_ERROR, job.id, str(exc))
             logger.exception("Задача %s упала", job.id)
         finally:
             self._current_job_id = None
             self._abort_requested = False
             job.finished_at = _now_iso()
+
+    @staticmethod
+    def _mark_project(
+        project_id: str | None, status: str, job_id: str | None = None, error: str | None = None
+    ) -> None:
+        """Обновляет статус проекта. Ошибка записи не должна губить задачу.
+
+        База — не модель: если она недоступна, уже сгенерированное аудио терять
+        незачем, поэтому сбой записи только логируется.
+        """
+        if not project_id:
+            return
+        try:
+            get_projects_store().set_project_status(project_id, status, job_id, error)
+        except Exception as exc:  # noqa: BLE001 — фоновая запись, задача важнее
+            logger.warning("Проект %s: не удалось записать статус %s (%s)", project_id, status, exc)
+
+    async def _persist_project_takes(
+        self, job: Job, payload: JobPayload, result: audio_pipeline.RenderResult
+    ) -> None:
+        """Сохраняет куски готового рендера вариантами реплик проекта.
+
+        Проект переживает задачу и очистку output/, поэтому куски копируются в его
+        каталог отдельными файлами: у реплики должна остаться возможность
+        прослушать и выбрать звучание, даже когда задача из очереди уже вытеснена.
+        """
+        project_id = payload.project_id
+        if not project_id:
+            return
+        try:
+            paths = await asyncio.to_thread(
+                audio_pipeline.export_project_chunks,
+                project_id,
+                result.output_path,
+                payload.settings.output_format,
+                result.segments,
+            )
+            takes: list[dict] = []
+            for index, replica in enumerate(payload.replicas):
+                if index >= len(paths):
+                    break
+                speaker = payload.speakers.get(replica.voice)
+                start, end = result.segments[index]
+                takes.append(
+                    {
+                        "index": index,
+                        "audio_path": str(paths[index]),
+                        "label": f"рендер {job.id}",
+                        "seed": result.seeds[index] if index < len(result.seeds) else None,
+                        "engine": audio_pipeline.voice_engine(
+                            speaker.voice_id if speaker else ""
+                        ),
+                        "parameters": audio_pipeline.chunk_parameters(replica, speaker)
+                        if speaker
+                        else {},
+                        "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
+                        "qa": result.qa[index].to_dict()
+                        if index < len(result.qa) and result.qa[index] is not None
+                        else None,
+                    }
+                )
+            await asyncio.to_thread(
+                get_projects_store().save_render_takes, project_id, job.id, takes
+            )
+        except Exception as exc:  # noqa: BLE001 — файл готов, история кусков вторична
+            logger.warning(
+                "Проект %s: не удалось сохранить куски рендера (%s: %s)",
+                project_id, type(exc).__name__, exc,
+            )
+            self._mark_project(project_id, config.PROJECT_STATUS_RENDERED, job.id)
 
     async def _regenerate(self, task: RegenerateTask) -> None:
         """Пересинтезирует один кусок и вставляет его в готовый файл.
@@ -472,6 +614,83 @@ class JobQueue:
         finally:
             self._current_job_id = None
             job.regenerating = None
+
+    async def _project_take(self, task: ProjectTakeTask) -> None:
+        """Синтезирует реплику проекта заново и сохраняет её новым вариантом.
+
+        Остальные реплики не трогаются: у проекта нет пересобираемого файла, и
+        «перегенерировать» здесь означает «добавить реплике ещё одно звучание,
+        сделав его текущим» — прежнее остаётся вариантом и его можно вернуть.
+        """
+        job = self._jobs.get(task.job_id)
+        if job is None:
+            return
+        speaker = task.speakers.get(task.replica.voice)
+        self._current_job_id = job.id
+        job.status = JobStatus.PROCESSING
+        job.started_at = _now_iso()
+        try:
+            if speaker is None:
+                raise ValueError(f"Для «{task.replica.label}» не найден голос")
+            prepared, seed, qa_outcome = await audio_pipeline.synthesize_replica(
+                replica=task.replica,
+                speaker=speaker,
+                settings=task.settings,
+                index=task.index,
+                wait_for_memory=lambda: self._wait_for_memory(job.id),
+                on_note=self._note_callback(job),
+            )
+            variant = await asyncio.to_thread(
+                audio_pipeline.save_chunk_variant,
+                job.id,
+                task.index,
+                "take",
+                prepared,
+                seed,
+                f"пересинтез {job.id}",
+                qa_outcome,
+            )
+            # Файл сначала живёт в output/, а в проект копируется: вариант задачи
+            # чистится вместе с output/, вариант проекта должен его пережить.
+            await asyncio.to_thread(
+                get_projects_store().save_replica_take,
+                task.project_id,
+                task.index,
+                {
+                    "audio_path": str(variant.path),
+                    "label": variant.label,
+                    "seed": seed,
+                    "engine": audio_pipeline.voice_engine(
+                        str(task.replica.voice_id or speaker.voice_id)
+                    ),
+                    "parameters": audio_pipeline.chunk_parameters(task.replica, speaker),
+                    "duration_sec": variant.duration_sec,
+                    "qa": qa_outcome.to_dict() if qa_outcome is not None else None,
+                },
+            )
+            await asyncio.to_thread(audio_pipeline.drop_variant, variant)
+            job.current_replica = 1
+            job.duration_sec = variant.duration_sec
+            job.message = f"Реплика {task.index + 1}: готово, {variant.duration_sec:.1f} c"
+            job.status = JobStatus.DONE
+            logger.info(
+                "Проект %s: реплика %s пересинтезирована (сид %s)",
+                task.project_id, task.index + 1, seed,
+            )
+        except asyncio.CancelledError:
+            job.status = JobStatus.ERROR
+            job.error = "Отменено (остановка сервера)"
+            raise
+        except Exception as exc:
+            job.status = JobStatus.ERROR
+            job.error = str(exc)
+            job.message = f"Реплика {task.index + 1}: не удалось перегенерировать"
+            logger.exception(
+                "Проект %s: пересинтез реплики %s упал", task.project_id, task.index + 1
+            )
+        finally:
+            self._current_job_id = None
+            job.finished_at = _now_iso()
 
     async def _keep_current(
         self, job: Job, index: int, settings: RenderSettings, source_path: Path

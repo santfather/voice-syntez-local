@@ -182,11 +182,13 @@ def test_pause_samples_prefers_speaker_override():
     assert _pause_samples(_speaker(pause_override_ms=0), RenderSettings(pause_ms=400)) == 0
 
 
-def test_settings_for_applies_marker_overrides():
+def test_settings_for_applies_marker_overrides(fake_store):
     replica = Replica(voice="#1", text="Текст", line_number=1, overrides={"speed": 1.5})
-    tuned = _settings_for(replica, _speaker(speed=1.0, cfg_strength=2.0))
-    assert tuned.speed == 1.5 and tuned.cfg_strength == 2.0
-    assert _settings_for(_replica(), _speaker()) is not None
+    slot = SpeakerSettings.from_dict({"voice_id": "voice1", "cfg_strength": 2.5})
+    tuned = _settings_for(replica, slot)
+    # Правка реплики (маркер в тексте) важнее слота, а нетронутая ручка — из слота.
+    assert tuned.speed == 1.5 and tuned.cfg_strength == 2.5
+    assert _settings_for(_replica(), slot).speed == 1.0
 
 
 def test_text_for_engine_accents_only_for_supporting_engines(monkeypatch):

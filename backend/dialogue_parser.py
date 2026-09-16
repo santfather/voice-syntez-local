@@ -71,6 +71,9 @@ class Replica:
     text: str
     line_number: int
     overrides: dict[str, float] = field(default_factory=dict)
+    # Голос именно этой реплики поверх голоса спикера; None — наследовать.
+    # В тексте не выражается: это правка карточки реплики в интерфейсе.
+    voice_id: str | None = None
 
     @property
     def label(self) -> str:
@@ -83,6 +86,7 @@ class Replica:
             "text": self.text,
             "line_number": self.line_number,
             "overrides": self.overrides,
+            "voice_id": self.voice_id,
         }
 
 
@@ -312,6 +316,7 @@ def _split_long_replicas(replicas: list[Replica], max_chars: int) -> list[Replic
                 text=piece,
                 line_number=replica.line_number,
                 overrides=dict(replica.overrides),
+                voice_id=replica.voice_id,
             )
             for piece in pieces
         )

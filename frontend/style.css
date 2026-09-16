@@ -574,6 +574,28 @@ audio { width: 100%; margin-top: 12px; }
 .variant-row .muted { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 9px var(--mono); }
 .variant-row button { flex: 0 0 auto; }
 
+/* --- редактор реплик проекта -------------------------------------------------- */
+/* Два представления одного диалога: карточки реплик и исходный текст с маркерами. */
+.view-switch { display: flex; gap: 6px; margin-bottom: 12px; }
+.view-switch button.active { color: #cbb9ff; background: #312151; border-color: #7454b2; }
+
+.replica-card .ref-text { margin-bottom: 12px; color: #c2c0c8; font-size: 12px; }
+/* Варианты реплики проекта — часть её карточки, а не отступ под чужим блоком. */
+.replica-card .variant-list { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid #25242c; }
+.replica-card .variant-row { flex-wrap: wrap; }
+/* Пока реплика синтезируется, карточка не должна выглядеть готовой к правкам. */
+.replica-card.busy { opacity: 0.6; }
+
+/* Подпись ползунка с кнопкой сброса: значение и «вернуть наследуемое» рядом. */
+.param-head { display: flex; align-items: baseline; gap: 7px; }
+.param-reset { padding: 2px 5px; font-size: 9px; letter-spacing: 0; }
+
+/* Источник значения под ручкой: «наследуется от голоса «Anna»» или «правка этой
+   реплики». Мельче подписи ручки — это пояснение, а не ещё одна настройка. */
+.param-source { display: block; margin-top: 5px; font: 9px var(--mono); letter-spacing: 0.04em; }
+/* Что сохранено у голоса: тем же шрифтом, что и статус прослушивания. */
+.preset-state { margin: 8px 0 0; font: 9px var(--mono); }
+
 /* --- подвал ------------------------------------------------------------------- */
 footer {
   display: flex;

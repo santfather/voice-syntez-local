@@ -16,6 +16,7 @@ from .engines.base import (
     default_engine_for_gender,
     normalize_engine_params,
 )
+from .settings_resolution import COMMON_FIELDS, INT_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,27 @@ def check_engine(engine: str) -> str:
         known = ", ".join(sorted(ENGINE_INFOS))
         raise ValueError(f"Неизвестный движок синтеза: {engine or '(пусто)'}. Доступны: {known}")
     return engine
+
+
+def _normalize_preset(raw: dict | None) -> dict:
+    """Приводит пресет голоса к известным ручкам синтеза и к числам.
+
+    Пресет — это то, что пользователь подобрал в «Прослушать»: скорость, CFG, NFE
+    и прочие общие ручки (см. `settings_resolution`). Чужой ключ или строка вместо
+    числа означали бы значение, которое пайплайн либо не прочитает, либо прочитает
+    неверно, поэтому `voices.json` при чтении чистится — файл правят и руками.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    preset: dict[str, float | int] = {}
+    for name, value in raw.items():
+        if name not in COMMON_FIELDS or value is None:
+            continue
+        try:
+            preset[name] = int(value) if name in INT_FIELDS else float(value)
+        except (TypeError, ValueError):
+            logger.warning("Пресет голоса: поле %s = %r не число — пропускаю", name, value)
+    return preset
 
 
 def _inspect_reference(audio_bytes: bytes, suffix: str, name: str, gender: str) -> dict:
@@ -90,6 +112,10 @@ class Voice:
     # Значения ручек выбранного движка (температура и т.п.) — дефолты для этого
     # голоса; карточка слота может переопределить их на одну генерацию.
     engine_params: dict = field(default_factory=dict)
+    # Пресет: общие ручки синтеза (скорость, CFG, NFE, громкость), подобранные
+    # пользователем в «Прослушать». Это слой между паспортом движка и слотом
+    # проекта: новый диалог берёт эти значения сам, без повторной настройки.
+    preset: dict = field(default_factory=dict)
 
     @property
     def audio_path(self) -> Path:
@@ -132,6 +158,7 @@ class VoicesStore:
                 voice.engine_params = normalize_engine_params(
                     voice.engine, voice.engine_params if isinstance(voice.engine_params, dict) else {}
                 )
+                voice.preset = _normalize_preset(voice.preset)
                 voices.append(voice)
             except TypeError as exc:  # запись без обязательного поля — пропускаем
                 logger.warning("Пропускаю некорректную запись в voices.json: %s", exc)
@@ -265,11 +292,19 @@ class VoicesStore:
             logger.warning("Голос «%s»: %s", voice.name, voice.ref_text_warning)
         return voice
 
-    def update(self, voice_id: str, engine: str | None = None, engine_params: dict | None = None) -> Voice:
-        """Меняет движок и его ручки у существующего голоса.
+    def update(
+        self,
+        voice_id: str,
+        engine: str | None = None,
+        engine_params: dict | None = None,
+        preset: dict | None = None,
+    ) -> Voice:
+        """Меняет движок, его ручки и пресет у существующего голоса.
 
         Записи голоса не трогаются: движок — это свойство голоса, а не проекта,
         и его смена не требует перезаписи референса или его расшифровки.
+        `preset=None` — «не трогать», пустой словарь — «сбросить подобранные
+        настройки»: так кнопка сброса возвращает голос к паспорту движка.
         """
         engine = check_engine(engine) if engine else None
         with self._lock:
@@ -285,8 +320,12 @@ class VoicesStore:
             # поэтому при смене движка набор значений пересобирается заново.
             elif engine is not None:
                 voice.engine_params = {}
+            if preset is not None:
+                voice.preset = _normalize_preset(preset)
             self._write(voices)
-        logger.info("Голос %s: движок %s", voice_id, voice.engine)
+        logger.info(
+            "Голос %s: движок %s, пресет %s", voice_id, voice.engine, voice.preset or "пуст"
+        )
         return voice
 
     def inspect_existing(self) -> int:

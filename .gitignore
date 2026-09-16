@@ -2,6 +2,8 @@ venv/
 models/
 voices/
 output/
+# База проектов: рабочее состояние пользователя, а не часть проекта.
+data/
 __pycache__/
 *.py[cod]
 .DS_Store

@@ -32,8 +32,30 @@ OUTPUT_DIR = Path(os.environ.get("TTS_OUTPUT_DIR", BASE_DIR / "output"))
 FRONTEND_DIR = BASE_DIR / "frontend"
 VOICES_JSON = VOICES_DIR / "voices.json"
 
-for _d in (MODELS_DIR, VOICES_DIR, OUTPUT_DIR):
+# --- Постоянные проекты (SQLite) ----------------------------------------------
+# Отдельно от output/: готовые файлы задач живут по TTL, а проект должен
+# переживать и перезапуск, и очистку, иначе «открыть вчерашний диалог» невозможно.
+DATA_DIR = Path(os.environ.get("TTS_DATA_DIR", BASE_DIR / "data"))
+DB_PATH = Path(os.environ.get("TTS_DB_PATH", DATA_DIR / "voice_syntez.db"))
+# Куски (takes) проектов: по одному wav на реплику, чтобы их можно было
+# прослушать и заменить отдельно от итогового файла.
+PROJECTS_OUTPUT_DIR = OUTPUT_DIR / "projects"
+
+for _d in (MODELS_DIR, VOICES_DIR, OUTPUT_DIR, DATA_DIR, PROJECTS_OUTPUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# Режим проекта: диалог со спикерами или сплошной текст одним голосом.
+PROJECT_MODE_DIALOGUE = "dialogue"
+PROJECT_MODE_TEXT = "text"
+PROJECT_MODES = (PROJECT_MODE_DIALOGUE, PROJECT_MODE_TEXT)
+
+# Статус проекта и статус отдельной реплики в нём.
+PROJECT_STATUS_DRAFT = "draft"
+PROJECT_STATUS_RENDERING = "rendering"
+PROJECT_STATUS_RENDERED = "rendered"
+PROJECT_STATUS_ERROR = "error"
+REPLICA_STATUS_PENDING = "pending"
+REPLICA_STATUS_RENDERED = "rendered"
 
 # --- Веса модели --------------------------------------------------------------
 # Misha24-10/F5-TTS_RUSSIAN -> F5TTS_v1_Base_accent_tune (полная разметка ударений)
@@ -143,6 +165,49 @@ QA_BUDGET_SEC = float(os.environ.get("TTS_QA_BUDGET_SEC", "300"))
 QA_CFG_STEP = 0.4
 QA_TEMPERATURE_STEP = 0.1
 QA_REPETITION_PENALTY_STEP = 1.0
+
+# Режимы проверки. Раньше их было два — «выключено» и «строгая проверка каждого
+# куска», — и на длинном диалоге второй означал десяток запусков Whisper. Smart
+# добавляет третью ступень: сначала дешёвый отбор по самому аудио, и только
+# подозрительные куски уходят в расшифровку (см. `qa_screening`).
+QA_MODE_OFF = "off"
+QA_MODE_SMART = "smart"
+QA_MODE_STRICT = "strict"
+QA_MODES = (QA_MODE_OFF, QA_MODE_SMART, QA_MODE_STRICT)
+
+# --- Smart QA: дешёвый отбор подозрительных кусков -----------------------------
+# Отбор считает только то, что видно в самом waveform: длину относительно текста,
+# тишину, перегруз, уровень, повторы. Ошибиться в сторону «подозрительный» стоит
+# одного лишнего запуска Whisper, в сторону «нормальный» — дороже: непроверенный
+# кусок уедет в готовый файл. Поэтому границы широкие.
+QA_SCREEN_CHARS_PER_SEC = 15.0
+# Оценка длины по тексту ниже секунды — это шум: на короткой фразе «0.6 с вместо
+# 0.9» не значит ничего. Поэтому ожидаемая длина не опускается ниже секунды.
+QA_SCREEN_MIN_EXPECTED_SEC = 1.0
+# Совсем короткий кусок (щелчок, обрыв) — признак сорвавшегося синтеза.
+QA_SCREEN_MIN_DURATION_SEC = 0.2
+QA_SCREEN_SHORT_RATIO = 0.35
+QA_SCREEN_LONG_RATIO = 3.0
+# Кусок, который больше чем на 60 % состоит из тишины, — это либо обрыв, либо
+# модель «задумалась» посреди фразы.
+QA_SCREEN_SILENCE_RATIO = 0.6
+QA_SCREEN_SILENCE_DB = -45.0
+# Границы уровня считаются до нормализации куска: тихий или перегруженный выход
+# движка видно только на сыром waveform — `_prepare_chunk` его уже выровняет.
+QA_SCREEN_RMS_FLOOR_DB = -45.0
+QA_SCREEN_RMS_CEIL_DB = -1.0
+# Повтор участка ищется корреляцией сигнала с собой при сдвиге 0.4–2 с: у
+# зацикленной модели кусок повторяется почти дословно. Замер идёт только там, где
+# меняется громкость: ровный тон (затянутая гласная, гудок) коррелирует с собой
+# при сдвиге, кратного периоду, и без этой оговорки отбор браковал бы каждую
+# длинную гласную.
+QA_SCREEN_REPEAT_CORR = 0.98
+QA_SCREEN_REPEAT_MIN_ENVELOPE_DB = 3.0
+QA_SCREEN_REPEAT_MIN_LAG_SEC = 0.4
+QA_SCREEN_REPEAT_MAX_LAG_SEC = 2.0
+# Кадр замера громкости: 20 мс — коротко для интонации и длинно для дрожания
+# отдельного периода.
+QA_SCREEN_FRAME_SEC = 0.02
 
 # Максимальная длина сплошного текста для одной задачи (символов).
 # ~50 000 знаков — это примерно час готового аудио; защита от случайной

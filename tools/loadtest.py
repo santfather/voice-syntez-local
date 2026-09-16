@@ -4,9 +4,9 @@
 Фазы (можно запускать выборочно):
   light   — последовательная латентность лёгких ручек;
   load    — те же ручки при конкурентности 1/5/20/50;
-  heavy   — отзывчивость API во время тяжёлой задачи с qa=true;
+  heavy   — отзывчивость API во время тяжёлой задачи с qa=strict;
   queue   — 6 задач разом: строгая серийность, ожидание и время работы;
-  qa      — один и тот же текст с qa=false и qa=true: цена строгой проверки;
+  qa      — один и тот же текст в режимах off/smart/strict: цена проверки;
   engines — XTTS холодный и прогретый плюс смешанный диалог F5 + XTTS.
 
 Ресурсы (RSS сервера, RSS дочерних процессов Whisper, CPU, память системы)
@@ -229,7 +229,7 @@ class Resources:
 
 
 # --- постановка задач ---------------------------------------------------------
-def start_job(dialogue: str, speakers: dict, qa: bool) -> str:
+def start_job(dialogue: str, speakers: dict, qa: str) -> str:
     payload = {
         "dialogue_text": dialogue,
         "speakers": speakers,
@@ -335,8 +335,8 @@ def phase_load() -> None:
 
 def phase_heavy() -> None:
     say("\n=== heavy. ОТЗЫВЧИВОСТЬ API ВО ВРЕМЯ ТЯЖЁЛОЙ ЗАДАЧИ ===")
-    job_id = start_job(DIALOGUE_THREE, {"ИВАН": {"voice_id": F5_VOICE}}, qa=True)
-    say(f"  задача {job_id} (3 реплики, qa=true), параллельно 10 потоков опроса /api/status")
+    job_id = start_job(DIALOGUE_THREE, {"ИВАН": {"voice_id": F5_VOICE}}, qa="strict")
+    say(f"  задача {job_id} (3 реплики, qa=strict), параллельно 10 потоков опроса /api/status")
 
     times: list[float] = []
     codes: list[int] = []
@@ -374,7 +374,7 @@ def phase_heavy() -> None:
 def phase_queue() -> None:
     say("\n=== queue. ОЧЕРЕДЬ: 6 ОДНОРЕПЛИКОВЫХ ЗАДАЧ РАЗОМ ===")
     speakers = {"ИВАН": {"voice_id": F5_VOICE}}
-    jobs = [start_job(DIALOGUE_ONE, speakers, qa=False) for _ in range(6)]
+    jobs = [start_job(DIALOGUE_ONE, speakers, qa="off") for _ in range(6)]
     say(f"  поставлены: {', '.join(jobs)}")
 
     max_parallel = 0
@@ -414,20 +414,29 @@ def phase_queue() -> None:
 
 
 def phase_qa() -> None:
-    say("\n=== qa. ЦЕНА СТРОГОЙ ПРОВЕРКИ: qa=false против qa=true ===")
+    say("\n=== qa. ЦЕНА ПРОВЕРКИ: off против smart против strict ===")
     speakers = {"ИВАН": {"voice_id": F5_VOICE}}
-    for qa in (False, True):
-        job_id = start_job(DIALOGUE_THREE, speakers, qa=qa)
+    for mode in ("off", "smart", "strict"):
+        job_id = start_job(DIALOGUE_THREE, speakers, qa=mode)
         final, wall, timeline = watch_job(job_id)
         replicas = final.get("replicas") or []
         marks = [replica.get("qa") for replica in replicas]
         wers = [mark["wer"] for mark in marks if mark]
         attempts = [mark["attempts"] for mark in marks if mark]
+        # Сколько кусков реально ушло в Whisper: в Smart это и есть его цена.
+        transcribed = sum(1 for mark in marks if mark and mark["wer"] is not None)
+        screened = sum(
+            1
+            for mark in marks
+            if mark and mark.get("screening") and mark["screening"]["suspicious"]
+        )
         duration = final.get("duration_sec") or 0
         say(
-            f"  qa={str(qa):<5} время {wall:6.1f} c · аудио {duration:5.1f} c "
+            f"  qa={mode:<6} время {wall:6.1f} c · аудио {duration:5.1f} c "
             f"({wall/duration if duration else 0:4.1f}× реального времени) · "
-            f"реплик {len(replicas)} · WER {wers} · попытки {attempts}"
+            f"реплик {len(replicas)} · в Whisper {transcribed}"
+            f"{f' (отбор: подозрительных {screened})' if mode == 'smart' else ''} · "
+            f"WER {wers} · попытки {attempts}"
         )
         show_replicas(timeline)
 
@@ -438,7 +447,7 @@ def phase_engines() -> None:
     speakers = {"ИВАН": {"voice_id": F5_VOICE}, "МАРГО": {"voice_id": XTTS_VOICE}}
 
     for label in ("холодный", "прогретый"):
-        job_id = start_job(DIALOGUE_MARGO, {"МАРГО": {"voice_id": XTTS_VOICE}}, qa=False)
+        job_id = start_job(DIALOGUE_MARGO, {"МАРГО": {"voice_id": XTTS_VOICE}}, qa="off")
         _, _, engines = call_json("GET", "/api/status")
         states = {engine["id"]: engine.get("state") for engine in (engines or {}).get("engines") or []}
         final, wall, timeline = watch_job(job_id)
@@ -448,7 +457,7 @@ def phase_engines() -> None:
         )
         show_replicas(timeline)
 
-    job_id = start_job(DIALOGUE_MIXED, speakers, qa=False)
+    job_id = start_job(DIALOGUE_MIXED, speakers, qa="off")
     final, wall, timeline = watch_job(job_id)
     replicas = final.get("replicas") or []
     say(

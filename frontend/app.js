@@ -6,21 +6,19 @@ const state = {
   voices: [],
   engines: {},         // id -> паспорт движка из /api/engines
   engineTouched: false, // пользователь сам выбрал движок в форме нового голоса
-  voiceKeys: [],       // ["#1", "#2", "ИВАН"] — голоса, встреченные в тексте
-  voiceMeta: {},       // key -> {key, label, slot}
-  configs: {},         // key -> {voice_id, speed, cfg_strength, nfe_step, engine_params}
-  replicaCount: null,  // реплик в последнем разборе; null — разбора ещё не было
-  overrideCount: 0,    // сколько параметров пришло из маркеров текста
+  project: null,       // проект диалога: исходный текст, спикеры, реплики и варианты
+  sourceDirty: false,  // исходный текст правили после последнего разбора
+  openDetails: {},     // индекс реплики -> раскрыт ли блок «ещё настройки»
+  speakerDetails: {},  // ключ спикера -> раскрыт ли блок «ещё настройки голоса»
+  replicaBusy: null,   // индекс реплики, которая синтезируется прямо сейчас
+  replicaTimer: null,
+  takeKey: null,       // "индекс:take_id" варианта, играющего в плеере реплик
   preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, engine_params, text}
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
   jobId: null,
   pollTimer: null,
-  doneJobId: null,      // id последней готовой задачи — по нему перегенерация реплик
-  regenTimer: null,
-  regenIndex: null,
-  variantKey: null,     // "индекс:вариант" того варианта, что играет в плеере вариантов
   statusTimer: null,
   previewJob: null,    // {jobId, voiceId}
   previewTimer: null,
@@ -300,6 +298,9 @@ async function loadVoices() {
   state.voices = data.voices;
   renderVoiceCards();
   renderVoiceConfigs();
+  // Карточки реплик показывают имя и движок голоса: после переименования или
+  // удаления голоса они должны обновиться, а не остаться со старым названием.
+  renderReplicaCards();
   renderTextVoiceOptions();
   updateGenerateButton();
 }
@@ -307,16 +308,52 @@ async function loadVoices() {
 function previewState(voiceId) {
   if (!state.preview[voiceId]) {
     const voice = voiceById(voiceId);
+    // Прослушивание начинается с пресета голоса: это те же настройки, что
+    // достанутся новому диалогу, поэтому подобранное здесь можно сохранить
+    // обратно в голос и получить их по умолчанию.
+    const preset = (voice && voice.preset) || {};
     state.preview[voiceId] = {
-      speed: 1.0,
-      cfg_strength: 2.0,
-      nfe_step: 32,
+      speed: preset.speed ?? PARAM_DEFAULTS.speed,
+      cfg_strength: preset.cfg_strength ?? PARAM_DEFAULTS.cfg_strength,
+      nfe_step: preset.nfe_step ?? PARAM_DEFAULTS.nfe_step,
       // Ручки движка начинаются с сохранённых у голоса — тех же, что уйдут в диалог.
       engine_params: voice ? { ...voice.engine_params } : {},
       text: PREVIEW_TEXT,
     };
   }
   return state.preview[voiceId];
+}
+
+// Что сохранено у голоса. Показываем списком, а не подписью «настройки заданы»:
+// пользователь должен видеть, что именно получит новый диалог.
+function presetText(voice) {
+  const preset = voice.preset || {};
+  const parts = [];
+  if (preset.speed !== undefined) parts.push(`скорость ${Number(preset.speed).toFixed(2)}x`);
+  if (preset.cfg_strength !== undefined) parts.push(`CFG ${Number(preset.cfg_strength).toFixed(1)}`);
+  if (preset.nfe_step !== undefined) parts.push(`NFE ${Math.round(preset.nfe_step)}`);
+  return parts.length ? `настройки голоса: ${parts.join(' · ')}` : 'настройки голоса: по умолчанию движка';
+}
+
+// Настройки, подобранные в «Прослушать», становятся пресетом голоса: с них
+// начинается и следующий диалог, и это же значение наследуют слоты и реплики.
+async function saveVoicePreset(voiceId) {
+  const cfg = state.preview[voiceId];
+  if (!cfg) return;
+  showAlert($('voice-error'), '');
+  try {
+    await api(`/api/voices/${voiceId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        preset: { speed: cfg.speed, cfg_strength: cfg.cfg_strength, nfe_step: cfg.nfe_step },
+      }),
+    });
+    await loadVoices();
+    showAlert($('voice-error'), 'Настройки сохранены у голоса: новый диалог начнётся с них', 'info');
+  } catch (error) {
+    showAlert($('voice-error'), error.message);
+  }
 }
 
 function previewCard(voiceId) {
@@ -385,8 +422,11 @@ function renderVoiceCards() {
 
         <div class="test-row">
           <button class="tiny primary" data-role="preview">Прослушать</button>
+          <button class="tiny" data-role="save-preset"
+                  title="Записать подобранные настройки в голос — новый диалог начнётся с них">сохранить настройки</button>
           <span class="muted preview-status" data-role="preview-status"></span>
         </div>
+        <p class="muted preset-state" data-role="preset-state">${esc(presetText(voice))}</p>
         <audio data-role="player" controls hidden></audio>
       </div>`;
   }).join('');
@@ -833,41 +873,337 @@ function resetRecording() {
   showAlert($('record-notes'), '');
 }
 
-// --- голоса диалога (слоты из маркеров и имена спикеров) ----------------------
-function renderVoiceConfigs() {
-  const box = $('voice-configs');
-  if (!state.voiceKeys.length) {
-    box.innerHTML = '<span class="muted">Вставьте диалог и нажмите «Определить голоса».</span>';
+// --- проект диалога -----------------------------------------------------------
+// Вкладка работает с проектом, а не с разовой задачей: исходный текст, голоса
+// спикеров, реплики и их варианты лежат в базе. Поэтому правки переживают
+// перезагрузку страницы, а пересинтез одной реплики не трогает остальные.
+
+// Значения по умолчанию — те же числа, что и в backend/config.py. Нужны только
+// как запасной вариант: пока голос не выбран, разрешать слои не из чего, а поля
+// карточки всё равно надо чем-то заполнить.
+const PARAM_DEFAULTS = {
+  speed: 1, cfg_strength: 2, nfe_step: 32,
+  target_rms: 0.1, gain_db: 0, pitch_semitones: 0, pause_override_ms: null,
+};
+
+// Ручки, которые правятся у одной реплики поверх карточки спикера. Границы взяты
+// из config.py: это те же ползунки, что и в панели спикеров, только на реплику.
+const PARAM_RANGES = {
+  speed: { min: 0.5, max: 2, step: 0.05, label: 'Скорость речи' },
+  cfg_strength: { min: 1, max: 4, step: 0.1, label: 'CFG strength — стабильность ↔ выразительность' },
+  target_rms: { min: 0.02, max: 0.3, step: 0.01, label: 'Целевая громкость куска (RMS)' },
+  gain_db: { min: -20, max: 20, step: 0.5, label: 'Громкость' },
+  pitch_semitones: { min: -12, max: 12, step: 0.5, label: 'Питч-шифт' },
+};
+
+const PROJECT_KEY = 'voiceStudio.projectId';
+
+// --- источники значений -------------------------------------------------------
+// Иерархия «движок → пресет голоса → участник → реплика» считается на бэкенде
+// (backend/settings_resolution.py), и каждая ручка приходит вместе с источником.
+// Своего порядка слоёв у клиента нет намеренно: вторая точка слияния однажды уже
+// разошлась с первой, и подпись «наследуется от голоса» показывала бы не то,
+// чем реплика читается на самом деле.
+const SOURCE_ENGINE = 'engine';
+const SOURCE_VOICE = 'voice';
+const SOURCE_SPEAKER = 'speaker';
+const SOURCE_REPLICA = 'replica';
+
+// Ручка слоя: значение, источник и (у перекрытой) значение нижнего слоя — то,
+// куда вернёт сброс. Пустой `settings` означает «голос не выбран»: слои разрешить
+// не из чего, поэтому показываем дефолты движка, чтобы поля не были пустыми.
+function settingItem(scope, field) {
+  const item = ((scope && scope.settings) || {})[field];
+  if (item && item.value !== undefined) return item;
+  return { value: PARAM_DEFAULTS[field], source: SOURCE_ENGINE };
+}
+
+// Значение, которым ручка читалась бы без правки этого слоя. По нему видно,
+// выбрал ли слот что-то своё: равенство нижнему слою — это не выбор, а наследование.
+function inheritedValue(scope, field) {
+  const item = settingItem(scope, field);
+  return item.source === SOURCE_SPEAKER || item.source === SOURCE_REPLICA
+    ? item.inherited
+    : item.value;
+}
+
+// Подпись о происхождении значения: видно, что унаследовано, а что выбрано здесь.
+// Про дефолт движка молчим — это исходное состояние, а не решение пользователя.
+// `own` — слой, который правит эта панель: у карточки реплики это реплика, у панели
+// слотов — участник. Одно и то же значение читается по-разному: правка этого слоя
+// («правка этой реплики») или чужая, унаследованная («наследуется от участника»).
+function sourceNoteHtml(item, voiceLabel = '', own = SOURCE_REPLICA) {
+  let note = '';
+  if (item.source === SOURCE_VOICE) note = `наследуется от голоса${voiceLabel ? ` «${voiceLabel}»` : ''}`;
+  else if (item.source === SOURCE_SPEAKER) note = item.source === own ? 'правка участника' : 'наследуется от участника';
+  else if (item.source === SOURCE_REPLICA) note = 'правка этой реплики';
+  return note ? `<span class="muted param-source">${esc(note)}</span>` : '';
+}
+
+// Кнопка сброса — только у правки этого слоя: унаследованное сбрасывать некуда.
+// `own` — слой панели, как и у подписи: в карточке реплики кнопка снимает правку
+// реплики, а значение, пришедшее от участника, снимать отсюда нечем — такой сброс
+// ушёл бы в никуда. В подсказке — значение, которым ручка будет читаться после сброса.
+function resetButtonHtml(item, dataField, param = '', backField = dataField, own = SOURCE_REPLICA) {
+  if (item.source !== own) return '';
+  const back = item.inherited === undefined ? '' : ` → ${fmtParam(backField, item.inherited)}`;
+  return `<button class="tiny ghost param-reset" data-role="reset" data-field="${esc(dataField)}"${param ? ` data-param="${esc(param)}"` : ''}
+                title="вернуть наследуемое значение${esc(back)}">сброс</button>`;
+}
+
+function fmtParam(field, value) {
+  if (field === 'speed') return `${Number(value).toFixed(2)}x`;
+  if (field === 'cfg_strength') return Number(value).toFixed(1);
+  if (field === 'nfe_step') return String(Math.round(value));
+  if (field === 'gain_db') return fmtGain(Number(value));
+  if (field === 'pitch_semitones') return fmtPitch(Number(value));
+  if (field === 'target_rms') return fmtRms(Number(value));
+  if (field === 'pause_override_ms') return value === null ? 'общая для диалога' : `${value} мс`;
+  return String(value);
+}
+
+function speakerByKey(key) {
+  const speakers = (state.project && state.project.speakers) || [];
+  return speakers.find((speaker) => speaker.key === key) || null;
+}
+
+// Подпись спикера: имя из «ИВАН:» или «Слот N» для маркера «(N)».
+function speakerLabel(key) {
+  const speaker = speakerByKey(key);
+  return (speaker && speaker.label) || (key.startsWith('#') ? `Слот ${key.slice(1)}` : key);
+}
+
+function voiceName(voiceId) {
+  const voice = voiceById(voiceId);
+  return voice ? voice.name : (voiceId || 'не выбран');
+}
+
+// Два представления одного диалога: карточки реплик и исходный текст с маркерами.
+function switchDialogueView(view) {
+  document.querySelectorAll('.view-switch button').forEach((button) => {
+    button.classList.toggle('active', button.dataset.view === view);
+  });
+  $('visual-view').hidden = view !== 'visual';
+  $('source-view').hidden = view !== 'source';
+  if (view === 'source') setSourceState();
+}
+
+// Разбор идёт только по команде: правка текста меняет состав реплик, и молча
+// переписывать их (вместе с вариантами и правками карточек) на каждом символе
+// нельзя — об этом сообщает подпись рядом с кнопкой.
+function markSourceDirty() {
+  if (state.sourceDirty) return;
+  state.sourceDirty = true;
+  setSourceState();
+  renderParseSummary();
+}
+
+function setSourceState() {
+  const element = $('source-state');
+  const replicas = (state.project && state.project.replicas) || [];
+  if (state.sourceDirty) {
+    element.textContent = 'текст изменён — разберите заново';
+    element.classList.add('warn');
     return;
   }
-  box.innerHTML = state.voiceKeys.map((key) => {
-    const cfg = state.configs[key];
-    const meta = state.voiceMeta[key] || { label: key, slot: null };
+  element.classList.remove('warn');
+  element.textContent = state.project
+    ? `разобрано: ${replicas.length} ${plural(replicas.length, 'реплика', 'реплики', 'реплик')}`
+    : 'разбор ещё не выполнялся';
+}
+
+// --- проект: загрузка, разбор, применение ответа API --------------------------
+async function ensureProject() {
+  if (state.project) return state.project;
+  const source = $('dialogue').value;
+  const project = await api('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: projectName(source), source_text: source }),
+  });
+  state.project = project;
+  rememberProject(project.id);
+  return project;
+}
+
+// Имя нужно только для базы: в интерфейсе его не видно. Берём начало первой
+// реплики без маркеров и имени-метки — по нему проект и узнаётся в списке.
+function projectName(source) {
+  const first = String(source).split('\n').map((line) => line.trim()).find(Boolean) || '';
+  const clean = first.replace(/\(\s*\d{1,3}[^()]*\)/g, ' ').replace(/^[^:]{0,24}:\s*/, '').trim();
+  return (clean || 'Диалог').slice(0, 48);
+}
+
+// Идентификатор открытого проекта запоминаем: без этого перезагрузка страницы
+// начинала бы новый проект, и прежний вместе с вариантами оставался бы мусором.
+function rememberProject(projectId) {
+  try {
+    if (projectId) localStorage.setItem(PROJECT_KEY, projectId);
+    else localStorage.removeItem(PROJECT_KEY);
+  } catch (_) { /* приватный режим — просто не запоминаем */ }
+}
+
+async function loadSavedProject() {
+  let projectId = null;
+  try { projectId = localStorage.getItem(PROJECT_KEY); } catch (_) { /* приватный режим */ }
+  if (!projectId) return;
+  try {
+    const project = await api(`/api/projects/${projectId}`);
+    if (!project.source_text) return;
+    $('dialogue').value = project.source_text;
+    applyProject(project);
+  } catch (_) {
+    // Проект могли удалить: начинаем с чистого листа, а не с ошибки на загрузке.
+    rememberProject(null);
+  }
+  setSourceState();
+}
+
+function applyProject(project, { speakers = true } = {}) {
+  state.project = project;
+  if (speakers) renderVoiceConfigs();
+  renderReplicaCards();
+  renderParseSummary();
+  setSourceState();
+  updateGenerateButton();
+}
+
+async function refreshProject() {
+  if (!state.project) return;
+  applyProject(await api(`/api/projects/${state.project.id}`), { speakers: false });
+}
+
+// «Применить и разобрать»: исходный текст уходит в проект, проект разбирается в
+// реплики. Правки, сделанные в карточках, при повторном разборе перекрываются
+// параметрами из маркеров — текст и карточки правят одно и то же.
+async function applySource() {
+  showAlert($('parse-error'), '');
+  try {
+    const project = await ensureProject();
+    await api(`/api/projects/${project.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_text: $('dialogue').value }),
+    });
+    const parsed = await api(`/api/projects/${project.id}/parse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chunk_strategy: $('chunk-strategy').value }),
+    });
+    state.sourceDirty = false;
+    applyProject(parsed);
+    if (!parsed.replicas.length) {
+      showAlert($('parse-error'), 'Текст пуст — вставьте диалог или хотя бы одну фразу.');
+    }
+    return true;
+  } catch (error) {
+    showAlert($('parse-error'), error.message);
+    setSourceState();
+    return false;
+  }
+}
+
+// --- голоса спикеров (слоты из маркеров и имена спикеров) ---------------------
+// Панель правит спикера целиком — голос и набор параметров, от которого
+// наследуют его реплики. Отдельной реплике можно назначить своё в её карточке.
+// В карточке стоит разрешённое значение (движок → пресет голоса → слот), а не
+// `overrides`: иначе поля показывали бы дефолты движка и при сохранении молча
+// перекрывали бы настройки, подобранные для голоса.
+function speakerConfig(speaker) {
+  const cfg = defaultConfig();
+  cfg.voice_id = speaker.voice_id || '';
+  Object.keys(PARAM_DEFAULTS).forEach((field) => {
+    cfg[field] = settingItem(speaker, field).value;
+  });
+  return cfg;
+}
+
+const SPEAKER_CONTROLS = {
+  speed: 'speed', cfg_strength: 'cfg', nfe_step: 'nfe',
+  gain_db: 'gain', pitch_semitones: 'pitch', target_rms: 'rms',
+};
+
+// Голова ручки: название слева, значение и «сброс» — справа. Кнопка лежит внутри
+// общего блока со значением, чтобы её появление не сдвигало значение к центру.
+function sliderHeadHtml(title, label, reset = '') {
+  return `<span class="slider-head">${esc(title)}<span class="row">${label}${reset}</span></span>`;
+}
+
+const valueHtml = (role, text) => `<b data-role="${role}-label">${text}</b>`;
+
+// Возврат контрола карточки к наследуемому значению — так работает «сброс»:
+// сохранение сравнивает поля с нижним слоем, и совпадение само снимает правку.
+function setSpeakerControl(card, field, value) {
+  if (field === 'pause_override_ms') {
+    const inherit = value === null;
+    card.querySelector('[data-role="pause-inherit"]').checked = inherit;
+    const range = card.querySelector('[data-role="pause-override"]');
+    range.disabled = inherit;
+    if (!inherit) range.value = value;
+    card.querySelector('[data-role="pause-label"]').textContent = fmtPause(value);
+    return;
+  }
+  const role = SPEAKER_CONTROLS[field];
+  const control = role ? card.querySelector(`[data-role="${role}"]`) : null;
+  if (!control) return;
+  control.value = value;
+  const label = card.querySelector(`[data-role="${role}-label"]`);
+  if (label) label.textContent = fmtParam(field, value);
+}
+
+// Ручки движка в карточке слота: значения приходят разрешёнными, поэтому ползунок
+// стоит на том, чем слот читается сейчас, а подпись говорит, откуда это взялось.
+function speakerEngineParamsHtml(speaker, engineId, voiceLabel) {
+  const info = engineInfo(engineId);
+  if (!info || !info.params.length) return '';
+  return `<div class="grid-2">${info.params.map((param) => {
+    const item = settingItem(speaker, param.name);
+    const value = typeof item.value === 'number' ? item.value : param.default;
+    return `
+    <div class="field">
+      ${sliderHeadHtml(param.label, `<b data-param-label="${esc(param.name)}">${fmtByStep(value, param.step)}</b>`, resetButtonHtml(item, 'engine_params', param.name, param.name, SOURCE_SPEAKER))}
+      <input type="range" data-engine-param="${esc(param.name)}"
+             min="${param.min}" max="${param.max}" step="${param.step}" value="${value}" />
+      ${param.hint ? `<span class="muted">${esc(param.hint)}</span>` : ''}
+      ${sourceNoteHtml(item, voiceLabel, SOURCE_SPEAKER)}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function renderVoiceConfigs() {
+  const box = $('voice-configs');
+  const speakers = (state.project && state.project.speakers) || [];
+  if (!speakers.length) {
+    box.innerHTML = '<span class="muted">Вставьте диалог и нажмите «Применить и разобрать».</span>';
+    return;
+  }
+  box.innerHTML = speakers.map((speaker) => {
+    const cfg = speakerConfig(speaker);
+    const key = speaker.key;
+    const label = speaker.label || key;
+    const slot = key.startsWith('#') ? key.slice(1) : null;
     const options = state.voices
       .map((v) => `<option value="${esc(v.id)}"${v.id === cfg.voice_id ? ' selected' : ''}>${esc(v.name)}</option>`)
       .join('');
-    const markerTag = meta.slot === null
-      ? ''
-      : `<span class="tag">маркер (${meta.slot})</span>`;
+    const markerTag = slot === null ? '' : `<span class="tag">маркер (${slot})</span>`;
     // Набор настроек диктует движок выбранного голоса: у XTTS вместо CFG и NFE
     // температура и штраф за повторы. Движок можно смешивать в одном диалоге —
     // каждый слот считает свой набор.
     const voice = voiceById(cfg.voice_id);
-    // Слот стартует с ручек, сохранённых у голоса: иначе он отправил бы дефолты
-    // движка и молча перекрыл бы настройки голоса (см. audio_pipeline._engine_params).
-    if (voice && !Object.keys(cfg.engine_params).length) {
-      cfg.engine_params = engineParamsFor(voice.engine, voice.engine_params);
-    }
-    const note = voice
+    const voiceLabel = voice ? voice.name : '';
+    const item = (field) => settingItem(speaker, field);
+    const reset = (field) => resetButtonHtml(item(field), field, '', field, SOURCE_SPEAKER);
+    const note = (field) => sourceNoteHtml(item(field), voiceLabel, SOURCE_SPEAKER);
+    const noteText = voice
       ? engineNote(voice.engine)
       : 'выберите голос — набор настроек появится под движок этого голоса';
     return `
       <div class="card" data-voice="${esc(key)}">
         <div class="voice-top">
-          <span class="avatar${voice && voice.engine !== ENGINE_F5 ? ' violet' : ''}">${esc(initials(meta.label))}</span>
+          <span class="avatar${voice && voice.engine !== ENGINE_F5 ? ' violet' : ''}">${esc(initials(label))}</span>
           <div class="voice-name">
-            <h3>${esc(meta.label)}</h3>
-            <p data-role="engine-note">${esc(note)}</p>
+            <h3>${esc(label)}</h3>
+            <p data-role="engine-note">${esc(noteText)}</p>
           </div>
           ${voice ? `<span class="engine-tag${voice.engine === ENGINE_F5 ? '' : ' violet'}" title="${esc(engineNote(voice.engine))}">${esc(voice.engine.toUpperCase())}</span>` : ''}
         </div>
@@ -881,47 +1217,54 @@ function renderVoiceConfigs() {
           </select>
         </label>
 
-        <label class="field">
-          <span class="slider-head">Скорость речи <b data-role="speed-label">${cfg.speed.toFixed(2)}x</b></span>
+        <div class="field">
+          ${sliderHeadHtml('Скорость речи', valueHtml('speed', `${cfg.speed.toFixed(2)}x`), reset('speed'))}
           <input type="range" data-role="speed" min="0.5" max="2" step="0.05" value="${cfg.speed}" />
-        </label>
-        <div data-role="engine-params">${voice ? engineParamsHtml(voice.engine, cfg.engine_params) : ''}</div>
+          ${note('speed')}
+        </div>
+        <div data-role="engine-params">${voice ? speakerEngineParamsHtml(speaker, voice.engine, voiceLabel) : ''}</div>
         <div data-role="f5-params" ${voice && voice.engine === ENGINE_F5 ? '' : 'hidden'}>
-          <label class="field">
-            <span class="slider-head">CFG strength — стабильность ↔ выразительность <b data-role="cfg-label">${cfg.cfg_strength.toFixed(1)}</b></span>
+          <div class="field">
+            ${sliderHeadHtml('CFG strength — стабильность ↔ выразительность', valueHtml('cfg', cfg.cfg_strength.toFixed(1)), reset('cfg_strength'))}
             <input type="range" data-role="cfg" min="1" max="4" step="0.1" value="${cfg.cfg_strength}" />
-          </label>
-          <label class="field" style="margin-bottom:0">
-            <span>NFE steps — быстрее ↔ качественнее</span>
+            ${note('cfg_strength')}
+          </div>
+          <div class="field" style="margin-bottom:0">
+            ${sliderHeadHtml('NFE steps — быстрее ↔ качественнее', '', reset('nfe_step'))}
             <select data-role="nfe">
               ${nfeOptions(cfg.nfe_step)}
             </select>
-          </label>
+            ${note('nfe_step')}
+          </div>
         </div>
 
-        <details class="advanced">
+        <details class="advanced"${state.speakerDetails[key] ? ' open' : ''}>
           <summary>Ещё настройки голоса</summary>
-          <label class="field">
-            <span class="slider-head">Громкость <b data-role="gain-label">${fmtGain(cfg.gain_db)}</b></span>
+          <div class="field">
+            ${sliderHeadHtml('Громкость', valueHtml('gain', fmtGain(cfg.gain_db)), reset('gain_db'))}
             <input type="range" data-role="gain" min="-20" max="20" step="0.5" value="${cfg.gain_db}" />
-          </label>
-          <label class="field">
-            <span class="slider-head">Питч-шифт <b data-role="pitch-label">${fmtPitch(cfg.pitch_semitones)}</b></span>
+            ${note('gain_db')}
+          </div>
+          <div class="field">
+            ${sliderHeadHtml('Питч-шифт', valueHtml('pitch', fmtPitch(cfg.pitch_semitones)), reset('pitch_semitones'))}
             <input type="range" data-role="pitch" min="-12" max="12" step="0.5" value="${cfg.pitch_semitones}" />
             <span class="muted">экспериментально: меняет высоту тона, а не пол голоса</span>
-          </label>
-          <label class="field">
-            <span class="slider-head">Целевая громкость куска (RMS) <b data-role="rms-label">${fmtRms(cfg.target_rms)}</b></span>
+            ${note('pitch_semitones')}
+          </div>
+          <div class="field">
+            ${sliderHeadHtml('Целевая громкость куска (RMS)', valueHtml('rms', fmtRms(cfg.target_rms)), reset('target_rms'))}
             <input type="range" data-role="rms" min="0.02" max="0.3" step="0.01" value="${cfg.target_rms}" />
-          </label>
+            ${note('target_rms')}
+          </div>
           <div class="field" style="margin-bottom:0">
-            <span class="slider-head">Пауза перед репликами <b data-role="pause-label">${fmtPause(cfg.pause_override_ms)}</b></span>
+            ${sliderHeadHtml('Пауза перед репликами', valueHtml('pause', fmtPause(cfg.pause_override_ms)), reset('pause_override_ms'))}
             <input type="range" data-role="pause-override" min="0" max="5000" step="50"
                    value="${cfg.pause_override_ms ?? 400}" ${cfg.pause_override_ms === null ? 'disabled' : ''} />
             <label class="toggle">
               <input type="checkbox" data-role="pause-inherit" ${cfg.pause_override_ms === null ? 'checked' : ''} />
               как в общих настройках
             </label>
+            ${note('pause_override_ms')}
           </div>
         </details>
       </div>`;
@@ -938,139 +1281,434 @@ function plural(count, one, few, many) {
   return many;
 }
 
-// Сводка под кнопкой разбора. Про неназначенный голос сообщаем здесь, а не только
-// подсказкой отключённой кнопки: иначе непонятно, почему генерация недоступна.
-// Считаем именно участников (слоты), а не выбранные голоса — их ещё может не быть.
+// Сводка над карточками реплик. Про неназначенный голос сообщаем здесь, а не
+// только подсказкой отключённой кнопки: иначе непонятно, почему генерация
+// недоступна. Считаем участников и реплики с правками — по ним видно, что
+// диалог уже настраивали, а что осталось на значениях спикера.
 function renderParseSummary() {
   const summary = $('parse-summary');
-  if (state.replicaCount === null) {
-    summary.textContent = '';
+  const replicas = (state.project && state.project.replicas) || [];
+  const speakers = (state.project && state.project.speakers) || [];
+  if (!state.project) {
+    summary.textContent = 'Реплик пока нет: вставьте текст в Source / Advanced и нажмите «Применить и разобрать».';
     summary.classList.remove('warn');
     return;
   }
-  const voices = state.voiceKeys.length;
-  const unassigned = state.voiceKeys
-    .filter((key) => !(state.configs[key] || {}).voice_id).length;
+  const unassigned = speakers.filter((speaker) => !speaker.voice_id).length;
+  const edited = replicas.filter((replica) => Object.keys(replica.overrides || {}).length).length;
   const parts = [
-    `${state.replicaCount} ${plural(state.replicaCount, 'реплика', 'реплики', 'реплик')}`,
-    `${voices} ${plural(voices, 'участник', 'участника', 'участников')}`,
+    `${replicas.length} ${plural(replicas.length, 'реплика', 'реплики', 'реплик')}`,
+    `${speakers.length} ${plural(speakers.length, 'участник', 'участника', 'участников')}`,
   ];
   if (unassigned) parts.push(`без голоса: ${unassigned}`);
-  if (state.overrideCount) parts.push(`параметров из текста: ${state.overrideCount}`);
+  if (edited) parts.push(`с правками: ${edited}`);
+  if (state.sourceDirty) parts.push('текст изменён — нужен повторный разбор');
   summary.textContent = parts.join(' · ');
-  summary.classList.toggle('warn', unassigned > 0);
+  summary.classList.toggle('warn', unassigned > 0 || state.sourceDirty);
 }
 
-// Панель голосов должна отражать текущий текст: пользователь правит диалог, а не
-// жмёт каждый раз «Определить голоса». Без этого новый слот («(2)», «(3)») уходил
-// на бэкенд без голоса и задача падала с «Не назначен голос для: …».
-async function syncVoices({ silent = false } = {}) {
-  if (!silent) showAlert($('parse-error'), '');
-  let parsed;
-  try {
-    parsed = await api('/api/parse', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        dialogue_text: $('dialogue').value,
-        chunk_strategy: $('chunk-strategy').value,
-      }),
-    });
-  } catch (error) {
-    if (!silent) showAlert($('parse-error'), error.message);
-    return false;
-  }
-
-  if (!parsed.replicas.length && !silent) {
-    showAlert($('parse-error'), 'Текст пуст — вставьте диалог или хотя бы одну фразу.');
-  }
-
-  const keys = parsed.voices.map((v) => v.key);
-  const meta = {};
-  parsed.voices.forEach((v) => { meta[v.key] = v; });
-  // Подпись состава голосов: если она не изменилась, панель не перерисовываем,
-  // иначе на каждой правке текста сбрасывались бы положения ползунков.
-  const signature = (list, map) =>
-    list.map((key) => `${key}|${map[key] ? map[key].label : ''}|${map[key] ? map[key].slot : ''}`).join('\n');
-  const changed = signature(keys, meta) !== signature(state.voiceKeys, state.voiceMeta);
-
-  // Настроенные параметры сохраняем и для голосов, исчезнувших из текста при
-  // правке: пользователь может вернуть их обратно, настройки не потеряются.
-  const configs = { ...state.configs };
-  keys.forEach((key) => { configs[key] = configs[key] || defaultConfig(); });
-  state.voiceKeys = keys;
-  state.voiceMeta = meta;
-  state.configs = configs;
-
-  state.replicaCount = parsed.replicas.length;
-  state.overrideCount = parsed.override_count;
-  renderParseSummary();
-  if (changed) renderVoiceConfigs();
-  updateGenerateButton();
-  return true;
+// --- работа с карточками спикеров ---------------------------------------------
+// Читаем карточку перед каждой записью: панель и база должны совпадать, иначе
+// незаписанная правка молча не попадёт ни в рендер, ни в пересинтез реплики.
+// В слот уходит только то, что отличается от наследуемого: равенство настройкам
+// голоса — это не выбор слота, а наследование. Иначе слот всегда перекрывал бы
+// пресет голоса всеми ручками сразу, и «настроил голос один раз» не работало бы
+// ни в одном новом диалоге.
+function readSpeakerCard(card) {
+  const speaker = speakerByKey(card.dataset.voice) || {};
+  const overrides = {};
+  const values = {
+    speed: parseFloat(card.querySelector('[data-role="speed"]').value),
+    cfg_strength: parseFloat(card.querySelector('[data-role="cfg"]').value),
+    nfe_step: parseInt(card.querySelector('[data-role="nfe"]').value, 10),
+    gain_db: parseFloat(card.querySelector('[data-role="gain"]').value),
+    pitch_semitones: parseFloat(card.querySelector('[data-role="pitch"]').value),
+    target_rms: parseFloat(card.querySelector('[data-role="rms"]').value),
+    pause_override_ms: card.querySelector('[data-role="pause-inherit"]').checked
+      ? null
+      : parseInt(card.querySelector('[data-role="pause-override"]').value, 10),
+  };
+  Object.entries(values).forEach(([field, value]) => {
+    if (value !== inheritedValue(speaker, field)) overrides[field] = value;
+  });
+  // Ручки движка (temperature у XTTS и т.п.) проверяются так же: в слот идёт
+  // только то, что слот выбрал сам, а F5-специфичные cfg/nfe остаются полями выше.
+  const params = {};
+  Object.entries(readEngineParams(card)).forEach(([name, value]) => {
+    if (value !== inheritedValue(speaker, name)) params[name] = value;
+  });
+  if (Object.keys(params).length) overrides.engine_params = params;
+  return { voice_id: card.querySelector('[data-role="voice"]').value, overrides };
 }
 
-async function detectVoices() {
-  await syncVoices({ silent: false });
-}
-
-// --- работа с карточками голосов ----------------------------------------------
-function readCardConfigs() {
+// Спикеры сохраняются целиком: карточка правит голос и набор параметров, от
+// которого наследуют все его реплики. Отдельные значения можно прислать готовыми
+// (`overrides`) — так смена голоса сбрасывает ручки прошлого движка.
+async function saveSpeakers(overrides = {}, errorElement = null) {
+  if (!state.project) return false;
+  const speakers = {};
   document.querySelectorAll('#voice-configs .card').forEach((card) => {
     const key = card.dataset.voice;
-    const cfg = state.configs[key];
-    cfg.voice_id = card.querySelector('[data-role="voice"]').value;
-    cfg.speed = parseFloat(card.querySelector('[data-role="speed"]').value);
-    cfg.cfg_strength = parseFloat(card.querySelector('[data-role="cfg"]').value);
-    cfg.nfe_step = parseInt(card.querySelector('[data-role="nfe"]').value, 10);
-    cfg.gain_db = parseFloat(card.querySelector('[data-role="gain"]').value);
-    cfg.pitch_semitones = parseFloat(card.querySelector('[data-role="pitch"]').value);
-    cfg.target_rms = parseFloat(card.querySelector('[data-role="rms"]').value);
-    cfg.pause_override_ms = card.querySelector('[data-role="pause-inherit"]').checked
-      ? null
-      : parseInt(card.querySelector('[data-role="pause-override"]').value, 10);
-    // Ручки движка (temperature у XTTS и т.п.) — в слот идут как переопределение
-    // настроек голоса; F5-специфичные cfg/nfe остаются отдельными полями.
-    cfg.engine_params = readEngineParams(card);
+    speakers[key] = overrides[key] || readSpeakerCard(card);
   });
+  try {
+    const project = await api(`/api/projects/${state.project.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speakers }),
+    });
+    applyProject(project, { speakers: false });
+    return true;
+  } catch (error) {
+    showAlert(errorElement || $('replica-error'), error.message);
+    return false;
+  }
+}
+
+// Сохранение с пересборкой панели: правка меняет и источники значений, и набор
+// кнопок «сброс», а после неудачной записи перерисовка возвращает карточку к
+// тому, что действительно лежит в базе.
+async function saveAndRenderSpeakers() {
+  await saveSpeakers();
+  renderVoiceConfigs();
 }
 
 function updateGenerateButton() {
-  const assigned = state.voiceKeys.length > 0 &&
-    state.voiceKeys.every((key) => state.configs[key] && state.configs[key].voice_id);
+  const speakers = (state.project && state.project.speakers) || [];
+  const assigned = speakers.length > 0 && speakers.every((speaker) => speaker.voice_id);
   const button = $('btn-generate');
-  button.disabled = !(state.modelReady && assigned) || Boolean(state.jobId);
+  button.disabled = !(state.modelReady && assigned)
+    || Boolean(state.jobId) || state.sourceDirty;
   if (!state.modelReady) button.title = 'Модель ещё загружается';
-  else if (!state.voiceKeys.length) button.title = 'Сначала определите голоса';
+  else if (!speakers.length) button.title = 'Сначала разберите текст на реплики';
+  else if (state.sourceDirty) button.title = 'Текст изменён — нажмите «Применить и разобрать»';
   else if (!assigned) button.title = 'Выберите голос для каждого участника диалога';
   else button.title = '';
 }
 
-// --- генерация диалога --------------------------------------------------------
-async function generate() {
-  // Текст мог измениться после последней синхронизации — сверяем список голосов
-  // до отправки, иначе задача упадёт на бэкенде с «Не назначен голос для: …».
-  if (!(await syncVoices({ silent: false }))) return;
-  readCardConfigs();
-  showAlert($('job-error'), '');
+// --- карточки реплик (Visual editor) ------------------------------------------
+// Карточка — основное место работы с диалогом: у каждой реплики видно, каким
+// голосом и движком она читается, что в ней можно поправить и какие звучания у
+// неё уже есть. Текст с маркерами остаётся advanced-режимом и правит то же
+// самое — реплики проекта, поэтому оба представления смотрят на одни данные.
 
-  const unassigned = state.voiceKeys.filter((key) => !state.configs[key].voice_id);
-  if (unassigned.length) {
-    const names = unassigned
-      .map((key) => `«${(state.voiceMeta[key] || {}).label || key}»`)
-      .join(', ');
-    showAlert($('job-error'), `Выберите голос для: ${names}`);
-    updateGenerateButton();
+const replicaByIndex = (index) =>
+  ((state.project && state.project.replicas) || []).find((item) => item.index === index) || null;
+
+// Ползунок одной ручки реплики: подпись со значением, источник и кнопка «сброс»
+// у правки этой реплики. Кнопка стоит вне <label>: внутри него клик по ней заодно
+// двигал бы ползунок.
+function replicaSliderHtml(replica, field, title, range, trackValue) {
+  const item = settingItem(replica, field);
+  const track = trackValue === undefined ? item.value : trackValue;
+  return `
+    <div class="field">
+      <span class="param-head">${esc(title)}
+        <b data-role="${field}-label">${esc(fmtParam(field, item.value))}</b>
+        ${resetButtonHtml(item, field)}</span>
+      <input type="range" data-role="param" data-field="${field}"
+             min="${range.min}" max="${range.max}" step="${range.step}" value="${track}" />
+      ${sourceNoteHtml(item, voiceName(replica.voice_id))}
+    </div>`;
+}
+
+function replicaSelectHtml(replica, field, title, options) {
+  const item = settingItem(replica, field);
+  return `
+    <div class="field">
+      <span class="param-head">${esc(title)}
+        ${resetButtonHtml(item, field)}</span>
+      <select data-role="param" data-field="${field}">${options}</select>
+      ${sourceNoteHtml(item, voiceName(replica.voice_id))}
+    </div>`;
+}
+
+// Ручки движка диктует сам движок: у XTTS это температура и штраф за повторы,
+// у F5 их нет. Поэтому блок собирается по паспорту движка, а не по списку полей.
+function replicaEngineParamsHtml(replica, engine) {
+  const info = engineInfo(engine);
+  if (!info || !info.params.length) return '';
+  return info.params.map((param) => {
+    const item = settingItem(replica, param.name);
+    const value = typeof item.value === 'number' ? item.value : param.default;
+    return `
+    <div class="field">
+      <span class="param-head">${esc(param.label)}
+        <b data-param-label="${esc(param.name)}">${fmtByStep(value, param.step)}</b>
+        ${resetButtonHtml(item, 'engine_params', param.name, param.name)}</span>
+      <input type="range" data-engine-param="${esc(param.name)}"
+             min="${param.min}" max="${param.max}" step="${param.step}" value="${value}" />
+      ${param.hint ? `<span class="muted">${esc(param.hint)}</span>` : ''}
+      ${sourceNoteHtml(item, voiceName(replica.voice_id))}
+    </div>`;
+  }).join('');
+}
+
+function renderReplicaCards() {
+  const box = $('replica-cards');
+  const replicas = (state.project && state.project.replicas) || [];
+  // Разметка пересобирается целиком, поэтому прослушивание, начатое до
+  // обновления, надо остановить: иначе кнопка осталась бы в состоянии «стоп»
+  // у строки, которой уже нет.
+  stopTake();
+  if (!replicas.length) {
+    box.innerHTML = '<span class="muted">Реплик нет: вставьте диалог в Source / Advanced и нажмите «Применить и разобрать».</span>';
     return;
   }
+  box.innerHTML = replicas.map(replicaCardHtml).join('');
+}
+
+// История звучаний реплики: вариант — это готовое аудио, поэтому переключение
+// между ними мгновенное и без повторного синтеза.
+function takesHtml(replica) {
+  const takes = replica.takes || [];
+  if (!takes.length) return '';
+  const rows = takes.map((take) => {
+    const playing = state.takeKey === `${replica.index}:${take.id}`;
+    return `
+      <div class="variant-row" data-take="${take.id}">
+        <button class="tiny" data-role="take-play">${playing ? 'стоп' : 'слушать'}</button>
+        <span class="variant-label">${esc(take.label || 'вариант')}${take.active ? ' · активно' : ''}</span>
+        <span class="muted">${Number(take.duration_sec || 0).toFixed(1)} с · ${esc(seedText(take.seed))}</span>
+        ${qaNote(take.qa)}
+        ${take.active ? '' : '<button class="tiny" data-role="take-pick">поставить</button>'}
+      </div>`;
+  }).join('');
+  return `<div class="variant-list">${rows}</div>`;
+}
+
+function replicaCardHtml(replica) {
+  const index = replica.index;
+  const label = replica.label || speakerLabel(replica.speaker);
+  const voice = voiceById(replica.voice_id);
+  const engine = replica.engine || (voice ? voice.engine : '');
+  const takes = replica.takes || [];
+  const active = takes.find((take) => take.active) || null;
+  const speaker = speakerByKey(replica.speaker);
+  const pause = settingItem(replica, 'pause_override_ms').value;
+  const options = state.voices
+    .map((item) => `<option value="${esc(item.id)}"${item.id === (replica.voice_override || '') ? ' selected' : ''}>${esc(item.name)}</option>`)
+    .join('');
+  const takeLine = !takes.length
+    ? 'Take: ещё не синтезировалась'
+    : active
+      ? `Take: ${takes.indexOf(active) + 1} из ${takes.length} · ${esc(active.label || '')}`
+      : `Take: ${takes.length} (активный не выбран)`;
+  return `
+    <div class="card replica-card${state.replicaBusy === index ? ' busy' : ''}" data-index="${index}">
+      <div class="voice-top">
+        <div class="voice-name">
+          <h3>${esc(label)} · Replica ${index + 1}</h3>
+          <p>Voice: ${esc(voiceName(replica.voice_id))} · Engine: ${esc(engine ? engineLabel(engine) : '—')}</p>
+        </div>
+        ${engine ? `<span class="engine-tag${engine === ENGINE_F5 ? '' : ' violet'}" title="${esc(engineNote(engine))}">${esc(engine.toUpperCase())}</span>` : ''}
+      </div>
+      <p class="ref-text" title="${esc(replica.text)}">${esc(replica.text)}</p>
+
+      <div class="row between" style="margin-bottom: 10px">
+        <span class="row">
+          <button class="tiny" data-role="play">Play</button>
+          <button class="tiny" data-role="regen"${state.replicaBusy === index ? ' disabled' : ''}>Regenerate</button>
+        </span>
+        <span class="muted">${takeLine}</span>
+      </div>
+
+      <div class="field">
+        <span>Голос реплики</span>
+        <select data-role="voice">
+          <option value="">— как у спикера: ${esc(voiceName(replica.inherited_voice_id))} —</option>
+          ${options}
+        </select>
+        <span class="muted">Свой голос этой реплики; остальные читает голос спикера.</span>
+      </div>
+
+      ${replicaSliderHtml(replica, 'speed', 'Speed', PARAM_RANGES.speed)}
+      ${replicaSliderHtml(replica, 'pause_override_ms', 'Pause before', { min: 0, max: 5000, step: 50 }, pause === null ? 400 : pause)}
+
+      <details class="advanced"${state.openDetails[index] ? ' open' : ''}>
+        <summary>Ещё настройки реплики</summary>
+        ${engine === ENGINE_F5 ? `
+          ${replicaSliderHtml(replica, 'cfg_strength', 'CFG strength', PARAM_RANGES.cfg_strength)}
+          ${replicaSelectHtml(replica, 'nfe_step', 'NFE steps', nfeOptions(settingItem(replica, 'nfe_step').value))}` : ''}
+        ${replicaEngineParamsHtml(replica, engine)}
+        ${replicaSliderHtml(replica, 'gain_db', 'Громкость', PARAM_RANGES.gain_db)}
+        ${replicaSliderHtml(replica, 'pitch_semitones', 'Питч-шифт', PARAM_RANGES.pitch_semitones)}
+        ${replicaSliderHtml(replica, 'target_rms', 'Целевая громкость (RMS)', PARAM_RANGES.target_rms)}
+      </details>
+
+      ${takesHtml(replica)}
+    </div>`;
+}
+
+// --- прослушивание вариантов реплик -------------------------------------------
+// Активный вариант — то, что попало в файл; «Play» в шапке карточки играет
+// именно его, а список ниже даёт сравнить с прежними звучаниями.
+function playActiveTake(index) {
+  const replica = replicaByIndex(index);
+  const active = replica && (replica.takes || []).find((take) => take.active);
+  if (!active) {
+    showAlert($('replica-error'), 'У реплики ещё нет звучания: нажмите Regenerate.');
+    return;
+  }
+  toggleTake(index, active.id);
+}
+
+function toggleTake(index, takeId) {
+  const player = $('take-player');
+  const key = `${index}:${takeId}`;
+  if (state.takeKey === key && !player.paused) {
+    player.pause();
+    return;
+  }
+  state.takeKey = key;
+  player.src = `/api/projects/${state.project.id}/replicas/${index}/takes/${takeId}/audio`;
+  markTakePlaying();
+  // play() отказывается промисом, а не исключением: молча оставить это нельзя —
+  // кнопка показывала бы «стоп» у варианта, который не звучит.
+  player.play().catch((error) => {
+    state.takeKey = null;
+    markTakePlaying();
+    showAlert($('replica-error'), `Не удалось воспроизвести вариант: ${error.message}`);
+  });
+}
+
+function markTakePlaying() {
+  document.querySelectorAll('#replica-cards [data-role="take-play"]').forEach((button) => {
+    const row = button.closest('.variant-row');
+    const card = button.closest('.replica-card');
+    button.textContent =
+      state.takeKey === `${card.dataset.index}:${row.dataset.take}` ? 'стоп' : 'слушать';
+  });
+  document.querySelectorAll('#replica-cards [data-role="play"]').forEach((button) => {
+    const card = button.closest('.replica-card');
+    const replica = replicaByIndex(parseInt(card.dataset.index, 10));
+    const active = replica && (replica.takes || []).find((take) => take.active);
+    const playing = Boolean(active) && state.takeKey === `${card.dataset.index}:${active.id}`;
+    button.textContent = playing ? 'Stop' : 'Play';
+  });
+}
+
+function stopTake() {
+  const player = $('take-player');
+  player.pause();
+  player.removeAttribute('src');
+  state.takeKey = null;
+}
+
+// --- правки реплики -----------------------------------------------------------
+// Правка точечная: одна ручка не затирает остальные правки карточки. `null` в
+// значении означает «вернуть наследуемое у спикера» — так работает «сброс».
+async function patchReplica(index, payload) {
+  if (!state.project) return;
+  showAlert($('replica-error'), '');
+  try {
+    const data = await api(`/api/projects/${state.project.id}/replicas/${index}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    setReplica(data.replica);
+  } catch (error) {
+    showAlert($('replica-error'), error.message);
+  }
+}
+
+// Ответ API содержит реплику целиком — правки, голос, движок и варианты, поэтому
+// перезапрашивать проект ради одной карточки не нужно.
+function setReplica(replica) {
+  if (!state.project) return;
+  const position = state.project.replicas.findIndex((item) => item.index === replica.index);
+  if (position < 0) return;
+  state.project.replicas[position] = replica;
+  renderReplicaCards();
+  renderParseSummary();
+}
+
+async function regenerateReplica(index) {
+  if (!state.project || state.replicaBusy !== null) return;
+  const replica = replicaByIndex(index);
+  if (!replica || !replica.voice_id) {
+    showAlert($('replica-error'), 'Сначала выберите голос для этой реплики.');
+    return;
+  }
+  showAlert($('replica-error'), '');
+  state.replicaBusy = index;
+  renderReplicaCards();
+  try {
+    const job = await api(`/api/projects/${state.project.id}/replicas/${index}/regenerate`, {
+      method: 'POST',
+    });
+    startTakePoll(job.job_id);
+  } catch (error) {
+    state.replicaBusy = null;
+    renderReplicaCards();
+    showAlert($('replica-error'), error.message);
+  }
+}
+
+// Синтез идёт через общий serial worker, поэтому завершения ждём опросом задачи:
+// пока она считается, карточка помечена занятой, а список вариантов не трогаем —
+// иначе он разошёлся бы с тем, что лежит на диске.
+function startTakePoll(jobId) {
+  clearInterval(state.replicaTimer);
+  state.replicaTimer = setInterval(() => pollTakeJob(jobId), 1500);
+}
+
+async function pollTakeJob(jobId) {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    if (job.status === 'queued' || job.status === 'processing') return;
+    clearInterval(state.replicaTimer);
+    state.replicaTimer = null;
+    state.replicaBusy = null;
+    if (job.status === 'error') {
+      renderReplicaCards();
+      showAlert($('replica-error'), job.error || 'Реплика не пересинтезировалась');
+      return;
+    }
+    // Новое звучание сохранено вариантом реплики — забираем проект целиком,
+    // чтобы карточка показала его активным, а прежнее осталось в списке.
+    await refreshProject();
+  } catch (error) {
+    clearInterval(state.replicaTimer);
+    state.replicaTimer = null;
+    state.replicaBusy = null;
+    renderReplicaCards();
+    showAlert($('replica-error'), error.message);
+  }
+}
+
+// Выбор варианта синтеза не запускает: он уже готов, и сравнение двух версий
+// на слух не должно превращаться в ожидание модели.
+async function selectTake(index, takeId) {
+  if (!state.project || state.replicaBusy !== null) return;
+  showAlert($('replica-error'), '');
+  try {
+    const data = await api(
+      `/api/projects/${state.project.id}/replicas/${index}/takes/${takeId}`,
+      { method: 'POST' },
+    );
+    setReplica(data.replica);
+  } catch (error) {
+    showAlert($('replica-error'), error.message);
+  }
+}
+
+// --- генерация диалога --------------------------------------------------------
+// Сборка идёт по проекту: реплики, голоса и правки уже лежат в базе, поэтому
+// перед запуском сохраняем карточки спикеров (в них могли печатать только что)
+// и ставим задачу рендера. Отдельной задачи «по тексту» больше нет — текст
+// попадает в проект разбором.
+async function generate() {
+  if (!state.project) return;
+  showAlert($('job-error'), '');
+  if (!(await saveSpeakers($('job-error')))) return;
 
   const payload = {
-    dialogue_text: $('dialogue').value,
-    speakers: state.configs,
     pause_ms: parseInt($('pause').value, 10),
     cross_fade_duration: parseFloat($('crossfade').value),
     auto_accent: $('auto-accent').checked,
-    qa: $('qa').checked,
+    qa: $('qa').value,
     output_format: $('output-format').value,
     chunk_strategy: $('chunk-strategy').value,
   };
@@ -1078,15 +1716,12 @@ async function generate() {
   $('btn-generate').disabled = true;
   $('player').hidden = true;
   $('download-link').hidden = true;
-  // Список реплик относится к прошлому файлу — до готовности нового он неактуален.
-  state.doneJobId = null;
-  stopVariant();
-  $('replicas-block').hidden = true;
-  $('replica-list').innerHTML = '';
+  // Готовый файл относится к прошлому прогону — до готовности нового он неактуален.
+  stopTake();
   setProgress(0);
 
   try {
-    const job = await api('/api/generate', {
+    const job = await api(`/api/projects/${state.project.id}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1136,8 +1771,10 @@ async function pollJob() {
       link.href = `${job.audio_url}?download=true`;
       link.download = `dialogue.${job.output_format}`;
       link.hidden = false;
-      state.doneJobId = job.job_id;
-      renderReplicas(job.replicas);
+      // Куски рендера сохранены вариантами реплик проекта — забираем проект,
+      // чтобы карточки показали новое звучание активным, а прежнее осталось
+      // в их истории.
+      await refreshProject();
     }
     updateGenerateButton();
   } catch (error) {
@@ -1149,36 +1786,24 @@ async function pollJob() {
   }
 }
 
-// --- перегенерация отдельной реплики ------------------------------------------
-function renderReplicas(replicas) {
-  const block = $('replicas-block');
-  const box = $('replica-list');
-  if (!replicas || !replicas.length) {
-    block.hidden = true;
-    box.innerHTML = '';
-    return;
-  }
-  // Разметка строк пересобирается целиком, поэтому прослушивание варианта,
-  // начатое до обновления статуса, надо остановить — иначе кнопка осталась бы
-  // в состоянии «стоп» у строки, которой уже нет.
-  stopVariant();
-  // Текст реплики длинный — в строке он обрезается CSS, полный виден в подсказке.
-  box.innerHTML = replicas.map((replica) => `
-    <div class="replica-row" data-index="${replica.index}">
-      <span class="replica-label">${esc(replica.label)}</span>
-      <span class="replica-text" title="${esc(replica.text)}">${esc(replica.text)}</span>
-      <span class="replica-seed muted">${seedText(replica.seed)}</span>
-      ${qaNote(replica.qa)}
-      <button class="tiny" data-role="regen">заново</button>
-    </div>
-    ${renderVariants(replica)}`).join('');
-  block.hidden = false;
-}
-
-// Отметка строгой проверки. Показывается только у тех кусков, что не прошли её
+// --- отметки и подписи звучаний ------------------------------------------------
+// Отметка проверки качества. Показывается только у тех кусков, что не прошли её
 // полностью: «проверено и прошло» — это норма, и подпись у каждой реплики была бы
 // шумом, а принятое без полной проверки должно быть видно — вместе со степенью
 // расхождения, чтобы решать «оставить или перегенерировать» осознанно.
+// Причины дешёвого отбора уходят в подсказку: по ним видно, за что кусок вообще
+// попал в расшифровку.
+const SCREEN_REASONS = {
+  empty: 'пустое аудио',
+  too_short: 'слишком короткий кусок',
+  duration_short: 'короче текста',
+  duration_long: 'длиннее текста',
+  silence: 'много тишины',
+  clipping: 'перегруз',
+  level: 'аномальный уровень',
+  repeat: 'повтор участка',
+};
+
 function qaNote(qa) {
   if (!qa || qa.status === 'passed') return '';
   const reasons = {
@@ -1188,141 +1813,15 @@ function qaNote(qa) {
   };
   const wer = qa.wer === null || qa.wer === undefined ? '' : `WER ${qa.wer.toFixed(2)} · `;
   const reason = reasons[qa.status] || qa.status;
-  return `<span class="replica-qa muted warn" title="Попыток: ${esc(String(qa.attempts))}">` +
+  const screened = ((qa.screening && qa.screening.reasons) || [])
+    .map((code) => SCREEN_REASONS[code] || code);
+  const title = `Попыток: ${qa.attempts}` + (screened.length ? `. Отбор: ${screened.join(', ')}` : '');
+  return `<span class="replica-qa muted warn" title="${esc(title)}">` +
     `⚠ ${esc(wer + reason)}</span>`;
-}
-
-// Список вариантов появляется после первой перегенерации: пока звучание одно,
-// список из одного пункта был бы шумом. Активный вариант — то, что в файле.
-function renderVariants(replica) {
-  const variants = replica.variants || [];
-  if (variants.length < 2) return '';
-  const rows = variants.map((variant) => `
-    <div class="variant-row" data-index="${replica.index}" data-variant="${esc(variant.id)}">
-      <button class="tiny" data-role="variant-play">слушать</button>
-      <span class="variant-label">${esc(variant.label)}${variant.active ? ' · в файле' : ''}</span>
-      <span class="muted">${variant.duration_sec} с · ${seedText(variant.seed)}</span>
-      ${variant.active ? '' : '<button class="tiny" data-role="variant-pick">поставить</button>'}
-    </div>`).join('');
-  return `<div class="variant-list">${rows}</div>`;
 }
 
 function seedText(seed) {
   return seed === null || seed === undefined ? 'без сида' : `сид ${seed}`;
-}
-
-function setRegenBusy(busy) {
-  document.querySelectorAll('#replica-list button').forEach((button) => {
-    button.disabled = busy;
-  });
-  if (!busy) {
-    document.querySelectorAll('#replica-list [data-role="regen"]').forEach((button) => {
-      button.textContent = 'заново';
-    });
-  }
-}
-
-async function regenerateReplica(index, button) {
-  const jobId = state.doneJobId;
-  if (!jobId || state.regenTimer) return;
-  showAlert($('job-error'), '');
-  setRegenBusy(true);
-  button.textContent = 'генерирую…';
-  try {
-    await api(`/api/jobs/${jobId}/replicas/${index}/regenerate`, { method: 'POST' });
-  } catch (error) {
-    setRegenBusy(false);
-    showAlert($('job-error'), error.message);
-    return;
-  }
-  startRegenPoll(jobId, index);
-}
-
-async function selectVariant(index, variantId, button) {
-  const jobId = state.doneJobId;
-  if (!jobId || state.regenTimer) return;
-  showAlert($('job-error'), '');
-  setRegenBusy(true);
-  button.textContent = 'ставлю…';
-  try {
-    await api(`/api/jobs/${jobId}/replicas/${index}/variants/${variantId}`, { method: 'POST' });
-  } catch (error) {
-    setRegenBusy(false);
-    showAlert($('job-error'), error.message);
-    return;
-  }
-  startRegenPoll(jobId, index);
-}
-
-// Опрос один на перегенерацию и на выбор варианта: для интерфейса это одно
-// состояние — «реплика занята, файл скоро обновится».
-function startRegenPoll(jobId, index) {
-  state.regenIndex = index;
-  state.regenTimer = setInterval(() => pollRegenerate(jobId), 1500);
-}
-
-async function pollRegenerate(jobId) {
-  try {
-    const job = await api(`/api/jobs/${jobId}`);
-    // Бэкенд снимает флаг в самом конце — и при успехе, и при ошибке.
-    if (job.regenerating_replica !== null) return;
-    clearInterval(state.regenTimer);
-    state.regenTimer = null;
-    setRegenBusy(false);
-    if (job.regen_error) {
-      showAlert($('job-error'), `Не удалось пересобрать реплику: ${job.regen_error}`);
-      return;
-    }
-    $('job-status').textContent = `готово · ${job.duration_sec} с аудио`;
-    // Варианты и сид изменились вместе с файлом — список реплик берём из статуса,
-    // а не правим на месте: так он не разойдётся с тем, что лежит на диске.
-    if (job.replicas) renderReplicas(job.replicas);
-    // Тот же URL, но содержимое файла новое — без метки времени браузер отдал бы кэш.
-    $('player').src = `${job.audio_url}?t=${Date.now()}`;
-  } catch (error) {
-    clearInterval(state.regenTimer);
-    state.regenTimer = null;
-    setRegenBusy(false);
-    showAlert($('job-error'), error.message);
-  }
-}
-
-// --- прослушивание вариантов реплики ------------------------------------------
-function variantKey(index, variantId) {
-  return `${index}:${variantId}`;
-}
-
-function toggleVariant(index, variantId) {
-  const player = $('variant-player');
-  const key = variantKey(index, variantId);
-  if (state.variantKey === key && !player.paused) {
-    player.pause();
-    return;
-  }
-  state.variantKey = key;
-  player.src = `/api/jobs/${state.doneJobId}/replicas/${index}/variants/${variantId}/audio`;
-  // play() отказывается промисом, а не исключением: молча оставить это нельзя —
-  // кнопка показывала бы «стоп» у варианта, который не звучит.
-  player.play().catch((error) => {
-    state.variantKey = null;
-    markVariantPlaying(false);
-    showAlert($('job-error'), `Не удалось воспроизвести вариант: ${error.message}`);
-  });
-}
-
-function markVariantPlaying(playing) {
-  document.querySelectorAll('#replica-list [data-role="variant-play"]').forEach((button) => {
-    const row = button.closest('.variant-row');
-    const key = variantKey(row.dataset.index, row.dataset.variant);
-    button.textContent = playing && key === state.variantKey ? 'стоп' : 'слушать';
-  });
-}
-
-function stopVariant() {
-  const player = $('variant-player');
-  player.pause();
-  player.removeAttribute('src');
-  state.variantKey = null;
 }
 
 // --- сплошной текст (один голос на весь файл) ---------------------------------
@@ -1414,7 +1913,7 @@ async function renderText() {
     pause_ms: parseInt($('text-pause').value, 10),
     cross_fade_duration: parseFloat($('text-crossfade').value),
     auto_accent: $('text-auto-accent').checked,
-    qa: $('text-qa').checked,
+    qa: $('text-qa').value,
     output_format: $('text-output-format').value,
     chunk_strategy: $('text-chunk-strategy').value,
   };
@@ -1484,8 +1983,8 @@ async function pollTextJob() {
   }
 }
 
-// У сплошного текста нет списка реплик, поэтому неполное прохождение строгой
-// проверки показываем одной строкой: сколько кусков принято без неё и насколько
+// У сплошного текста нет списка реплик, поэтому неполное прохождение проверки
+// показываем одной строкой: сколько кусков принято без неё и насколько
 // близко подошёл лучший из них.
 function showTextQaNote(replicas) {
   const note = $('text-job-note');
@@ -1500,7 +1999,7 @@ function showTextQaNote(replicas) {
     .map((replica) => replica.qa.wer)
     .filter((wer) => wer !== null && wer !== undefined);
   const best = wers.length ? `, лучший WER ${Math.min(...wers).toFixed(2)}` : '';
-  note.textContent = `Строгая проверка: ${failed.length} из ${all.length} кусков приняты ` +
+  note.textContent = `Проверка качества: ${failed.length} из ${all.length} кусков приняты ` +
     `без полного прохождения${best}`;
   note.classList.add('warn');
   note.hidden = false;
@@ -1607,55 +2106,114 @@ async function refreshStatus() {
 }
 
 // --- события ------------------------------------------------------------------
+// События обеих частей редактора реплик: карточек и исходного текста.
+function bindReplicaCards() {
+  const box = $('replica-cards');
+  const indexOf = (element) => parseInt(element.closest('.replica-card').dataset.index, 10);
+
+  // На движении ползунка меняется только подпись: запись в базу — на отпускании,
+  // иначе каждое движение слало бы запрос на правку реплики.
+  box.addEventListener('input', (event) => {
+    const card = event.target.closest('.replica-card');
+    if (!card) return;
+    if (event.target.dataset.engineParam) {
+      updateEngineParamLabel(card, event.target);
+      return;
+    }
+    const field = event.target.dataset.field;
+    if (field) {
+      const label = card.querySelector(`[data-role="${field}-label"]`);
+      if (label) label.textContent = fmtParam(field, parseFloat(event.target.value));
+    }
+  });
+
+  box.addEventListener('change', (event) => {
+    const card = event.target.closest('.replica-card');
+    if (!card) return;
+    const index = indexOf(event.target);
+    // Голос реплики — это её собственный голос поверх голоса спикера.
+    if (event.target.dataset.role === 'voice') {
+      patchReplica(index, { voice_id: event.target.value });
+      return;
+    }
+    if (event.target.dataset.engineParam) {
+      patchReplica(index, { overrides: { engine_params: readEngineParams(card) } });
+      return;
+    }
+    const field = event.target.dataset.field;
+    if (!field) return;
+    const value = event.target.tagName === 'SELECT'
+      ? parseInt(event.target.value, 10)
+      : parseFloat(event.target.value);
+    patchReplica(index, { overrides: { [field]: value } });
+  });
+
+  box.addEventListener('click', (event) => {
+    const card = event.target.closest('.replica-card');
+    if (!card) return;
+    const index = parseInt(card.dataset.index, 10);
+    const reset = event.target.closest('[data-role="reset"]');
+    if (reset) {
+      // `null` возвращает параметр к наследуемому: у ручек движка — к значению
+      // голоса, у остальных — к значению спикера.
+      const field = reset.dataset.field;
+      patchReplica(index, {
+        overrides: field === 'engine_params'
+          ? { engine_params: { [reset.dataset.param]: null } }
+          : { [field]: null },
+      });
+      return;
+    }
+    if (event.target.closest('[data-role="play"]')) { playActiveTake(index); return; }
+    if (event.target.closest('[data-role="regen"]')) { regenerateReplica(index); return; }
+    const row = event.target.closest('.variant-row');
+    if (!row) return;
+    const takeId = parseInt(row.dataset.take, 10);
+    if (event.target.closest('[data-role="take-play"]')) { toggleTake(index, takeId); return; }
+    if (event.target.closest('[data-role="take-pick"]')) selectTake(index, takeId);
+  });
+
+  // Список карточек пересобирается после каждой правки, поэтому раскрытые
+  // «ещё настройки» запоминаем: иначе блок закрывался бы на каждом ползунке.
+  box.addEventListener('toggle', (event) => {
+    const details = event.target.closest('.replica-card details.advanced');
+    if (!details) return;
+    state.openDetails[details.closest('.replica-card').dataset.index] = details.open;
+  }, true);
+
+  const takePlayer = $('take-player');
+  takePlayer.addEventListener('play', markTakePlaying);
+  takePlayer.addEventListener('pause', markTakePlaying);
+  takePlayer.addEventListener('ended', markTakePlaying);
+  // Собранный диалог и отдельный вариант реплики одновременно звучать не должны.
+  $('player').addEventListener('play', stopTake);
+}
+
 function bindEvents() {
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => switchTab(tab.dataset.tab));
   });
 
-  $('btn-detect').addEventListener('click', detectVoices);
-  $('btn-generate').addEventListener('click', generate);
-  $('replica-list').addEventListener('click', (event) => {
-    const row = event.target.closest('.replica-row');
-    const regen = event.target.closest('button[data-role="regen"]');
-    if (regen && row) {
-      regenerateReplica(parseInt(row.dataset.index, 10), regen);
-      return;
-    }
-    const variant = event.target.closest('.variant-row');
-    if (!variant) return;
-    const index = parseInt(variant.dataset.index, 10);
-    const play = event.target.closest('button[data-role="variant-play"]');
-    if (play) {
-      toggleVariant(index, variant.dataset.variant);
-      return;
-    }
-    const pick = event.target.closest('button[data-role="variant-pick"]');
-    if (pick) selectVariant(index, variant.dataset.variant, pick);
+  // Два представления одного диалога: карточки реплик и исходный текст с маркерами.
+  document.querySelectorAll('.view-switch button').forEach((button) => {
+    button.addEventListener('click', () => switchDialogueView(button.dataset.view));
   });
-  const variantPlayer = $('variant-player');
-  variantPlayer.addEventListener('play', () => markVariantPlaying(true));
-  variantPlayer.addEventListener('pause', () => markVariantPlaying(false));
-  variantPlayer.addEventListener('ended', () => markVariantPlaying(false));
-  // Основной трек и отдельный вариант одновременно звучать не должны.
-  $('player').addEventListener('play', stopVariant);
+  // Разбор — только по команде: правка текста меняет состав реплик, и молча
+  // переписывать их (вместе с правками карточек и историей вариантов) нельзя.
+  $('dialogue').addEventListener('input', markSourceDirty);
+  $('btn-apply-source').addEventListener('click', applySource);
+  bindReplicaCards();
+  $('btn-generate').addEventListener('click', generate);
   $('btn-reload-voices').addEventListener('click', () => loadVoices().catch((e) => alert(e.message)));
   $('btn-save-voice').addEventListener('click', createVoice);
   $('btn-recognize-voice').addEventListener('click', recognizeRefText);
 
   $('pause').addEventListener('input', (e) => { $('pause-value').textContent = `${e.target.value} мс`; });
-  // Смена стратегии меняет число реплик — сводка должна обновиться сама.
-  $('chunk-strategy').addEventListener('change', () => { syncVoices({ silent: true }); });
+  // Смена стратегии меняет состав реплик: без повторного разбора карточки
+  // показывали бы старые куски, поэтому текст помечается как «нужен разбор».
+  $('chunk-strategy').addEventListener('change', markSourceDirty);
   $('crossfade').addEventListener('input', (e) => {
     $('crossfade-value').textContent = `${parseFloat(e.target.value).toFixed(2)} с`;
-  });
-
-  // Правка текста меняет состав голосов (новые маркеры, новые имена) — панель
-  // должна успевать за ней сама, без нажатия «Определить голоса». Пауза нужна,
-  // чтобы не дёргать разбор на каждом символе.
-  let dialogueSyncTimer = null;
-  $('dialogue').addEventListener('input', () => {
-    clearTimeout(dialogueSyncTimer);
-    dialogueSyncTimer = setTimeout(() => { syncVoices({ silent: true }); }, 600);
   });
 
   // --- вкладка «Сплошной текст» ---
@@ -1799,6 +2357,7 @@ function bindEvents() {
     const button = event.target.closest('button');
     if (!card || !button) return;
     if (button.dataset.role === 'preview') previewVoice(card);
+    if (button.dataset.role === 'save-preset') saveVoicePreset(card.dataset.voiceId);
     if (button.dataset.role === 'delete') {
       const voiceId = card.dataset.voiceId;
       if (!confirm('Удалить голос? Файл референса будет стёрт.')) return;
@@ -1813,6 +2372,9 @@ function bindEvents() {
   });
 
   // --- карточки голосов диалога ---
+  // Спикер — это голос и набор параметров, от которого наследуют его реплики.
+  // Значения сохраняются на отпускании ручки: карточки реплик берут из них
+  // наследуемые значения, и незаписанная правка разошлась бы с базой.
   const voiceConfigs = $('voice-configs');
   voiceConfigs.addEventListener('input', (event) => {
     const card = event.target.closest('.card');
@@ -1828,11 +2390,10 @@ function bindEvents() {
       card.querySelector('[data-role="pause-label"]').textContent = fmtPause(parseInt(event.target.value, 10));
     }
     if (event.target.dataset.engineParam) updateEngineParamLabel(card, event.target);
-    readCardConfigs();
     updateGenerateButton();
   });
 
-  voiceConfigs.addEventListener('change', (event) => {
+  voiceConfigs.addEventListener('change', async (event) => {
     const role = event.target.dataset.role;
     if (role === 'pause-inherit') {
       const card = event.target.closest('.card');
@@ -1841,19 +2402,50 @@ function bindEvents() {
       card.querySelector('[data-role="pause-label"]').textContent = event.target.checked
         ? fmtPause(null)
         : fmtPause(parseInt(range.value, 10));
-      readCardConfigs();
+      await saveAndRenderSpeakers();
       return;
     }
     if (role === 'voice') {
-      readCardConfigs();
       // Набор ручек диктует движок голоса: значения прошлого движка к новому не
-      // относятся, поэтому блок пересобирается с сохранёнными ручками нового голоса.
-      state.configs[event.target.closest('.card').dataset.voice].engine_params = {};
+      // относятся, поэтому у слота они сбрасываются, а синтез берёт сохранённые
+      // у нового голоса (см. audio_pipeline.voice_layer). Панель после этого
+      // пересобирается: набор полей тоже зависит от движка.
+      const card = event.target.closest('.card');
+      const speaker = readSpeakerCard(card);
+      delete speaker.overrides.engine_params;
+      await saveSpeakers({ [card.dataset.voice]: speaker });
       renderVoiceConfigs();
-      renderParseSummary();
-      updateGenerateButton();
+      return;
     }
+    await saveAndRenderSpeakers();
   });
+
+  voiceConfigs.addEventListener('click', async (event) => {
+    const card = event.target.closest('.card');
+    const reset = event.target.closest('[data-role="reset"]');
+    if (!card || !reset) return;
+    const speaker = speakerByKey(card.dataset.voice) || {};
+    // Сброс правки слота: контрол возвращается к наследуемому значению, и
+    // сохранение само видит, что поле снова совпадает с нижним слоем.
+    if (reset.dataset.param === undefined) {
+      setSpeakerControl(card, reset.dataset.field, inheritedValue(speaker, reset.dataset.field));
+    } else {
+      const input = card.querySelector(`[data-engine-param="${reset.dataset.param}"]`);
+      if (input) {
+        input.value = inheritedValue(speaker, reset.dataset.param);
+        updateEngineParamLabel(card, input);
+      }
+    }
+    await saveAndRenderSpeakers();
+  });
+
+  // Панель пересобирается после каждой правки, поэтому раскрытые «ещё настройки»
+  // запоминаем: иначе блок закрывался бы на каждой ручке.
+  voiceConfigs.addEventListener('toggle', (event) => {
+    const details = event.target.closest('.card details.advanced');
+    if (!details) return;
+    state.speakerDetails[details.closest('.card').dataset.voice] = details.open;
+  }, true);
 }
 
 // --- старт --------------------------------------------------------------------
@@ -1867,9 +2459,15 @@ async function init() {
     // Паспорта движков — до голосов: и карточки, и форма рисуют по ним набор настроек.
     await loadEngines();
     await loadVoices();
+    // Прошлый проект открывается сам: реплики, голоса и варианты живут в базе,
+    // а не в разовой задаче, поэтому перезагрузка страницы их не теряет.
+    await loadSavedProject();
+    renderParseSummary();
+    setSourceState();
   } catch (error) {
     showAlert($('voice-error'), error.message);
   }
+  updateGenerateButton();
 }
 
 init();

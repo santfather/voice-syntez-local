@@ -86,6 +86,10 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "VOICES_DIR", voices_dir)
     monkeypatch.setattr(config, "OUTPUT_DIR", output_dir)
     monkeypatch.setattr(config, "VOICES_JSON", voices_dir / "voices.json")
+    # База проектов тоже в tmp_path: иначе тесты писали бы в рабочую базу, а
+    # прогон зависел бы от того, какие проекты уже созданы на машине.
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "projects.db")
+    monkeypatch.setattr(config, "PROJECTS_OUTPUT_DIR", output_dir / "projects")
     return tmp_path
 
 
