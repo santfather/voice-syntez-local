@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio_pipeline, benchmark, config, resource_guard
+from . import audio_pipeline, benchmark, config, eta, resource_guard
 from .audio_pipeline import (
     NoteCallback,
     ProgressCallback,
@@ -21,6 +21,8 @@ from .audio_pipeline import (
 )
 from .db.store import get_projects_store
 from .dialogue_parser import Replica
+from .engines.base import STATE_LOADING, STATE_READY
+from .engines.registry import created_engine
 from .voices_store import Voice
 
 logger = logging.getLogger(__name__)
@@ -142,6 +144,11 @@ class Job:
             "cancel_requested": self.cancel_requested,
             "duration_sec": round(self.duration_sec, 2) if self.duration_sec else None,
             "eta_sec": round(self.eta_sec, 1) if self.eta_sec else None,
+            # Готовая строка для интерфейса: «2 мин 40 сек». `eta_sec` остаётся
+            # на месте — по нему считают старые клиенты и тесты, — а формат
+            # русского числительного живёт на бэкенде (см. backend/eta.py),
+            # чтобы UI не повторял правила склонения у себя.
+            "eta_text": eta.format_eta(self.eta_sec) if self.eta_sec else None,
             "output_format": self.output_format,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -753,16 +760,24 @@ class JobQueue:
         self._current_job_id = job.id
         self._mark_project(payload.project_id, config.PROJECT_STATUS_RENDERING, job.id)
         started = time.monotonic()
+        # План рендера и статистика времени: до старта видно оценку по кускам
+        # (у каждого свой движок и своя длина текста), после каждого куска
+        # оценка пересчитывается по остатку (см. backend/eta.py).
+        plan = self._render_plan(payload)
+        tracker = eta.get_tracker()
+        job.eta_sec = await asyncio.to_thread(tracker.estimate, plan)
         try:
             result = await audio_pipeline.render_dialogue(
                 job_id=job.id,
                 replicas=payload.replicas,
                 speakers=payload.speakers,
                 settings=payload.settings,
-                on_progress=self._progress_callback(job),
+                on_progress=self._progress_callback(job, plan, tracker),
                 should_abort=lambda: self._cancelled(job.id),
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
+                on_engine_loaded=self._engine_loaded_callback(tracker),
+                on_chunk_timing=self._timing_callback(job, plan, tracker),
             )
             job.output_path = result.output_path
             job.duration_sec = result.duration_sec
@@ -1232,23 +1247,110 @@ class JobQueue:
             segments[position] = (begin + delta, end + delta)
 
     @staticmethod
-    def _progress_callback(job: Job) -> ProgressCallback:
-        durations: list[float] = []
-        last = time.monotonic()
+    def _progress_callback(
+        job: Job,
+        plan: list[eta.EtaStep] | None = None,
+        tracker: eta.EtaTracker | None = None,
+    ) -> ProgressCallback:
+        """Ход рендера: текущая реплика и оценка остатка по плану.
+
+        Оценка здесь только уточняет уже показанную: настоящий пересчёт делает
+        `_timing_callback` по факту законченного куска. Прежнее «среднее по
+        длительности аудио × число реплик» убрано: одно число на все реплики
+        не различало ни движки, ни длину текста, ни холодный старт, ни проверку.
+        """
 
         def on_progress(index: int, total: int, label: str) -> None:
-            nonlocal last
-            now = time.monotonic()
-            if index > 1:
-                durations.append(now - last)
-            last = now
-            if durations:  # ETA по средней длительности уже готовых реплик
-                job.eta_sec = (sum(durations) / len(durations)) * (total - index + 1)
             job.current_replica = index - 1
             job.current_voice = label
             job.message = f"Реплика {index} из {total} — {label}"
+            if plan and tracker is not None:
+                # Index у пайплайна с единицы: закончены куски до index - 1.
+                job.eta_sec = tracker.estimate(plan[index - 1 :])
 
         return on_progress
+
+    @staticmethod
+    def _engine_loaded(engine_id: str) -> bool:
+        """Движок уже поднят (или поднимается) — холодный старт ему не нужен.
+
+        Проверка ничего не создаёт: `created_engine` смотрит только на живые
+        экземпляры реестра, поэтому ETA не поднимает модель ради оценки.
+        `loading` считается тёплым: загрузка уже началась (например, прогрев
+        при старте сервера), и второй раз её оплачивать не нужно.
+        """
+        engine = created_engine(engine_id)
+        return engine is not None and engine.state in (STATE_READY, STATE_LOADING)
+
+    def _render_plan(self, payload: JobPayload) -> list[eta.EtaStep]:
+        """План рендера: по куску на реплику — движок, длина текста, проверка.
+
+        Строится до старта и по тем же данным, что уйдут в синтез: движок
+        берётся у эффективного голоса реплики (правка карточки важнее слота),
+        а «холодный» кусок — только первый для ещё не поднятого движка. Именно
+        поэтому ETA не может быть одним средним на число реплик: у кусков
+        разные движки, длины и цена проверки.
+        """
+        qa_mode = eta.qa_mode(payload.settings.qa)
+        seen_engines: set[str] = set()
+        steps: list[eta.EtaStep] = []
+        for replica in payload.replicas:
+            speaker = payload.speakers.get(replica.voice)
+            voice_id = str(replica.voice_id or (speaker.voice_id if speaker else ""))
+            engine = audio_pipeline.voice_engine(voice_id)
+            # Холодный — ровно первый кусок каждого движка, который ещё не поднят;
+            # у остальных его кусков загрузка уже оплачена первым.
+            cold = engine not in seen_engines and not self._engine_loaded(engine)
+            seen_engines.add(engine)
+            steps.append(
+                eta.EtaStep(
+                    engine=engine,
+                    chars=audio_pipeline.replica_chars(replica.text),
+                    qa_mode=qa_mode,
+                    cold=cold,
+                )
+            )
+        return steps
+
+    @staticmethod
+    def _engine_loaded_callback(tracker: eta.EtaTracker):
+        """Загрузка движка — это и есть его холодный старт; запоминаем цену."""
+
+        def on_loaded(engine_id: str, seconds: float) -> None:
+            tracker.note_load(engine_id, seconds)
+            logger.info("Движок %s поднят за %.1f c (учтено в ETA)", engine_id, seconds)
+
+        return on_loaded
+
+    @staticmethod
+    def _timing_callback(job: Job, plan: list[eta.EtaStep], tracker: eta.EtaTracker):
+        """Факт куска — в статистику, оценка остатка — в статус задачи.
+
+        Кусков «до индекса» уже нет: план знает о них только по оценке, а их
+        настоящее время пришло этим колбэком. Поэтому остаток считается от
+        `index + 1`, а не от начала: выполненная работа обязана уменьшать
+        остаток, а не подтверждать прежнюю оценку.
+        """
+
+        def on_chunk_timing(
+            index: int, seconds: float, audio_sec: float, qa_outcome: QaOutcome | None
+        ) -> None:
+            if not 0 <= index < len(plan):
+                return
+            step = plan[index]
+            tracker.observe(
+                engine=step.engine,
+                chars=step.chars,
+                render_sec=seconds,
+                qa_mode=step.qa_mode,
+                attempts=qa_outcome.attempts if qa_outcome is not None else 1,
+                cold=step.cold,
+                audio_sec=audio_sec,
+            )
+            remaining = tracker.estimate(plan[index + 1 :])
+            job.eta_sec = remaining
+
+        return on_chunk_timing
 
     @staticmethod
     def _note_callback(job: Job) -> NoteCallback:

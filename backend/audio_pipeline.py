@@ -41,6 +41,13 @@ ProgressCallback = Callable[[int, int, str], None]
 WaitForMemory = Callable[[], Awaitable[None]]
 # Сообщение о ходе работы (попадает в статус задачи в интерфейсе).
 NoteCallback = Callable[[str], None]
+# Фактические времена куска: индекс (с нуля), сколько секунд занял синтез,
+# сколько вышло аудио и чем закончилась проверка. Очередь кормит этим
+# статистику ETA (см. backend/eta.py) — пайплайн сам её не ведёт и про оценку
+# времени ничего не знает.
+ChunkTimingCallback = Callable[[int, float, float, "QaOutcome | None"], None]
+# Движок поднят: id и сколько секунд заняла загрузка (холодный старт).
+EngineLoadedCallback = Callable[[str, float], None]
 
 # Чем закончился QA-цикл куска. Отдельные значения, а не флаг «получилось»: в
 # интерфейсе важно различать «проверено и прошло» и «проверить не успели» —
@@ -542,7 +549,23 @@ def _text_for_engine(text: str, engine: SynthesisEngine, auto_accent: bool) -> s
     ).final
 
 
-async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:
+def replica_chars(text: str) -> int:
+    """Размер куска в знаках для статистики времени.
+
+    Одна мера и у плана, и у наблюдения (см. `backend/eta.py`): если бы оценка
+    считала знаки по одному тексту, а факт — по другому, статистика уточнялась
+    бы в сторону, которой нет. Знаки считаются по тексту реплики, то есть без
+    стадий preprocessing: нормализация («12:30» → «двенадцать часов тридцать
+    минут») удлиняет текст, но идёт до движка и у всех языков и режимов
+    одинакова по порядку величины, а тащить её в оценку значило бы поднимать
+    нормализатор ради числа в ETA.
+    """
+    return len(text or "")
+
+
+async def _load_engines(
+    voices: Iterable[Voice], on_loaded: EngineLoadedCallback | None = None
+) -> dict[str, SynthesisEngine]:
     """Грузит движки всех голосов диалога до первой реплики.
 
     Модель XTTS поднимается 20–40 секунд. Если грузить её лениво, эта пауза
@@ -552,6 +575,8 @@ async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:
     Ключ — идентификатор из карточки голоса, а не `engine.id`: именно по нему
     движок ищется на каждой реплике, и подменённый движок (тесты, будущая
     обёртка над моделью) иначе оказался бы в словаре под другим именем.
+    `on_loaded` — необязательный колбэк с id и длительностью загрузки: по нему
+    очередь узнаёт цену холодного старта (`backend/eta.py`).
     """
     engines: dict[str, SynthesisEngine] = {}
     for voice in voices:
@@ -559,7 +584,14 @@ async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:
             continue
         engine = _engine_for(voice)
         engines[voice.engine] = engine
-        await asyncio.to_thread(engine.load)
+        if on_loaded is not None:
+            # Длительность загрузки — это и есть холодный старт движка; она
+            # уходит в статистику ETA, чтобы следующий рендер знал её заранее.
+            started = time.monotonic()
+            await asyncio.to_thread(engine.load)
+            on_loaded(voice.engine, time.monotonic() - started)
+        else:
+            await asyncio.to_thread(engine.load)
         logger.info("Движок %s готов (%s)", engine.id, voice.name)
     return engines
 
@@ -887,6 +919,8 @@ async def render_dialogue(
     should_abort: Callable[[], bool] | None = None,
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
+    on_engine_loaded: EngineLoadedCallback | None = None,
+    on_chunk_timing: ChunkTimingCallback | None = None,
 ) -> RenderResult:
     """Синтезирует реплики строго по одной и склеивает их в один файл.
 
@@ -897,6 +931,9 @@ async def render_dialogue(
     Движок выбирается у каждого голоса отдельно, поэтому в одном файле спокойно
     соседствуют куски F5-TTS и XTTS: реплики идут строго последовательно, и
     склейка для неё одинакова — все движки отдают 24 кГц.
+
+    `on_engine_loaded` и `on_chunk_timing` — фактические времена для статистики
+    ETA; без них поведение прежнее (оба колбэка необязательны).
     """
     replicas = list(replicas)
     if not replicas:
@@ -921,7 +958,7 @@ async def render_dialogue(
             voice = _resolve_voice(replica.label, replace(base, voice_id=voice_id))
             resolved[voice_id] = voice
         per_replica[index] = tuning_for(voice, base, replica.overrides)
-    engines = await _load_engines(list(resolved.values()))
+    engines = await _load_engines(list(resolved.values()), on_loaded=on_engine_loaded)
 
     pieces: list[np.ndarray] = []
     segments: list[tuple[int, int]] = []
@@ -942,6 +979,7 @@ async def render_dialogue(
         voice = resolved[settings_for_replica.voice_id]
         engine = engines[voice.engine]
 
+        started = time.monotonic()
         chunk, seed, qa_outcome = await _synthesize_checked(
             engine,
             voice,
@@ -955,7 +993,6 @@ async def render_dialogue(
         )
         seeds.append(seed)
         checks.append(qa_outcome)
-
         pause = _pause_samples(settings_for_replica, settings)
         if pieces and pause:
             pieces.append(np.zeros(pause, dtype=np.float32))
@@ -964,6 +1001,16 @@ async def render_dialogue(
         segments.append((cursor, cursor + prepared.size))
         cursor += prepared.size
         pieces.append(prepared)
+        # Время уходит наружу после подготовки куска: это ровно тот интервал,
+        # который прожил пользователь, включая подготовку, и он же ляжет в
+        # статистику — иначе оценка систематически недосчитывала бы кусок.
+        if on_chunk_timing:
+            on_chunk_timing(
+                index - 1,
+                time.monotonic() - started,
+                prepared.size / SAMPLE_RATE,
+                qa_outcome,
+            )
 
     final = await asyncio.to_thread(np.concatenate, pieces)
     final = await asyncio.to_thread(_finalize_track, final)

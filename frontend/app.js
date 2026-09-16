@@ -2767,6 +2767,15 @@ async function generate() {
   }
 }
 
+// Хвост «≈ 2 мин 40 сек» к строке статуса. Строку собирает бэкенд (поле
+// `eta_text` в ответе GET /api/jobs/{id}): русские формы числительных — не дело
+// UI. Если ответ пришёл без неё (старый бэкенд), число секунд показывается как было.
+function etaLabel(job) {
+  if (job.eta_text) return `, ≈ ${job.eta_text}`;
+  if (job.eta_sec) return `, осталось ~${Math.round(job.eta_sec)} с`;
+  return '';
+}
+
 function setProgress(ratio) {
   $('progress-bar').style.width = `${Math.round(ratio * 100)}%`;
 }
@@ -2780,7 +2789,10 @@ async function pollJob() {
       return;
     }
     if (job.status === 'processing') {
-      const eta = job.eta_sec ? `, осталось ~${Math.round(job.eta_sec)} с` : '';
+      // ETA приходит с бэкенда уже строкой («2 мин 40 сек»): русские формы
+      // числительных считает backend/eta.py, а не UI. `eta_sec` оставлен
+      // запасным вариантом для старых ответов без `eta_text`.
+      const eta = etaLabel(job);
       $('job-status').textContent = job.cancel_requested
         ? 'останавливаю на безопасной точке…'
         : `${job.message}${eta}`;
@@ -3013,7 +3025,7 @@ async function pollTextJob() {
       return;
     }
     if (job.status === 'processing') {
-      const eta = job.eta_sec ? `, осталось ~${Math.round(job.eta_sec)} с` : '';
+      const eta = etaLabel(job);
       $('text-job-status').textContent = job.cancel_requested
         ? 'останавливаю на безопасной точке…'
         : `кусок ${job.current_replica + 1} из ${job.total_replicas}${eta}`;
