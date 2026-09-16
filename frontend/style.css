@@ -586,6 +586,17 @@ audio { width: 100%; margin-top: 12px; }
 /* Пока реплика синтезируется, карточка не должна выглядеть готовой к правкам. */
 .replica-card.busy { opacity: 0.6; }
 
+/* --- «что услышит модель» ----------------------------------------------------- */
+/* Стадии идут одна под другой: это последовательность, а не набор равнозначных
+   блоков, и разделять их отступами важнее, чем экономить высоту. */
+.preview-mount .field:first-child { margin-top: 0; }
+.preview-mount [data-role="result"] blockquote.ref-phrase { font-size: 13px; }
+/* Preview реплики внутри карточки: отделён от вариантов, чтобы не читаться как
+   ещё один вариант звучания. */
+.replica-preview { margin-top: 12px; padding-top: 10px; border-top: 1px solid #25242c; }
+.replica-preview .ref-phrase { margin-bottom: 8px; font-size: 12px; }
+.replica-preview .alert { margin-top: 6px; }
+
 /* Подпись ползунка с кнопкой сброса: значение и «вернуть наследуемое» рядом. */
 .param-head { display: flex; align-items: baseline; gap: 7px; }
 .param-reset { padding: 2px 5px; font-size: 9px; letter-spacing: 0; }

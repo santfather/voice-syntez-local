@@ -27,7 +27,7 @@ from .settings_resolution import (
     resolve_synthesis_settings,
     split_values,
 )
-from .text_preprocess import normalize
+from .text_preprocess import normalize, normalize_report
 from .transcribe import transcribe_audio, word_error_rate
 from .voices_store import Voice, get_store
 
@@ -432,27 +432,91 @@ def _engine_for(voice: Voice) -> SynthesisEngine:
         raise ValueError(f"У голоса «{voice.name}» неизвестный движок «{voice.engine}»") from exc
 
 
-def _text_for_engine(text: str, engine: SynthesisEngine, auto_accent: bool) -> str:
-    """Готовит текст куска к отправке в модель.
+@dataclass(frozen=True)
+class TextStages:
+    """Путь текста до модели по стадиям — то, что показывает preview.
+
+    Стадии, а не один итог, потому что preprocessing непрозрачен: пользователь
+    видит «В 2026 году цена выросла на 5%.» и не понимает, откуда взялось
+    «две тысячи двадцать шестом». Показывая каждую ступень рядом с итогом, preview
+    отвечает и на «что уйдёт в модель», и на «почему именно это». Если стадия
+    ничего не изменила, её результат равен предыдущей — по этому равенству видно,
+    что шаг сработал вхолостую (например, словарь без совпадений).
+
+    `matches` — отчёт словаря из того же прохода, что дал `dictionary`: preview не
+    может показать правило, которого не было, или пропустить сработавшее.
+    `accents_applied` — пытались ли вообще ставить ударения (RUAccent поднимается
+    только когда его просят и когда движок понимает «+»).
+    """
+
+    original: str
+    normalized: str
+    dictionary: str
+    accentized: str
+    final: str
+    matches: list[dict]
+    supports_accents: bool
+    accents_applied: bool
+
+
+def preview_text(
+    text: str,
+    *,
+    supports_accents: bool,
+    auto_accent: bool,
+    rules: list | None = None,
+) -> TextStages:
+    """Прогоняет текст по всем стадиям preprocessing и возвращает каждую.
+
+    Единственный источник истины: и синтез (`_text_for_engine`), и preview-эндпоинт
+    зовут эту функцию, поэтому «что услышит модель» не может разойтись с тем, что
+    реально уходит в движок, — совпадение обеспечено конструкцией, а не дисциплиной
+    двух реализаций.
 
     Порядок важен и повторяет план фазы 6: нормализация → пользовательский словарь
     → RUAccent. Правила словаря берутся из сервиса (снимок в памяти, не чтение базы
     на каждый кусок), а флаг `supports_accents` решает, дойдут ли «+» из замены до
-    движка: XTTS прочитал бы знак как отдельный символ, поэтому для неё словарь
+    движка: XTTS прочитала бы знак как отдельный символ, поэтому для неё словарь
     отдаёт замену без разметки.
 
-    RUAccent по-прежнему получает уже развёрнутые числа: «12» должно стать
-    «двена́дцать», а не остаться цифрами. Ударения — только у движков, которые их
-    понимают (`supports_accents`).
+    RUAccent получает уже развёрнутые числа: «12» должно стать «двена́дцать», а не
+    остаться цифрами. Ударения — только у движков, которые их понимают
+    (`supports_accents`); выключенный `auto_accent` оставляет стадию `accentized`
+    равной словарю, чтобы «выключено» было видно, а не выглядело как «ничего не
+    нашлось».
     """
-    prepared = normalize(
-        text,
-        pronunciation=active_rules(),
-        supports_accents=engine.supports_accents,
+    if rules is None:
+        rules = active_rules()
+    normalized = normalize(text)
+    dictionary, matches = normalize_report(
+        text, rules, supports_accents=supports_accents
     )
-    if auto_accent and engine.supports_accents:
-        return accentuate(prepared)
-    return prepared
+    accents_applied = bool(auto_accent and supports_accents)
+    accentized = accentuate(dictionary) if accents_applied else dictionary
+    return TextStages(
+        original=text,
+        normalized=normalized,
+        dictionary=dictionary,
+        accentized=accentized,
+        final=accentized,
+        matches=matches,
+        supports_accents=supports_accents,
+        accents_applied=accents_applied,
+    )
+
+
+def _text_for_engine(text: str, engine: SynthesisEngine, auto_accent: bool) -> str:
+    """Готовит текст куска к отправке в модель.
+
+    Тонкая обёртка над `preview_text`: пайплайн берёт из стадий только итог, но
+    проходит ровно тот же путь, что и preview. Держать здесь второй порядок шагов
+    значило бы однажды показать пользователю одно, а отправить в модель другое.
+    """
+    return preview_text(
+        text,
+        supports_accents=engine.supports_accents,
+        auto_accent=auto_accent,
+    ).final
 
 
 async def _load_engines(voices: Iterable[Voice]) -> dict[str, SynthesisEngine]:

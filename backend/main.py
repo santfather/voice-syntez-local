@@ -22,7 +22,7 @@ from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettin
 from .db.connection import init_db
 from .db.store import UNSET, get_projects_store
 from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
-from .engines.base import ENGINE_F5, ENGINE_INFOS
+from .engines.base import ENGINE_F5, ENGINE_INFOS, EngineInfo
 from .engines.registry import created_engines, get_engine
 from .job_queue import Job, JobPayload, JobStatus, get_queue
 from .pronunciation import PronunciationConflict, get_store as get_pronunciation_store
@@ -625,6 +625,25 @@ class PronunciationPreviewRequest(BaseModel):
     engine: str | None = None
 
 
+class TextPreviewRequest(BaseModel):
+    """Что услышит модель: текст и движок, по которым показать все стадии.
+
+    Источник текста ровно один из двух, и это осознанно разные сценарии: панель
+    «Что услышит модель» присылает произвольный `text`, а карточка реплики —
+    `project_id` + `replica_index`, чтобы preview показывал текст и голос именно
+    этой реплики, а не набранный заново. Движок разрешается по цепочке
+    реплика → её голос → `voice_id` → `engine`; чем-то одним он должен
+    определиться, иначе непонятно, ставить ли ударения.
+    """
+
+    text: str | None = None
+    project_id: str | None = None
+    replica_index: int | None = None
+    voice_id: str | None = None
+    engine: str | None = None
+    auto_accent: bool = True
+
+
 @app.get("/api/pronunciation")
 async def list_pronunciation() -> dict:
     """Правила словаря целиком, включая выключенные: интерфейс показывает и их."""
@@ -701,6 +720,125 @@ async def preview_pronunciation(payload: PronunciationPreviewRequest) -> dict:
     normalized = normalize(text)
     result, matches = normalize_report(text, entries, supports_accents=supports_accents)
     return {"original": text, "normalized": normalized, "result": result, "matches": matches}
+
+
+def _preview_source(payload: TextPreviewRequest) -> tuple[str, str, EngineInfo]:
+    """Разрешает текст и движок preview по цепочке из запроса.
+
+    Возвращает текст, идентификатор движка и его паспорт. Цепочка ровно та же,
+    что у синтеза реплики: реплика проекта → её голос (уже с учётом override) →
+    `voice_id` из запроса → `engine`. Порядок здесь не формальность: если у
+    реплики назначен F5, а в поле `engine` случайно остался XTTS, preview обязан
+    показать F5 — иначе пользователь увидит текст без ударений, а услышит с ними.
+
+    Ошибки — 400/404 с понятным русским текстом: preview дешёвый, и лучше
+    отказать, чем молча показать «как для F5» чужой сценарий.
+
+    Если пришли и `text`, и реплика, текст берётся из запроса, а голос — из
+    реплики: панель может проверить произвольную фразу голосом конкретной строки,
+    а карточка реплики просто не присылает `text` и получает и то, и другое.
+    """
+    if payload.replica_index is not None and not payload.project_id:
+        raise HTTPException(status_code=400, detail="Для реплики проекта нужен project_id")
+    if payload.project_id and payload.replica_index is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите replica_index — preview показывает текст одной реплики",
+        )
+
+    replica_text = ""
+    replica_voice_id = ""
+    if payload.project_id:
+        project = _project_or_404(payload.project_id)
+        replica = _replica_or_404(project, payload.replica_index)
+        replica_text = str(replica.get("text") or "")
+        # `voice_id` реплики уже учитывает её собственный override (см. sync_voices).
+        replica_voice_id = str(replica.get("voice_id") or "")
+
+    text = payload.text if payload.text and payload.text.strip() else replica_text
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Пустой текст: введите текст или выберите непустую реплику проекта",
+        )
+    if len(text) > config.MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Текст длиннее {config.MAX_TEXT_CHARS} символов — сократите его",
+        )
+
+    voices: dict = {}
+    engine_id = ""
+    replica_voice = _resolved_voice(replica_voice_id, voices) if replica_voice_id else None
+    if replica_voice is not None:
+        engine_id = replica_voice.engine
+    elif payload.voice_id:
+        voice = _resolved_voice(payload.voice_id, voices)
+        if voice is None:
+            raise HTTPException(
+                status_code=404, detail=f"Голос не найден: {payload.voice_id}"
+            )
+        engine_id = voice.engine
+
+    if not engine_id:
+        if not payload.engine:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Не удалось определить движок: укажите голос, engine "
+                    "или реплику с назначенным голосом"
+                ),
+            )
+        engine_id = payload.engine
+
+    info = ENGINE_INFOS.get(engine_id)
+    if info is None:
+        known = ", ".join(sorted(ENGINE_INFOS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный движок: {engine_id}. Доступны: {known}",
+        )
+    return text, engine_id, info
+
+
+@app.post("/api/text/preview")
+async def preview_text_stages(payload: TextPreviewRequest) -> dict:
+    """Что услышит модель: все стадии preprocessing без единого вызова синтеза.
+
+    Модель TTS здесь не поднимается: `supports_accents` берётся из паспорта
+    (`ENGINE_INFOS`), а не из живого движка, — поэтому preview стоит миллисекунды и
+    не занимает память моделью. RUAccent — исключение: он и есть предмет проверки,
+    и поднимается ровно так же, как при синтезе, чтобы preview не обещал ударений,
+    которых не будет.
+
+    Отказ RUAccent не роняет запрос: возвращается 200, текст без ударений и явные
+    `accentizer.state`/`accentizer.error`. Иначе «почему нет ударений» пришлось бы
+    выяснять по логам, а preview — ровно то место, где это должно быть видно.
+
+    Стадии и итог считает `audio_pipeline.preview_text` — та же функция, которой
+    пользуется синтез. Ничего в базу не пишется, исходный текст не меняется.
+    """
+    text, engine_id, info = _preview_source(payload)
+    stages = await asyncio.to_thread(
+        audio_pipeline.preview_text,
+        text,
+        supports_accents=info.supports_accents,
+        auto_accent=payload.auto_accent,
+    )
+    accentizer = Accentizer.instance()
+    return {
+        "original": stages.original,
+        "normalized": stages.normalized,
+        "dictionary": stages.dictionary,
+        "accentized": stages.accentized,
+        "final": stages.final,
+        "matches": stages.matches,
+        "engine": engine_id,
+        "engine_label": info.label,
+        "supports_accents": stages.supports_accents,
+        "accents_applied": stages.accents_applied,
+        "accentizer": {"state": accentizer.state, "error": accentizer.last_error},
+    }
 
 
 @app.post("/api/preview", status_code=202)
