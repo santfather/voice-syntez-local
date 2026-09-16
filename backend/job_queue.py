@@ -418,6 +418,16 @@ class JobQueue:
     def queue_size(self) -> int:
         return self._queue.qsize() if self._queue else 0
 
+    @property
+    def current_job_id(self) -> str | None:
+        """Id задачи, которая сейчас в работе; None — воркер свободен.
+
+        Публичное свойство, а не приватное поле: занятость воркера нужна снаружи
+        очереди — по ней менеджер моделей отказывает в удалении весов движка,
+        который прямо сейчас синтезирует.
+        """
+        return self._current_job_id
+
     # -- внутреннее ------------------------------------------------------------
     def _prune(self) -> None:
         while len(self._order) > MAX_KEPT_JOBS:

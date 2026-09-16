@@ -16,7 +16,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
 
-from . import audio_analysis, audio_pipeline, benchmark, config, denoise, resource_guard, transcribe
+from . import (
+    audio_analysis,
+    audio_pipeline,
+    benchmark,
+    config,
+    denoise,
+    model_manager,
+    resource_guard,
+    transcribe,
+)
 from .accentizer import Accentizer
 from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettings
 from .db.connection import init_db
@@ -25,7 +34,14 @@ from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
 from .engines.base import ENGINE_F5, ENGINE_INFOS, EngineInfo
 from .engines.registry import created_engines, get_engine
 from .job_queue import Job, JobPayload, JobStatus, get_queue
-from .pronunciation import PronunciationConflict, get_store as get_pronunciation_store
+from .model_manager import (
+    ModelBusyError,
+    ModelNotDownloadableError,
+    ModelPathError,
+    get_manager,
+)
+from .pronunciation import PronunciationConflict
+from .pronunciation import get_store as get_pronunciation_store
 from .resource_guard import ResourceGuard
 from .text_normalization import normalize, normalize_report
 from .voices_store import ALLOWED_AUDIO_SUFFIXES, MAX_AUDIO_BYTES, Voice, get_store
@@ -412,6 +428,88 @@ async def list_engines() -> dict:
     форме голоса нужен до того, как модель впервые понадобилась.
     """
     return {"engines": [info.to_dict() for info in ENGINE_INFOS.values()]}
+
+
+# --- менеджер моделей ---------------------------------------------------------
+# Веса — это диск и сеть, а не инференс: скачивание и удаление идут мимо очереди
+# синтеза. Но удаление обязано уважать занятость движка: файлы работающей модели
+# трогать нельзя (см. `model_manager.guard_delete`).
+@app.get("/api/models")
+async def list_models() -> dict:
+    """Все модели проекта: установка, размер, состояние движка и скачивания.
+
+    Пути и размеры считаются на диске; в сеть этот роут не ходит — список
+    моделей открывается и в офлайне.
+    """
+    manager = get_manager()
+    states = await asyncio.to_thread(manager.states)
+    return {
+        "models": [state.to_dict() for state in states],
+        "disk": manager.disk_report(states),
+    }
+
+
+@app.get("/api/models/{model_id}")
+async def get_model(model_id: str) -> dict:
+    """Одна модель — для опроса прогресса скачивания."""
+    try:
+        spec = model_manager.model_spec(model_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Модель «{model_id}» не найдена. Доступны: "
+            + ", ".join(spec.id for spec in model_manager.model_specs()),
+        ) from exc
+    return await asyncio.to_thread(lambda: get_manager().state(spec).to_dict())
+
+
+@app.post("/api/models/{model_id}/download", status_code=202)
+async def download_model(model_id: str) -> dict:
+    """Запускает скачивание модели в фоне и сразу отдаёт её состояние.
+
+    Уже установленная модель не скачивается повторно: её файлы остаются
+    нетронутыми, а состояние помечается `done`.
+    """
+    try:
+        spec = model_manager.model_spec(model_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Модель «{model_id}» не найдена. Доступны: "
+            + ", ".join(spec.id for spec in model_manager.model_specs()),
+        ) from exc
+    try:
+        return await asyncio.to_thread(get_manager().download, spec.id)
+    except ModelPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ModelNotDownloadableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/models/{model_id}")
+async def delete_model(model_id: str) -> dict:
+    """Удаляет файлы модели.
+
+    409, пока движок модели занят: поднятая модель держит файлы открытыми, а
+    очередь может синтезировать прямо сейчас. Выгрузки движка в этой фазе нет —
+    текст ошибки говорит именно то, что нужно сделать пользователю.
+    """
+    try:
+        spec = model_manager.model_spec(model_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Модель «{model_id}» не найдена. Доступны: "
+            + ", ".join(spec.id for spec in model_manager.model_specs()),
+        ) from exc
+    try:
+        return await asyncio.to_thread(get_manager().delete, spec.id)
+    except ModelPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ModelBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ModelNotDownloadableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/parse")

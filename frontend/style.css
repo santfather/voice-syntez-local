@@ -514,6 +514,41 @@ details.advanced > summary::-webkit-details-marker { display: none; }
 .alert.error { background: #2a1120; border: 1px solid #8c2f5e; color: #ffb3d1; }
 .alert.info { background: #1b1430; border: 1px solid #5b4392; color: #d9caff; }
 
+/* --- менеджер моделей --------------------------------------------------------- */
+/* Карточка модели повторяет карточку голоса: тот же список и те же теги, но
+   содержимое — состояние файлов на диске, а не настройки синтеза. */
+.model-card {
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid #25242c;
+  border-radius: 4px;
+  background: #101015;
+}
+.model-card:last-child { margin-bottom: 0; }
+.model-top { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+.model-top b { flex: 0 0 auto; font: 10px var(--mono); }
+.model-path {
+  margin: 8px 0 10px;
+  overflow: hidden;
+  color: #6e6c77;
+  font: 9px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-hint { font: 9px var(--mono); }
+.disk-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid #25242c;
+}
+.disk-row:last-of-type { border-bottom: 0; }
+.disk-row b { font: 10px var(--mono); }
+/* Зелёный тег «установлена»: у тегов уже есть янтарный вариант (.tag.warn). */
+.tag.ok { border-color: #3f6b2a; color: var(--lime); }
+
 /* Запись голоса: эталонную фразу нужно читать, поэтому она набрана как цитата */
 .ref-phrase {
   margin: 0 0 12px;

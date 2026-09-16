@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from backend import audio_pipeline, config, job_queue
-from backend.engines.base import EngineInfo, SAMPLE_RATE, STATE_READY, SynthesisEngine
+from backend import audio_pipeline, config, job_queue, model_manager
+from backend.engines.base import SAMPLE_RATE, STATE_READY, EngineInfo, SynthesisEngine
 from backend.voices_store import Voice
 
 STUB_ENGINE_ID = "stub"
@@ -91,7 +91,11 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "projects.db")
     monkeypatch.setattr(config, "PROJECTS_OUTPUT_DIR", output_dir / "projects")
     monkeypatch.setattr(config, "BENCHMARKS_DIR", output_dir / "benchmarks")
-    return tmp_path
+    # Менеджер моделей держит состояние скачиваний в памяти, а замеры размеров —
+    # в кеше модуля: без сброса тесты влияли бы друг на друга.
+    model_manager.reset_manager()
+    yield tmp_path
+    model_manager.reset_manager()
 
 
 @pytest.fixture(autouse=True)

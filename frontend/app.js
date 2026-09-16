@@ -19,6 +19,8 @@ const state = {
   dictionaryEditing: null, // id правила, которое правится в форме (null — новое)
   replicaPreview: {},  // индекс реплики -> {loading} | {data} | {error} для «что услышит модель»
   benchmark: {},       // voice_id -> состояние панели «сравнить движки»
+  models: null,        // последний ответ /api/models: {models, disk}
+  modelsTimer: null,   // опрос прогресса скачивания; null — ни одна модель не качается
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
@@ -315,11 +317,202 @@ function switchTab(name) {
   $('tab-dialogue').hidden = name !== 'dialogue';
   $('tab-text').hidden = name !== 'text';
   $('tab-dictionary').hidden = name !== 'dictionary';
+  $('tab-models').hidden = name !== 'models';
   // Словарь грузится при первом открытии вкладки: он не нужен для озвучки, и
   // запрашивать его на каждом старте дашборда незачем.
   if (name === 'dictionary') {
     loadDictionary().catch((error) => showAlert($('dictionary-error'), error.message));
   }
+  // Модели — так же: список весов нужен только тому, кто пришёл его смотреть,
+  // а обход каталогов с гигабайтными файлами на старте дашборда незачем.
+  if (name === 'models') {
+    loadModels().catch((error) => showAlert($('models-error'), error.message));
+  } else {
+    stopModelsPolling();
+  }
+}
+
+// --- менеджер моделей ---------------------------------------------------------
+// Вкладка показывает состояние весов на диске и, если чего-то не хватает, умеет
+// их скачать. Скачивание идёт мимо очереди синтеза (это сеть и диск), но удаление
+// запрещено, пока движок модели занят — отказ приходит из бэкенда текстом 409.
+const MODELS_POLL_MS = 1500;
+
+function fmtBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+  return `${size >= 100 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
+}
+
+const DOWNLOAD_LABELS = {
+  idle: '',
+  downloading: 'скачивание',
+  done: 'скачано',
+  error: 'ошибка скачивания',
+  interrupted: 'скачивание прервано',
+};
+
+// Скачивается ли хоть что-то прямо сейчас. По этому признаку живёт опрос:
+// закончились загрузки — таймер снимается, и вкладка перестаёт дёргать бэкенд.
+const isDownloading = (model) => model.download && model.download.state === 'downloading';
+
+function modelStatusTags(model) {
+  const tags = [];
+  tags.push(model.installed
+    ? '<span class="tag ok">установлена</span>'
+    : '<span class="tag warn">не установлена</span>');
+  if (model.loaded) tags.push('<span class="tag">в памяти</span>');
+  if (model.engine_in_use) tags.push('<span class="tag warn">движок занят</span>');
+  if (model.kind === 'cache') tags.push('<span class="tag">кеш HF</span>');
+  if (model.download && model.download.state !== 'idle') {
+    tags.push(`<span class="tag">${esc(DOWNLOAD_LABELS[model.download.state] || model.download.state)}</span>`);
+  }
+  return tags.join('');
+}
+
+function modelActions(model) {
+  const buttons = [];
+  const downloading = isDownloading(model);
+  const canDownload = model.kind === 'local';
+  if (canDownload && !model.installed) {
+    buttons.push(`<button class="tiny primary" data-model-action="download" data-model-id="${esc(model.id)}"`
+      + `${downloading ? ' disabled' : ''}>${downloading ? 'Скачивается…' : 'Скачать'}</button>`);
+  }
+  if (canDownload && model.installed && !downloading) {
+    buttons.push(`<button class="tiny ghost danger" data-model-action="delete" data-model-id="${esc(model.id)}"`
+      + '>Удалить</button>');
+  }
+  return buttons.join('');
+}
+
+function renderModels() {
+  const container = $('models-list');
+  const data = state.models;
+  if (!data) return;
+  if (!data.models.length) {
+    container.innerHTML = '<p class="muted">Модели не объявлены.</p>';
+    return;
+  }
+  container.innerHTML = data.models.map((model) => {
+    const download = model.download || {};
+    const showProgress = download.state === 'downloading';
+    const missing = model.missing_files && model.missing_files.length
+      ? `<p class="muted warn">не хватает: ${esc(model.missing_files.join(', '))}</p>` : '';
+    const error = download.error
+      ? `<div class="alert error show">${esc(download.error)}</div>` : '';
+    const progress = showProgress
+      ? `<div class="progress"><div style="width:${Math.round((download.progress || 0) * 100)}%"></div></div>
+         <span class="muted job-line">${fmtBytes(download.bytes_downloaded)} из ${fmtBytes(download.bytes_total)}`
+         + ` · ${Math.round((download.progress || 0) * 100)}%</span>`
+      : '';
+    return `
+      <div class="model-card" data-model-id="${esc(model.id)}">
+        <div class="model-top">
+          <div class="voice-name">
+            <h3>${esc(model.label)}</h3>
+            <p>${esc(model.description)}</p>
+          </div>
+          <b class="muted">${fmtBytes(model.size_bytes)}</b>
+        </div>
+        <div class="tag-row">${modelStatusTags(model)}</div>
+        ${missing}
+        ${progress}
+        ${error}
+        <p class="model-path" title="${esc(model.path)}">${esc(model.path)}</p>
+        <div class="row">
+          ${modelActions(model)}
+          <span class="muted model-hint">${esc(model.repo_id)} · ожидается ~${fmtBytes(model.approx_size_bytes)}</span>
+        </div>
+      </div>`;
+  }).join('');
+  const disk = data.disk || {};
+  $('models-disk-used').textContent = fmtBytes(disk.models_bytes);
+  $('models-disk-free').textContent = fmtBytes(disk.free_bytes);
+}
+
+async function loadModels() {
+  state.models = await api('/api/models');
+  showAlert($('models-error'), '');
+  renderModels();
+  // Опрос живёт ровно столько, сколько идёт скачивание: после завершения
+  // (успех, ошибка или прерывание) он снимается сам.
+  if (state.models.models.some(isDownloading)) startModelsPolling();
+  else stopModelsPolling();
+}
+
+function startModelsPolling() {
+  if (state.modelsTimer) return;
+  state.modelsTimer = setInterval(() => {
+    loadModels().catch((error) => {
+      stopModelsPolling();
+      showAlert($('models-error'), error.message);
+    });
+  }, MODELS_POLL_MS);
+}
+
+function stopModelsPolling() {
+  if (!state.modelsTimer) return;
+  clearInterval(state.modelsTimer);
+  state.modelsTimer = null;
+}
+
+async function downloadModel(modelId) {
+  const model = (state.models?.models || []).find((item) => item.id === modelId);
+  try {
+    await api(`/api/models/${encodeURIComponent(modelId)}/download`, { method: 'POST' });
+  } catch (error) {
+    showAlert($('models-error'), error.message);
+  }
+  await loadModels().catch((error) => showAlert($('models-error'), error.message));
+  if (model && model.kind === 'local') {
+    showAlert(
+      $('models-note'),
+      `Скачивание «${model.label}» идёт в фоне: страницу можно закрыть, прогресс виден здесь.`,
+      'info',
+    );
+  }
+}
+
+async function deleteModel(modelId) {
+  const model = (state.models?.models || []).find((item) => item.id === modelId);
+  if (!model) return;
+  const ok = window.confirm(
+    `Удалить файлы модели «${model.label}» (${fmtBytes(model.size_bytes)})?\n`
+    + 'Веса придётся скачивать заново.',
+  );
+  if (!ok) return;
+  try {
+    await api(`/api/models/${encodeURIComponent(modelId)}`, { method: 'DELETE' });
+    showAlert($('models-note'), `Файлы модели «${model.label}» удалены.`, 'info');
+  } catch (error) {
+    // 409 — движок занят: показываем текст бэкенда как есть, он объясняет, что делать.
+    showAlert($('models-error'), error.message);
+  }
+  await loadModels().catch((error) => showAlert($('models-error'), error.message));
+}
+
+function bindModelsEvents() {
+  const reload = $('btn-reload-models');
+  if (reload) reload.addEventListener('click', () => {
+    loadModels().catch((error) => showAlert($('models-error'), error.message));
+  });
+  const list = $('models-list');
+  if (!list) return;
+  list.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-model-action]');
+    if (!button) return;
+    const modelId = button.dataset.modelId;
+    if (button.dataset.modelAction === 'download') {
+      button.disabled = true;
+      downloadModel(modelId).catch((error) => showAlert($('models-error'), error.message));
+    } else if (button.dataset.modelAction === 'delete') {
+      deleteModel(modelId).catch((error) => showAlert($('models-error'), error.message));
+    }
+  });
 }
 
 // --- словарь произношения -----------------------------------------------------
@@ -2917,6 +3110,7 @@ function bindEvents() {
   $('btn-reload-voices').addEventListener('click', () => loadVoices().catch((e) => alert(e.message)));
   $('btn-save-voice').addEventListener('click', createVoice);
   $('btn-recognize-voice').addEventListener('click', recognizeRefText);
+  bindModelsEvents();
 
   $('pause').addEventListener('input', (e) => { $('pause-value').textContent = `${e.target.value} мс`; });
   // Смена стратегии меняет состав реплик: без повторного разбора карточки

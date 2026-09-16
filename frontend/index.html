@@ -49,6 +49,7 @@
   <button class="tab" data-tab="dialogue"><span>02</span>Озвучка диалога</button>
   <button class="tab" data-tab="text"><span>03</span>Сплошной текст</button>
   <button class="tab" data-tab="dictionary"><span>04</span>Словарь</button>
+  <button class="tab" data-tab="models"><span>05</span>Модели</button>
 </nav>
 </div>
 
@@ -687,6 +688,67 @@
             Ударение F5 пишется знаком <b>+</b> перед гласной: <code>звонит → звон+ит</code>.
             Движкам без поддержки ударений (XTTS) знак не отправляется. Правило с тем же
             источником обновляет прежнее, а не создаёт второе.
+          </p>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+</main>
+
+<!-- Вкладка 5: менеджер моделей -->
+<main class="tab-panel" id="tab-models" hidden>
+<div class="workspace">
+  <section class="section-heading">
+    <div>
+      <p class="eyebrow">05 · МЕНЕДЖЕР МОДЕЛЕЙ</p>
+      <h1>Модели <span>//</span> веса, диск и загрузка</h1>
+    </div>
+    <button class="outline-button" id="btn-reload-models">Обновить</button>
+  </section>
+
+  <div class="voice-layout">
+    <div class="column">
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">01</span>
+          <div>
+            <h2>ВЕСА НА ЭТОМ КОМПЬЮТЕРЕ</h2>
+            <p>Что уже лежит на диске, что поднято в память и что можно скачать.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="alert error" id="models-error"></div>
+          <div class="alert info" id="models-note" hidden></div>
+          <div id="models-list">
+            <p class="muted">Загружаю список моделей…</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="column">
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">02</span>
+          <div>
+            <h2>ДИСК</h2>
+            <p>Приложение работает офлайн: скачивание нужно только там, где весов ещё нет.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="disk-row">
+            <span class="muted">Занято моделями</span>
+            <b class="muted" id="models-disk-used">—</b>
+          </div>
+          <div class="disk-row">
+            <span class="muted">Свободно на диске</span>
+            <b class="muted" id="models-disk-free">—</b>
+          </div>
+          <p class="hint muted">
+            Удаление файлов запрещено, пока движок поднят или в очереди идёт задача:
+            веса читает работающая модель. Выгрузка движка появится в следующей фазе —
+            до неё помогает перезапуск приложения.
           </p>
         </div>
       </section>
