@@ -11,7 +11,13 @@ import numpy as np
 
 from .. import config
 from ..tts_engine import TTSEngine
-from .base import ENGINE_F5, ENGINE_INFOS, SAMPLE_RATE, SynthesisEngine
+from .base import (
+    ENGINE_F5,
+    ENGINE_INFOS,
+    SAMPLE_RATE,
+    SynthesisEngine,
+    release_torch_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,15 @@ class F5Engine(SynthesisEngine):
             self._mark("failed", exc)
             raise
         self._mark("ready")
+
+    def _release(self) -> None:
+        """Обнуляет модель F5 (общий singleton `TTSEngine`) и возвращает память MPS.
+
+        Сам `TTSEngine` остаётся тем же объектом: сбрасывается только ссылка на
+        модель, поэтому `load()` после выгрузки поднимает веса заново.
+        """
+        self._engine.unload()
+        release_torch_memory()
 
     def _synthesize(
         self, text: str, ref_audio_path: str, ref_text: str, speed: float, params: dict

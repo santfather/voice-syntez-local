@@ -114,6 +114,30 @@ MAX_RSS_MB = int(os.environ.get("TTS_MAX_RSS_MB", "5120"))
 # Порог общей памяти системы (проценты): вторая, независимая от MAX_RSS_MB
 # проверка — она видит нагрузку чужих процессов, которую свой RSS не показывает.
 SYSTEM_MEM_THRESHOLD_PERCENT = int(os.environ.get("TTS_SYSTEM_MEM_THRESHOLD", "85"))
+# Выгрузка простаивающего движка (фаза 10): сколько минут движок может не
+# участвовать в синтезе, прежде чем фоновая задача вернёт его память. `0` —
+# политика выключена, выгрузка остаётся только ручной.
+DEFAULT_ENGINE_IDLE_UNLOAD_MIN = 15.0
+ENGINE_IDLE_UNLOAD_ENV = "TTS_ENGINE_IDLE_UNLOAD_MIN"
+
+
+def engine_idle_unload_minutes() -> float:
+    """Порог простоя в минутах из окружения — читается **в момент вызова**.
+
+    Не константой на импорте: настройку меняют без перезапуска (и подменяют в
+    тестах через `monkeypatch.setenv`), а `0` — это «выключено». Нечисло и
+    отрицательное значение приводим к безопасному дефолту: опечатка в
+    переменной окружения не должна включать выгрузку «прямо сейчас».
+    """
+    raw = os.environ.get(ENGINE_IDLE_UNLOAD_ENV)
+    if raw is None:
+        return DEFAULT_ENGINE_IDLE_UNLOAD_MIN
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_ENGINE_IDLE_UNLOAD_MIN
+    return minutes if minutes > 0 else 0.0
+
 # Сколько хранить готовые файлы в output/
 OUTPUT_TTL_HOURS = float(os.environ.get("TTS_OUTPUT_TTL_HOURS", "24"))
 # Максимальная длина куска (символов), который уходит в модель за один прогон.

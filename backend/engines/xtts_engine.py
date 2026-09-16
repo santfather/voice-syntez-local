@@ -23,6 +23,7 @@ from .base import (
     ENGINE_XTTS_BANANA,
     SAMPLE_RATE,
     SynthesisEngine,
+    release_torch_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,20 @@ class XTTSEngine(SynthesisEngine):
                 self._mark("failed", exc)
                 raise
             self._mark("ready")
+
+    def _release(self) -> None:
+        """Обнуляет модель, устройство и кеш conditioning latents.
+
+        Латенты — это тензоры на голос, и без их очистки выгрузка модели
+        освободила бы не всю память движка. Вызывается, когда активных синтезов
+        нет, поэтому локи свободны.
+        """
+        with self._load_lock:
+            self._model = None
+            self._device = None
+        with self._latents_lock:
+            self._latents.clear()
+        release_torch_memory()
 
     def _load_model(self, device: str) -> None:
         config.configure_torch()

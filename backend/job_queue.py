@@ -418,6 +418,26 @@ class JobQueue:
     def queue_size(self) -> int:
         return self._queue.qsize() if self._queue else 0
 
+    def is_busy(self) -> bool:
+        """Есть ли задачи в состоянии queued/processing — включая перегенерацию.
+
+        По этому признаку фоновая и ручная выгрузка движка отказывается работать:
+        выгружать модель, которая нужна следующей реплике (или прямо сейчас
+        пересобирает одну), незачем — её тут же придётся поднимать заново.
+        Проверяются три источника, потому что задача проходит через них
+        последовательно: очередь (`queued`), `current_job_id` (`processing`) и
+        флаг `regenerating`, который выставляется ещё до взятия задачи воркером.
+        """
+        if self._current_job_id is not None:
+            return True
+        if self._queue is not None and not self._queue.empty():
+            return True
+        return any(
+            job.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
+            or job.regenerating is not None
+            for job in self._jobs.values()
+        )
+
     @property
     def current_job_id(self) -> str | None:
         """Id задачи, которая сейчас в работе; None — воркер свободен.

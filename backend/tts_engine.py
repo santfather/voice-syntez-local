@@ -134,6 +134,20 @@ class TTSEngine:
             self.device = device
             logger.info("Модель загружена на %s", device)
 
+    def unload(self) -> None:
+        """Обнуляет ссылку на модель F5 — память освобождает вызывающий движок.
+
+        `gc.collect()` и очистку кеша MPS делает `engines/f5_engine._release`:
+        сам `TTSEngine` про движки синтеза не знает и импортировать их не должен.
+        Идемпотентно и безопасно, если модель не поднята.
+        """
+        with self._load_lock:
+            if self._model is None:
+                return
+            self._model = None
+            self.device = None
+            logger.info("Модель F5-TTS выгружена")
+
     # -- синтез ----------------------------------------------------------------
     def synthesize(
         self,

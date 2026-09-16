@@ -22,6 +22,7 @@ from . import (
     benchmark,
     config,
     denoise,
+    engine_lifecycle,
     model_manager,
     resource_guard,
     transcribe,
@@ -31,8 +32,14 @@ from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettin
 from .db.connection import init_db
 from .db.store import UNSET, get_projects_store
 from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
-from .engines.base import ENGINE_F5, ENGINE_INFOS, EngineInfo
-from .engines.registry import created_engines, get_engine
+from .engines.base import (
+    ENGINE_F5,
+    ENGINE_INFOS,
+    STATE_IDLE,
+    EngineBusyError,
+    EngineInfo,
+)
+from .engines.registry import created_engine, created_engines, get_engine
 from .job_queue import Job, JobPayload, JobStatus, get_queue
 from .model_manager import (
     ModelBusyError,
@@ -378,12 +385,18 @@ async def lifespan(app: FastAPI):
         name="resource-guard",
     )
     warmup_task = asyncio.create_task(asyncio.to_thread(_warmup))
+    # Выгрузка простаивающих движков: возвращает память без рестарта, но только
+    # когда очередь пуста и порог простоя пройден (см. engine_lifecycle).
+    idle_unload_task = asyncio.create_task(
+        engine_lifecycle.IdleUnloadWatcher().run(), name="engine-idle-unload"
+    )
     try:
         yield
     finally:
         await get_queue().stop()
         guard_task.cancel()
         warmup_task.cancel()
+        idle_unload_task.cancel()
 
 
 app = FastAPI(title="TTS Dashboard", lifespan=lifespan)
@@ -416,6 +429,10 @@ async def status() -> dict:
         # Опциональная очистка референса: без DeepFilterNet тумблер в форме гаснет.
         "denoise_available": denoise.is_available(),
         "queue_size": get_queue().queue_size(),
+        # Память MPS: на Apple Silicon вес моделей не виден в RSS (см. MAX_RSS_MB),
+        # поэтому здесь best-effort счётчики torch. `None` — torch/MPS недоступны;
+        # ошибка чтения метрики не должна валить статус.
+        "mps_memory": resource_guard.mps_memory_snapshot(),
         **resource_guard.snapshot(),
     }
 
@@ -428,6 +445,94 @@ async def list_engines() -> dict:
     форме голоса нужен до того, как модель впервые понадобилась.
     """
     return {"engines": [info.to_dict() for info in ENGINE_INFOS.values()]}
+
+
+# --- выгрузка движков ---------------------------------------------------------
+# Возврат памяти без перезапуска приложения (фаза 10). Ручные роуты и фоновую
+# задачу объединяет одно правило: движок нельзя выгружать, пока он синтезирует
+# или пока очередь занята задачей — иначе следующей реплике придётся поднимать
+# его заново, а перегенерация получит выгруженную модель посреди работы.
+ENGINE_UNLOAD_QUEUE_BUSY = (
+    "В очереди есть задача: движок может понадобиться следующей реплике. "
+    "Дождитесь окончания задачи и повторите выгрузку."
+)
+
+
+def _unknown_engine(engine_id: str) -> HTTPException:
+    """404 с перечнем доступных движков — общий текст для обоих роутов."""
+    return HTTPException(
+        status_code=404,
+        detail=f"Движок «{engine_id}» не найден. Доступны: " + ", ".join(ENGINE_INFOS),
+    )
+
+
+@app.post("/api/engines/{engine_id}/unload")
+async def unload_engine(engine_id: str) -> dict:
+    """Выгружает движок и возвращает занятую им память.
+
+    409 в двух случаях: движок прямо сейчас синтезирует (`EngineBusyError`) или
+    очередь занята задачей. 404 — неизвестный id: молчаливый no-op скрыл бы
+    опечатку. Повторная выгрузка незагруженного движка — успешный no-op.
+    """
+    info = ENGINE_INFOS.get(engine_id)
+    if info is None:
+        raise _unknown_engine(engine_id)
+    engine = created_engine(engine_id)
+    if engine is None:
+        return {
+            "engine": engine_id,
+            "state": STATE_IDLE,
+            "unloaded": False,
+            "message": f"Движок «{info.label}» и так не поднят — выгружать нечего.",
+        }
+    if engine.is_loaded and engine_lifecycle.queue_busy_now():
+        raise HTTPException(status_code=409, detail=ENGINE_UNLOAD_QUEUE_BUSY)
+    try:
+        await asyncio.to_thread(engine.unload)
+    except EngineBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        # Освободить не удалось, но сервис жив: отдаём причину текстом и 500.
+        logger.exception("Не удалось выгрузить движок %s", engine_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось выгрузить движок «{info.label}»: {exc}",
+        ) from exc
+    return {
+        "engine": engine_id,
+        "state": engine.state,
+        "unloaded": True,
+        "message": f"Движок «{info.label}» выгружен: память освобождена.",
+    }
+
+
+@app.post("/api/engines/{engine_id}/load")
+async def load_engine(engine_id: str) -> dict:
+    """Поднимает движок заранее, без синтеза — чтобы вернуть выгруженный.
+
+    Модель поднимается десятки секунд, поэтому роут синхронный для вызывающего,
+    но не блокирует цикл событий: загрузка идёт в отдельном потоке. Повторный
+    вызов на поднятом движке — идемпотентный no-op.
+    """
+    info = ENGINE_INFOS.get(engine_id)
+    if info is None:
+        raise _unknown_engine(engine_id)
+    try:
+        engine = get_engine(engine_id)
+        await asyncio.to_thread(engine.load)
+    except Exception as exc:
+        # Не поднялся: причина уходит в текст ответа, состояние движка уже `failed`.
+        logger.exception("Не удалось поднять движок %s", engine_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Движок «{info.label}» не поднялся: {exc}",
+        ) from exc
+    return {
+        "engine": engine_id,
+        "state": engine.state,
+        "loaded": engine.is_loaded,
+        "message": f"Движок «{info.label}» поднят.",
+    }
 
 
 # --- менеджер моделей ---------------------------------------------------------
@@ -491,8 +596,8 @@ async def delete_model(model_id: str) -> dict:
     """Удаляет файлы модели.
 
     409, пока движок модели занят: поднятая модель держит файлы открытыми, а
-    очередь может синтезировать прямо сейчас. Выгрузки движка в этой фазе нет —
-    текст ошибки говорит именно то, что нужно сделать пользователю.
+    очередь может синтезировать прямо сейчас. Выгрузить движок можно роутом
+    `POST /api/engines/{id}/unload` — текст отказа говорит, что именно сделать.
     """
     try:
         spec = model_manager.model_spec(model_id)

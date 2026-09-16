@@ -52,6 +52,21 @@ def get_engine(engine_id: str) -> SynthesisEngine:
 
 
 def created_engines() -> dict[str, SynthesisEngine]:
-    """Уже созданные движки — для /api/status, без запуска новых."""
+    """Уже созданные движки — для /api/status и /api/models, без запуска новых.
+
+    Состояние берётся у живых объектов (`engine.state`/`engine.is_loaded`), а не
+    кешируется здесь: после `unload()` и `/api/status`, и вкладка «Модели»
+    обязаны видеть `idle`, а не запомненный `ready`.
+    """
     with _lock:
         return dict(_instances)
+
+
+def created_engine(engine_id: str) -> SynthesisEngine | None:
+    """Уже созданный движок по id или `None` — без создания нового.
+
+    Нужен ручной выгрузке: поднимать модель ради того, чтобы её выгрузить,
+    бессмысленно, а неизвестный id проверяется вызывающим отдельно.
+    """
+    with _lock:
+        return _instances.get(engine_id)

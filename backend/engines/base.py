@@ -12,12 +12,17 @@ F5-TTS сейчас синтезирует кусок или XTTS v2. Ручки
 библиотеки нельзя — их импорт стоит десятки секунд и сотни мегабайт RSS.
 """
 
+import gc
+import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
 from .. import config
+
+logger = logging.getLogger(__name__)
 
 # Единый sample rate всех движков: и F5-TTS, и XTTS v2 отдают 24 кГц.
 # Куски разных движков склеиваются в один файл напрямую, поэтому это не
@@ -32,6 +37,33 @@ STATE_IDLE = "idle"
 STATE_LOADING = "loading"
 STATE_READY = "ready"
 STATE_FAILED = "failed"
+
+
+class EngineBusyError(RuntimeError):
+    """Выгрузка отменена: движок прямо сейчас синтезирует.
+
+    Пайплайн синтезирует в отдельном потоке, поэтому обнулить модель из-под
+    работающего инференса — значит уронить кусок на середине, а не освободить
+    память. Отказ приходит вызывающему понятным текстом (роут отдаёт по нему 409).
+    """
+
+
+def release_torch_memory() -> None:
+    """Best-effort возврат памяти Python/Torch/MPS после выгрузки модели.
+
+    `gc.collect()` идёт раньше `empty_cache()`: пока на тензоры есть ссылки в
+    циклах, драйвер их не заберёт. Отсутствие torch или MPS и ошибка очистки не
+    считаются ошибкой выгрузки — ссылки на модель уже обнулены, а кеш драйвера
+    ОС заберёт сама, поэтому сбой уборки только логируется.
+    """
+    gc.collect()
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception as exc:  # noqa: BLE001 — уборка мусора не должна ломать выгрузку
+        logger.warning("Не удалось очистить кеш MPS после выгрузки: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -216,6 +248,16 @@ class SynthesisEngine(ABC):
         self._state = STATE_IDLE
         self._last_error: str | None = None
         self._state_lock = threading.Lock()
+        # Счётчик активных синтезов: пайплайн синтезирует в отдельном потоке, а
+        # `unload()` обязан отказаться выгружать модель, которую прямо сейчас
+        # читает инференс. Тот же лок удерживается на время `_release()`, поэтому
+        # синтез, стартовавший сразу после проверки счётчика, не начнётся раньше,
+        # чем модель будет освобождена: он подождёт лок и поднимет движок заново.
+        self._active_lock = threading.Lock()
+        self._active_synthesizes = 0
+        # `time.monotonic()` последней загрузки или завершённого синтеза — точка
+        # отсчёта простоя для фоновой выгрузки (см. engine_lifecycle).
+        self._last_used_at: float | None = None
 
     # -- состояние -------------------------------------------------------------
     @property
@@ -239,10 +281,30 @@ class SynthesisEngine(ABC):
     def is_loaded(self) -> bool:
         return self._state == STATE_READY
 
+    @property
+    def active_synthesizes(self) -> int:
+        """Сколько синтезов идёт прямо сейчас: по этому числу `unload()` отказывает."""
+        with self._active_lock:
+            return self._active_synthesizes
+
+    @property
+    def last_used_at(self) -> float | None:
+        """Когда движок последний раз поднимали или синтезировали (`time.monotonic()`)."""
+        return self._last_used_at
+
     def _mark(self, state: str, error: Exception | None = None) -> None:
         with self._state_lock:
             self._state = state
             self._last_error = None if error is None else str(error)
+            if state == STATE_READY:
+                # Только что поднятый движок тоже «только что использован»: иначе
+                # фоновая выгрузка забрала бы его сразу после загрузки.
+                self._last_used_at = time.monotonic()
+
+    def _touch(self) -> None:
+        """Отмечает конец использования: простой для политики считается от него."""
+        with self._state_lock:
+            self._last_used_at = time.monotonic()
 
     def to_dict(self) -> dict:
         return {**self.info.to_dict(), "state": self._state, "error": self._last_error}
@@ -251,6 +313,47 @@ class SynthesisEngine(ABC):
     @abstractmethod
     def load(self) -> None:
         """Грузит модель (идемпотентно). Тяжёлая операция — вызывается в отдельном потоке."""
+
+    def _release(self) -> None:
+        """Освобождает ресурсы модели: подклассы обнуляют модель, тензоры и латенты.
+
+        В базовом классе ресурсов нет, поэтому хук — no-op. Вызывается только из
+        `unload()` и только когда движок свободен, поэтому подклассу не нужно
+        защищаться от одновременного инференса. Хук должен быть идемпотентным:
+        выгрузка незагруженного движка — нормальная ситуация.
+        """
+
+    def unload(self) -> None:
+        """Выгружает модель и освобождает её память. Идемпотентно.
+
+        Отказ, а не тихая выгрузка, если движок занят: `EngineBusyError`
+        поднимается, пока счётчик активных синтезов не ноль. Лок счётчика
+        удерживается до конца `_release()`, поэтому гонка «выгрузка против
+        стартующей задачи» безопасна: синтез подождёт и поднимет модель заново
+        (`synthesize()` сам вызывает `load()`), то есть худший исход — лишняя
+        загрузка, а не падение.
+
+        Ошибка `_release()` не глотается — о ней нужно сказать вызывающему, — но
+        и не оставляет движок в подвешенном состоянии: состояние помечается
+        `failed` с текстом ошибки, а повторные `unload()`/`load()` работают.
+        """
+        with self._active_lock:
+            if self._active_synthesizes:
+                raise EngineBusyError(
+                    f"Движок «{self.info.label}» сейчас синтезирует "
+                    f"({self._active_synthesizes} активных вызовов): выгрузка отменена, "
+                    "чтобы не оборвать инференс. Дождитесь окончания задачи."
+                )
+            try:
+                self._release()
+            except Exception as exc:
+                # Не глотаем: об ошибке нужно сказать вызывающему. Состояние при
+                # этом согласовано — `failed` с текстом, повторные вызовы работают.
+                logger.error("Не удалось выгрузить движок %s: %s", self.id, exc)
+                self._mark(STATE_FAILED, exc)
+                raise
+            self._mark(STATE_IDLE)
+        logger.info("Движок %s выгружен, память освобождена", self.id)
 
     @abstractmethod
     def _synthesize(
@@ -274,16 +377,29 @@ class SynthesisEngine(ABC):
         speed: float = config.DEFAULT_SPEED,
         **params: Any,
     ) -> tuple[Any, int]:
-        """Синтез одного куска: `(waveform, sample_rate)`, sample_rate всегда SAMPLE_RATE."""
-        if not self.is_loaded:
-            self.load()
-        merged = {**self.defaults(), **self.normalize_params(params)}
-        waveform, sample_rate = self._synthesize(
-            text, ref_audio_path, ref_text, float(speed), merged
-        )
-        if sample_rate != SAMPLE_RATE:
-            raise RuntimeError(
-                f"Движок {self.id} вернул {sample_rate} Гц вместо {SAMPLE_RATE}: "
-                "куски разных движков нельзя склеить без ресемплинга"
+        """Синтез одного куска: `(waveform, sample_rate)`, sample_rate всегда SAMPLE_RATE.
+
+        Модель поднимается здесь же, если движок выгружен: `load()` вызывается при
+        `not is_loaded`, поэтому ручная или фоновая выгрузка не ломает следующий
+        синтез — он просто снова платит за загрузку. Пока вызов активен, счётчик
+        не ноль, и `unload()` отказывается освобождать модель (см. `EngineBusyError`).
+        """
+        with self._active_lock:
+            self._active_synthesizes += 1
+        try:
+            if not self.is_loaded:
+                self.load()
+            merged = {**self.defaults(), **self.normalize_params(params)}
+            waveform, sample_rate = self._synthesize(
+                text, ref_audio_path, ref_text, float(speed), merged
             )
-        return waveform, sample_rate
+            if sample_rate != SAMPLE_RATE:
+                raise RuntimeError(
+                    f"Движок {self.id} вернул {sample_rate} Гц вместо {SAMPLE_RATE}: "
+                    "куски разных движков нельзя склеить без ресемплинга"
+                )
+            return waveform, sample_rate
+        finally:
+            with self._active_lock:
+                self._active_synthesizes -= 1
+            self._touch()

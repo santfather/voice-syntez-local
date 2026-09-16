@@ -10,6 +10,7 @@
 import asyncio
 import logging
 import os
+import sys
 import time
 from collections.abc import Callable
 
@@ -45,6 +46,38 @@ def snapshot() -> dict:
         "cpu_percent": round(process.cpu_percent(interval=None), 1),
         "system_mem_percent": round(psutil.virtual_memory().percent, 1),
     }
+
+
+def mps_memory_snapshot() -> dict | None:
+    """Best-effort память MPS: `None`, если torch/MPS недоступны.
+
+    На Apple Silicon память моделей не попадает в RSS (см. MAX_RSS_MB), поэтому
+    единственная честная метрика — счётчики самого torch. Значение читается
+    только если torch уже импортирован: `/api/status` опрашивается часто, а
+    первый импорт torch стоит секунды, и тянуть его ради метрики нельзя. В
+    работающем приложении torch поднимается на старте (`configure_torch`), так
+    что метрика есть; в тестах и на машинах без MPS её просто нет.
+
+    Ошибка чтения не должна валить `/api/status`: счётчик может быть недоступен
+    в принципе (старый torch, отсутствие Metal), и это не ошибка сервиса.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.backends.mps.is_available():
+            return None
+        return {
+            "current_allocated_mb": round(
+                torch.mps.current_allocated_memory() / (1024 * 1024), 1
+            ),
+            "driver_allocated_mb": round(
+                torch.mps.driver_allocated_memory() / (1024 * 1024), 1
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 — метрика не повод валить статус
+        logger.warning("Не удалось прочитать память MPS: %s", exc)
+        return None
 
 
 def check_system_memory_pressure() -> bool:

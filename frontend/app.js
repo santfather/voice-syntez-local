@@ -366,6 +366,10 @@ function modelStatusTags(model) {
     ? '<span class="tag ok">установлена</span>'
     : '<span class="tag warn">не установлена</span>');
   if (model.loaded) tags.push('<span class="tag">в памяти</span>');
+  // `idle` у уже созданного движка означает именно выгрузку: движок либо поднят
+  // синтезом, либо отпущен кнопкой/по простою. Никогда не созданный движок даёт
+  // `engine_state: null` — его выгруженным называть нечестно.
+  else if (model.engine_state === 'idle') tags.push('<span class="tag">выгружен</span>');
   if (model.engine_in_use) tags.push('<span class="tag warn">движок занят</span>');
   if (model.kind === 'cache') tags.push('<span class="tag">кеш HF</span>');
   if (model.download && model.download.state !== 'idle') {
@@ -381,6 +385,18 @@ function modelActions(model) {
   if (canDownload && !model.installed) {
     buttons.push(`<button class="tiny primary" data-model-action="download" data-model-id="${esc(model.id)}"`
       + `${downloading ? ' disabled' : ''}>${downloading ? 'Скачивается…' : 'Скачать'}</button>`);
+  }
+  // Выгрузка/загрузка — только у моделей с движком синтеза (у Whisper его нет) и
+  // только когда файлы на месте. Занятый движок кнопку не гасит: отказ 409 с
+  // понятным текстом честнее, чем молча неактивная кнопка.
+  if (model.engine_id && model.installed && !downloading) {
+    if (model.loaded) {
+      buttons.push(`<button class="tiny ghost" data-model-action="unload" data-model-id="${esc(model.id)}"`
+        + '>Выгрузить</button>');
+    } else {
+      buttons.push(`<button class="tiny" data-model-action="load" data-model-id="${esc(model.id)}"`
+        + '>Загрузить</button>');
+    }
   }
   if (canDownload && model.installed && !downloading) {
     buttons.push(`<button class="tiny ghost danger" data-model-action="delete" data-model-id="${esc(model.id)}"`
@@ -495,6 +511,38 @@ async function deleteModel(modelId) {
   await loadModels().catch((error) => showAlert($('models-error'), error.message));
 }
 
+// Выгрузка и загрузка движка — возврат памяти без перезапуска приложения.
+// Отказ 409 приходит понятным текстом (движок синтезирует или очередь занята) и
+// показывается как есть; после любой попытки список перечитывается, чтобы вкладка
+// не показывала устаревшее «в памяти».
+async function unloadModelEngine(modelId) {
+  const model = (state.models?.models || []).find((item) => item.id === modelId);
+  showAlert($('models-note'), 'Выгружаю движок и возвращаю память…', 'info');
+  try {
+    const result = await api(`/api/engines/${encodeURIComponent(modelId)}/unload`, { method: 'POST' });
+    showAlert($('models-note'), result.message || `Движок «${model?.label || modelId}» выгружен.`, 'info');
+  } catch (error) {
+    showAlert($('models-error'), error.message);
+  }
+  await loadModels().catch((error) => showAlert($('models-error'), error.message));
+}
+
+async function loadModelEngine(modelId) {
+  const model = (state.models?.models || []).find((item) => item.id === modelId);
+  showAlert(
+    $('models-note'),
+    `Поднимаю «${model?.label || modelId}»: это может занять до минуты, страница остаётся отзывчивой.`,
+    'info',
+  );
+  try {
+    const result = await api(`/api/engines/${encodeURIComponent(modelId)}/load`, { method: 'POST' });
+    showAlert($('models-note'), result.message || `Движок «${model?.label || modelId}» поднят.`, 'info');
+  } catch (error) {
+    showAlert($('models-error'), error.message);
+  }
+  await loadModels().catch((error) => showAlert($('models-error'), error.message));
+}
+
 function bindModelsEvents() {
   const reload = $('btn-reload-models');
   if (reload) reload.addEventListener('click', () => {
@@ -506,11 +554,17 @@ function bindModelsEvents() {
     const button = event.target.closest('[data-model-action]');
     if (!button) return;
     const modelId = button.dataset.modelId;
-    if (button.dataset.modelAction === 'download') {
+    const action = button.dataset.modelAction;
+    if (action === 'download') {
       button.disabled = true;
       downloadModel(modelId).catch((error) => showAlert($('models-error'), error.message));
-    } else if (button.dataset.modelAction === 'delete') {
+    } else if (action === 'delete') {
       deleteModel(modelId).catch((error) => showAlert($('models-error'), error.message));
+    } else if (action === 'unload' || action === 'load') {
+      // Блокируем кнопку до перерисовки списка: так видно, что запрос в работе.
+      button.disabled = true;
+      const task = action === 'unload' ? unloadModelEngine(modelId) : loadModelEngine(modelId);
+      task.catch((error) => showAlert($('models-error'), error.message));
     }
   });
 }
