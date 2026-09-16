@@ -136,11 +136,26 @@ def show_latency(title: str, stats: dict) -> None:
 
 
 # --- ресурсы ------------------------------------------------------------------
+def _run_tool(command: list[str]) -> str:
+    """Вывод внешней утилиты или пустая строка, если она недоступна.
+
+    `ps`/`pgrep` могут отсутствовать или быть запрещены политикой песочницы.
+    Телеметрия — вспомогательная часть нагрузочного теста: её отказ не должен
+    выглядеть как падение теста, поэтому здесь пустой вывод, а не исключение.
+    """
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError:
+        return ""
+    return result.stdout
+
+
 class Resources:
     """Фоновый сэмплер: RSS/CPU сервера из /api/status плюс RSS его детей через ps."""
 
     def __init__(self, interval: float = 0.5):
         self.interval = interval
+        self._warned = False
         self.server_pid = self._find_server()
         self.samples: list[tuple[float, dict]] = []
         self.marks: list[tuple[float, str]] = []
@@ -149,23 +164,17 @@ class Resources:
 
     @staticmethod
     def _find_server() -> int | None:
-        out = subprocess.run(
-            ["pgrep", "-f", "uvicorn backend.main"], capture_output=True, text=True
-        ).stdout.split()
+        out = _run_tool(["pgrep", "-f", "uvicorn backend.main"]).split()
         return int(out[0]) if out else None
 
     def _children(self) -> list[tuple[str, float]]:
         """Дочерние процессы сервера (Whisper-воркер и его помощники) с их RSS."""
         if self.server_pid is None:
             return []
-        pids = subprocess.run(
-            ["pgrep", "-P", str(self.server_pid)], capture_output=True, text=True
-        ).stdout.split()
+        pids = _run_tool(["pgrep", "-P", str(self.server_pid)]).split()
         found = []
         for pid in pids:
-            out = subprocess.run(
-                ["ps", "-o", "rss=,command=", "-p", pid], capture_output=True, text=True
-            ).stdout.strip()
+            out = _run_tool(["ps", "-o", "rss=,command=", "-p", pid]).strip()
             if not out:
                 continue
             rss, _, command = out.partition(" ")
@@ -174,8 +183,18 @@ class Resources:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            _, _, data = call_json("GET", "/api/status", timeout=10)
-            children = self._children()
+            # Сэмплер — вспомогательный: недоступный `ps`, запрет на запуск
+            # процессов или упавший /api/status не должны убивать поток с
+            # трейсбеком посреди прогона. Один раз предупреждаем и продолжаем.
+            try:
+                _, _, data = call_json("GET", "/api/status", timeout=10)
+                children = self._children()
+            except Exception as exc:  # noqa: BLE001 — фоновая телеметрия
+                if not self._warned:
+                    self._warned = True
+                    say(f"  (телеметрия недоступна: {type(exc).__name__}: {exc})")
+                self._stop.wait(self.interval)
+                continue
             if data:
                 self.samples.append(
                     (
