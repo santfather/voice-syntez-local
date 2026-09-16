@@ -105,10 +105,21 @@ CREATE TABLE IF NOT EXISTS pronunciation_entries (
 CREATE INDEX IF NOT EXISTS idx_pronunciation_enabled ON pronunciation_entries(enabled);
 """
 
+# Диагностические метрики take'а: WER, клиппинг, доля тишины, длительность,
+# секунды на знак, peak/RMS/LUFS, попытки и причины отбора. Отдельной колонкой, а
+# не внутри `qa`: это измерения самого готового куска, а не вердикт проверки, и
+# они есть даже у take, который в Whisper не отправляли. JSON, потому что набор
+# полей растёт от фазы к фазе, а читается он всегда целиком. У записей, сделанных
+# до этой миграции, колонка пуста — они читаются как `quality: null`.
+_MIGRATION_4 = """
+ALTER TABLE takes ADD COLUMN quality TEXT;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
+    (4, _MIGRATION_4),
 )
 
 

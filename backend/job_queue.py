@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio_pipeline, benchmark, config, eta, resource_guard
+from . import audio_pipeline, benchmark, config, eta, resource_guard, take_quality
 from .audio_pipeline import (
     NoteCallback,
     ProgressCallback,
@@ -106,6 +106,9 @@ class Job:
     # кусок пришёл из варианта). Нужен, чтобы показать принятое без полного
     # прохождения аудио как непроверенное, а не как обычное.
     qa: list[QaOutcome | None] = field(default_factory=list, repr=False)
+    # Диагностика исходного куска по индексу реплики (`None` — кусок пришёл из
+    # варианта или задача не проект). Метрики, а не оценка: ранжирования по ним нет.
+    quality: list[take_quality.TakeQuality | None] = field(default_factory=list, repr=False)
     # Варианты кусков: индекс реплики → список вариантов, от старых к новым.
     # Наличие варианта — это и есть история: без него перегенерация означала бы
     # «потерять то, что было», и сравнивать новое на слух было бы не с чем.
@@ -459,6 +462,19 @@ class JobQueue:
                     return variant.qa
         return job.qa[index] if index < len(job.qa) else None
 
+    def active_quality(self, job: Job, index: int) -> take_quality.TakeQuality | None:
+        """Диагностика куска, который сейчас стоит в файле.
+
+        Как и отметка проверки, метрики принадлежат звучанию, а не реплике: после
+        выбора варианта показываться должны измерения выбранного аудио.
+        """
+        active = job.active_variant.get(index)
+        if active is not None:
+            for variant in job.variants.get(index, []):
+                if variant.id == active:
+                    return variant.quality
+        return job.quality[index] if index < len(job.quality) else None
+
     def _ready_job(self, job_id: str) -> tuple[Job, "JobPayload"]:
         """Готовая к пересборке задача и её данные; всё остальное — ошибка запроса."""
         job = self._jobs.get(job_id)
@@ -786,6 +802,7 @@ class JobQueue:
             job.segments = result.segments
             job.seeds = result.seeds
             job.qa = result.qa
+            job.quality = list(result.qualities)
             job.current_replica = job.total_replicas
             job.eta_sec = 0.0
             # Статус DONE ставится после записи кусков в проект: «готово» должно
@@ -879,6 +896,9 @@ class JobQueue:
                         "qa": result.qa[index].to_dict()
                         if index < len(result.qa) and result.qa[index] is not None
                         else None,
+                        "quality": result.qualities[index].to_dict()
+                        if index < len(result.qualities) and result.qualities[index] is not None
+                        else None,
                     }
                 )
             await asyncio.to_thread(
@@ -911,7 +931,7 @@ class JobQueue:
             await self._keep_current(job, task.index, job.payload.settings, job.output_path)
             if self._cancelled(job.id):
                 raise audio_pipeline.JobCancelledError("Отменено до синтеза")
-            prepared, seed, qa_outcome = await audio_pipeline.synthesize_replica(
+            prepared, seed, qa_outcome, quality = await audio_pipeline.synthesize_replica(
                 replica=replica,
                 speaker=speaker,
                 settings=job.payload.settings,
@@ -924,7 +944,9 @@ class JobQueue:
             # сохраняем — в файл попадёт недоделанная пересборка.
             if self._cancelled(job.id):
                 raise audio_pipeline.JobCancelledError("Отменено до сохранения варианта")
-            variant = await self._add_variant(job, task.index, prepared, seed, qa_outcome)
+            variant = await self._add_variant(
+                job, task.index, prepared, seed, qa_outcome, quality,
+            )
             duration, bounds = await audio_pipeline.apply_variant(
                 source_path=job.output_path,
                 settings=job.payload.settings,
@@ -1007,7 +1029,7 @@ class JobQueue:
         try:
             if speaker is None:
                 raise ValueError(f"Для «{task.replica.label}» не найден голос")
-            prepared, seed, qa_outcome = await audio_pipeline.synthesize_replica(
+            prepared, seed, qa_outcome, quality = await audio_pipeline.synthesize_replica(
                 replica=task.replica,
                 speaker=speaker,
                 settings=task.settings,
@@ -1025,6 +1047,7 @@ class JobQueue:
                 seed,
                 f"пересинтез {job.id}",
                 qa_outcome,
+                quality,
             )
             # Файл сначала живёт в output/, а в проект копируется: вариант задачи
             # чистится вместе с output/, вариант проекта должен его пережить.
@@ -1042,6 +1065,9 @@ class JobQueue:
                     "parameters": audio_pipeline.chunk_parameters(task.replica, speaker),
                     "duration_sec": variant.duration_sec,
                     "qa": qa_outcome.to_dict() if qa_outcome is not None else None,
+                    "quality": variant.quality.to_dict()
+                    if variant.quality is not None
+                    else None,
                 },
             )
             await asyncio.to_thread(audio_pipeline.drop_variant, variant)
@@ -1175,6 +1201,14 @@ class JobQueue:
             audio_pipeline.save_chunk_variant,
             job.id, index, "v0", chunk, self.active_seed(job, index), "исходный",
             self.active_qa(job, index),
+            # Исходный вариант — вырезанный из файла кусок: его диагностика
+            # считается по тому же срезу, что слышит пользователь.
+            await asyncio.to_thread(
+                take_quality.measure,
+                chunk,
+                job.payload.replicas[index].text,
+                qa=self.active_qa(job, index),
+            ),
         )
         job.variants[index] = [variant]
         job.active_variant[index] = variant.id
@@ -1186,12 +1220,13 @@ class JobQueue:
         chunk: np.ndarray,
         seed: int | None,
         qa: QaOutcome | None = None,
+        quality: take_quality.TakeQuality | None = None,
     ) -> audio_pipeline.ChunkVariant:
         """Добавляет новый вариант куска и делает его текущим."""
         seq = self._take_seq(job, index)
         variant = await asyncio.to_thread(
             audio_pipeline.save_chunk_variant,
-            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}", qa,
+            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}", qa, quality,
         )
         job.variants.setdefault(index, []).append(variant)
         job.active_variant[index] = variant.id

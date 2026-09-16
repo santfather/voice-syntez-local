@@ -25,6 +25,7 @@ from . import (
     engine_lifecycle,
     model_manager,
     resource_guard,
+    take_quality,
     timeline,
     transcribe,
 )
@@ -1796,6 +1797,9 @@ async def job_status(job_id: str) -> dict:
                 "seed": queue.active_seed(job, index),
                 # Итог строгой проверки этого звучания; None — проверка не гонялась.
                 "qa": _qa_payload(queue.active_qa(job, index)),
+                # Диагностика этого звучания (клиппинг, тишина, LUFS...); None —
+                # метрик нет (старая задача или вырезанный вариант без замера).
+                "quality": _quality_payload(queue.active_quality(job, index)),
                 "variants": _variants_payload(job_id, index, job),
             }
             for index, replica in enumerate(job.payload.replicas)
@@ -1806,6 +1810,15 @@ async def job_status(job_id: str) -> dict:
 def _qa_payload(outcome: QaOutcome | None) -> dict | None:
     """Итог строгой проверки для интерфейса; None — кусок не проверялся."""
     return None if outcome is None else outcome.to_dict()
+
+
+def _quality_payload(quality: take_quality.TakeQuality | None) -> dict | None:
+    """Диагностические метрики take'а для интерфейса; None — их нет.
+
+    `None` — нормальный случай (старые записи, вырезанный вариант), а не ошибка:
+    интерфейс обязан показать такой take как раньше, без блока «Диагностика».
+    """
+    return None if quality is None else quality.to_dict()
 
 
 def _variants_payload(job_id: str, index: int, job: Job) -> list[dict]:
@@ -1822,6 +1835,7 @@ def _variants_payload(job_id: str, index: int, job: Job) -> list[dict]:
             "seed": variant.seed,
             "duration_sec": round(variant.duration_sec, 2),
             "active": variant.id == active,
+            "quality": variant.quality.to_dict() if variant.quality is not None else None,
             "audio_url": f"/api/jobs/{job_id}/replicas/{index}/variants/{variant.id}/audio",
         }
         for variant in job.variants.get(index, [])

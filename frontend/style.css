@@ -612,6 +612,37 @@ audio { width: 100%; margin-top: 12px; }
 .variant-row .muted { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 9px var(--mono); }
 .variant-row button { flex: 0 0 auto; }
 
+/* Take и его диагностика — один блок: иначе раскрытые числа выглядели бы
+   отдельным take'ом. */
+.take-block { margin-bottom: 4px; }
+.take-block:last-child { margin-bottom: 0; }
+
+/* Предупреждение take'а: обычному пользователю показывается только оно. Цвет —
+   из .muted.warn, габариты — как у отметки проверки. */
+.take-warn { flex: 0 0 auto; font: 9px var(--mono); }
+
+/* Диагностика свёрнута: WER, LUFS и доли нужны при разборе, а не при выборе. */
+details.take-diagnostics { margin: 2px 0 6px; }
+details.take-diagnostics > summary {
+  cursor: pointer;
+  color: var(--muted-2);
+  font: 9px var(--mono);
+  letter-spacing: 0.06em;
+  list-style: none;
+}
+details.take-diagnostics > summary::before { content: '▸ '; color: var(--purple); }
+details.take-diagnostics[open] > summary::before { content: '▾ '; }
+details.take-diagnostics > summary::-webkit-details-marker { display: none; }
+.diag-list {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+}
+.diag-list > div { display: flex; gap: 10px; justify-content: space-between; padding: 2px 0; }
+.diag-list dt { color: var(--muted-2); font: 9px var(--mono); letter-spacing: 0.06em; }
+.diag-list dd { margin: 0; color: #c2c0c8; font: 9px var(--mono); }
+
 /* --- редактор реплик проекта -------------------------------------------------- */
 /* Два представления одного диалога: карточки реплик и исходный текст с маркерами. */
 .view-switch { display: flex; gap: 6px; margin-bottom: 12px; }

@@ -284,12 +284,14 @@ def test_migration_3_upgrades_existing_database(tmp_path):
             connection.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
     assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
 
-    assert migrations.apply_migrations(connection) == 3
+    # Верхняя версия растёт с новыми фазами: проверяем, что доводится до последней,
+    # а не что последняя — именно третья.
+    assert migrations.apply_migrations(connection) == migrations.MIGRATIONS[-1][0]
     assert connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pronunciation_entries'"
     ).fetchone() is not None
     # Повторный запуск миграций идемпотентен, а уникальность правила на месте.
-    assert migrations.apply_migrations(connection) == 3
+    assert migrations.apply_migrations(connection) == migrations.MIGRATIONS[-1][0]
     connection.execute(
         "INSERT INTO pronunciation_entries"
         " (source, target, case_sensitive, whole_word, enabled, note, created_at, updated_at)"

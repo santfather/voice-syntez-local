@@ -277,13 +277,16 @@ def test_render_dialogue_aborts_between_replicas(stub, fake_store):
 
 
 def test_synthesize_replica_returns_seed_and_prepared_chunk(stub, fake_store):
-    prepared, seed, qa = asyncio.run(
+    prepared, seed, qa, quality = asyncio.run(
         audio_pipeline.synthesize_replica(_replica(), _speaker(), RenderSettings(), 0)
     )
     assert isinstance(seed, int)
     assert qa is None  # проверка выключена — отметки нет
     assert prepared.dtype == np.float32
     assert _rms(prepared) == pytest.approx(config.DEFAULT_TARGET_RMS, abs=0.002)
+    # Диагностика едет вместе с куском: у вызывающего сырого выхода модели нет.
+    assert quality.duration_sec == pytest.approx(prepared.size / SAMPLE_RATE, abs=1e-6)
+    assert quality.qa_attempts is None
 
 
 # --- строгая проверка куска (Фаза 7) ------------------------------------------

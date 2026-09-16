@@ -210,16 +210,28 @@ def estimate_f0_yin(y: np.ndarray, sr: int) -> float | None:
     return float(np.median(f0[keep]))
 
 
+def clipping_ratio(y: np.ndarray) -> float:
+    """Доля отсчётов, упёршихся в потолок шкалы.
+
+    Единственная точка замера перегруза: `check_clipping` выносит по ней вердикт
+    для референса, а диагностика take'а кладёт её же числом в метаданные. Второй
+    счётчик той же величины разошёлся бы с первым при первой же правке порога.
+    """
+    if y.size == 0:
+        return 0.0
+    return int(np.count_nonzero(np.abs(y) >= CLIPPING_LEVEL)) / y.size
+
+
 def check_clipping(y: np.ndarray) -> str | None:
     """Предупреждение, если микрофон был перегружен и вершины громких звуков срезаны."""
     if y.size == 0:
         return None
-    clipped = int(np.count_nonzero(np.abs(y) >= CLIPPING_LEVEL))
-    if clipped / y.size < CLIPPING_MIN_RATIO:
+    ratio = clipping_ratio(y)
+    if ratio < CLIPPING_MIN_RATIO:
         return None
     peak_db = 20 * math.log10(max(float(np.max(np.abs(y))), 1e-6))
     return (
-        f"Запись перегружена: {clipped / y.size * 100:.1f}% отсчётов упираются в потолок "
+        f"Запись перегружена: {ratio * 100:.1f}% отсчётов упираются в потолок "
         f"шкалы (пик {peak_db:.1f} дБ). Микрофон срезает вершины громких звуков, и модель "
         f"склонирует искажения вместе с тембром. Убавьте усиление микрофона или отойдите "
         f"дальше и запишите заново."

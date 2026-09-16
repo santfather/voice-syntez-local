@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from . import config, qa_screening
+from . import config, qa_screening, take_quality
 from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
@@ -186,6 +186,10 @@ class RenderResult:
     seeds: list[int | None] = field(default_factory=list)
     # Итог строгой проверки по индексу реплики; None — проверка не гонялась.
     qa: list[QaOutcome | None] = field(default_factory=list)
+    # Диагностические метрики подготовленного куска по индексу реплики. Не
+    # оценка естественности голоса: набор измерений, по которым видно, почему
+    # take может звучать плохо (см. `take_quality`).
+    qualities: list[take_quality.TakeQuality] = field(default_factory=list)
 
 
 @dataclass
@@ -208,6 +212,9 @@ class ChunkVariant:
     # Свойство самого аудио, а не реплики: у вариантов разная история проверок, и
     # при выборе варианта к реплике должна вернуться именно его отметка.
     qa: QaOutcome | None = None
+    # Диагностика этого звучания (клиппинг, тишина, громкость, LUFS...). None —
+    # метрик нет: так выглядят варианты, сохранённые до фазы, и это норма.
+    quality: take_quality.TakeQuality | None = None
 
 
 class ChunkTimeoutError(RuntimeError):
@@ -964,6 +971,7 @@ async def render_dialogue(
     segments: list[tuple[int, int]] = []
     seeds: list[int | None] = []
     checks: list[QaOutcome | None] = []
+    qualities: list[take_quality.TakeQuality] = []
     total = len(replicas)
     cursor = 0
     for index, replica in enumerate(replicas, start=1):
@@ -998,6 +1006,13 @@ async def render_dialogue(
             pieces.append(np.zeros(pause, dtype=np.float32))
             cursor += pause
         prepared = await asyncio.to_thread(_prepare_chunk, chunk, settings_for_replica)
+        # Диагностика считается по подготовленному куску — по тому, что реально
+        # попадёт в файл, а не по сырому выходу модели.
+        qualities.append(
+            await asyncio.to_thread(
+                take_quality.measure, prepared, replica.text, qa=qa_outcome, raw=chunk
+            )
+        )
         segments.append((cursor, cursor + prepared.size))
         cursor += prepared.size
         pieces.append(prepared)
@@ -1022,6 +1037,7 @@ async def render_dialogue(
         segments=segments,
         seeds=seeds,
         qa=checks,
+        qualities=qualities,
     )
 
 
@@ -1033,12 +1049,14 @@ async def synthesize_replica(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
-) -> tuple[np.ndarray, int | None, QaOutcome | None]:
+) -> tuple[np.ndarray, int | None, QaOutcome | None, take_quality.TakeQuality]:
     """Синтезирует и готовит один кусок — без записи в готовый файл.
 
-    Возвращает подготовленный кусок, сид, которым он получен, и итог строгой
-    проверки (`None` — проверка выключена): всё это нужно вызывающему, чтобы
-    сохранить вариант и уже его поставить в файл. Пересобирать весь диалог из-за
+    Возвращает подготовленный кусок, сид, которым он получен, итог строгой
+    проверки (`None` — проверка выключена) и диагностику take'а: всё это нужно
+    вызывающему, чтобы сохранить вариант и уже его поставить в файл.
+    Диагностика считается здесь, а не у вызывающего: перегруз модели виден только
+    на сыром куске, который наружу не отдаётся. Пересобирать весь диалог из-за
     одной неудачной реплики — десятки секунд на каждый кусок, поэтому
     перегенерация трогает ровно один кусок.
     """
@@ -1066,11 +1084,17 @@ async def synthesize_replica(
         should_abort=should_abort,
     )
     prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
+    # Диагностика считается здесь, где под рукой и сырой выход модели, и
+    # подготовленный кусок: перегруз подготовки не виден, и перемерить его
+    # снаружи уже нечем (см. `take_quality.measure`).
+    quality = await asyncio.to_thread(
+        take_quality.measure, prepared, replica.text, qa=qa_outcome, raw=chunk
+    )
     logger.info(
         "Реплика %s (%s) пересинтезирована: %.2f c аудио, сид %s",
         index + 1, replica.label, prepared.size / SAMPLE_RATE, seed,
     )
-    return prepared, seed, qa_outcome
+    return prepared, seed, qa_outcome, quality
 
 
 async def synthesize_take(
@@ -1139,6 +1163,7 @@ def save_chunk_variant(
     seed: int | None,
     label: str,
     qa: QaOutcome | None = None,
+    quality: take_quality.TakeQuality | None = None,
 ) -> ChunkVariant:
     """Сохраняет кусок вариантом: файл для прослушивания + сид в карточке.
 
@@ -1156,6 +1181,7 @@ def save_chunk_variant(
         seed=seed,
         duration_sec=chunk.size / SAMPLE_RATE,
         qa=qa,
+        quality=quality,
     )
 
 

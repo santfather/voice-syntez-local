@@ -276,6 +276,7 @@ class ProjectsStore:
                     parameters=take.get("parameters") or {},
                     duration_sec=float(take.get("duration_sec") or 0.0),
                     qa=take.get("qa"),
+                    quality=take.get("quality"),
                 )
                 replicas.select_take(int(replica["id"]), int(saved["id"]))
                 ProjectsRepository(connection).update(project_id)
@@ -322,6 +323,7 @@ class ProjectsStore:
                     parameters=item.get("parameters") or {},
                     duration_sec=float(item.get("duration_sec") or 0.0),
                     qa=item.get("qa"),
+                    quality=item.get("quality"),
                 )
                 replicas.select_take(int(replica["id"]), int(take["id"]))
             projects.update(

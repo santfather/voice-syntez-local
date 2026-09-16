@@ -21,6 +21,9 @@ def row_to_take(row: sqlite3.Row) -> dict:
         "parameters": loads(row["parameters"], {}),
         "duration_sec": row["duration_sec"],
         "qa": loads(row["qa"], {}) if row["qa"] else None,
+        # Диагностика take'а. Пустая колонка (записи до фазы 14) — это `None`, а
+        # не пустой объект: «метрик нет» и «метрики пусты» должны различаться.
+        "quality": loads(row["quality"], {}) if row["quality"] else None,
         "created_at": row["created_at"],
     }
 
@@ -39,10 +42,11 @@ class TakesRepository:
         parameters: dict | None = None,
         duration_sec: float = 0.0,
         qa: dict | None = None,
+        quality: dict | None = None,
     ) -> dict:
         cursor = self._conn.execute(
             "INSERT INTO takes (replica_id, label, audio_path, seed, engine, parameters,"
-            " duration_sec, qa, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " duration_sec, qa, quality, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 replica_id,
                 label,
@@ -52,6 +56,7 @@ class TakesRepository:
                 dumps(parameters or {}),
                 float(duration_sec),
                 None if qa is None else dumps(qa),
+                None if quality is None else dumps(quality),
                 _now(),
             ),
         )

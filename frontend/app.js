@@ -2684,12 +2684,16 @@ function takesHtml(replica) {
   const rows = takes.map((take) => {
     const playing = state.takeKey === `${replica.index}:${take.id}`;
     return `
-      <div class="variant-row" data-take="${take.id}">
-        <button class="tiny" data-role="take-play">${playing ? 'стоп' : 'слушать'}</button>
-        <span class="variant-label">${esc(take.label || 'вариант')}${take.active ? ' · активно' : ''}</span>
-        <span class="muted">${Number(take.duration_sec || 0).toFixed(1)} с · ${esc(seedText(take.seed))}</span>
-        ${qaNote(take.qa)}
-        ${take.active ? '' : '<button class="tiny" data-role="take-pick">поставить</button>'}
+      <div class="take-block">
+        <div class="variant-row" data-take="${take.id}">
+          <button class="tiny" data-role="take-play">${playing ? 'стоп' : 'слушать'}</button>
+          <span class="variant-label">${esc(take.label || 'вариант')}${take.active ? ' · активно' : ''}</span>
+          <span class="muted">${Number(take.duration_sec || 0).toFixed(1)} с · ${esc(seedText(take.seed))}</span>
+          ${takeWarnings(take.quality)}
+          ${qaNote(take.qa)}
+          ${take.active ? '' : '<button class="tiny" data-role="take-pick">поставить</button>'}
+        </div>
+        ${takeDiagnostics(take.quality)}
       </div>`;
   }).join('');
   return `<div class="variant-list">${rows}</div>`;
@@ -3115,6 +3119,52 @@ function qaNote(qa) {
   const title = `Попыток: ${qa.attempts}` + (screened.length ? `. Отбор: ${screened.join(', ')}` : '');
   return `<span class="replica-qa muted warn" title="${esc(title)}">` +
     `⚠ ${esc(wer + reason)}</span>`;
+}
+
+const QA_MODE_LABELS = { off: 'выключена', smart: 'smart', strict: 'strict' };
+
+// --- диагностика take'а --------------------------------------------------------
+// Обычному пользователю показываются только предупреждения: «клиппинг», «много
+// тишины», «необычно длинная реплика». Числа (WER, LUFS, peak, RMS) уходят в
+// раскрывающуюся «Диагностику» — по ним видно техническую причину, но решение
+// «оставить или перегенерировать» принимается на слух. Автоматического балла
+// естественности у take'а нет намеренно: из этих измерений он не выводится.
+function takeWarnings(quality) {
+  const warnings = (quality && quality.warnings) || [];
+  return warnings
+    .map((item) => `<span class="take-warn muted warn" title="${esc(item.text)}">⚠ ${esc(item.text)}</span>`)
+    .join('');
+}
+
+function takeDiagnostics(quality) {
+  if (!quality) return '';
+  const number = (value, digits, suffix = '') =>
+    typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : null;
+  const percent = (value, digits) =>
+    typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(digits)} %` : null;
+  const count = (value) => (Number.isInteger(value) ? String(value) : null);
+  const rows = [
+    ['WER', number(quality.wer, 2)],
+    ['Знаков', count(quality.chars)],
+    ['Длительность', number(quality.duration_sec, 2, ' с')],
+    ['Секунд на знак', number(quality.duration_per_char, 3)],
+    ['Peak', number(quality.peak_dbfs, 1, ' dBFS')],
+    ['RMS', number(quality.rms_dbfs, 1, ' dBFS')],
+    ['LUFS', number(quality.lufs, 1)],
+    ['Доля тишины', percent(quality.silence_ratio, 1)],
+    ['Клиппинг', typeof quality.clipping === 'boolean' ? (quality.clipping ? 'есть' : 'нет') : null],
+    ['Доля клиппинга', percent(quality.clipping_ratio, 2)],
+    ['Попыток QA', count(quality.qa_attempts)],
+    ['Режим QA', quality.qa_mode ? QA_MODE_LABELS[quality.qa_mode] || quality.qa_mode : null],
+    ['Причины отбора', (quality.screening_reasons || [])
+      .map((code) => SCREEN_REASONS[code] || code).join(', ') || null],
+  ].filter((row) => row[1] !== null && row[1] !== undefined && row[1] !== '');
+  if (!rows.length) return '';
+  const items = rows
+    .map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
+    .join('');
+  return `<details class="take-diagnostics"><summary>Диагностика</summary>` +
+    `<dl class="diag-list">${items}</dl></details>`;
 }
 
 function seedText(seed) {

@@ -67,6 +67,49 @@ def _expected_sec(text: str) -> float:
     return max(len(text) / config.QA_SCREEN_CHARS_PER_SEC, config.QA_SCREEN_MIN_EXPECTED_SEC)
 
 
+def _silent_fraction(frames: np.ndarray) -> float | None:
+    """Доля кадров тише `QA_SCREEN_SILENCE_DB`; None — кадров нет."""
+    if not frames.size:
+        return None
+    frames_db = _to_db(frames)
+    return float(np.count_nonzero(frames_db < config.QA_SCREEN_SILENCE_DB)) / frames.size
+
+
+def silence_ratio(chunk: np.ndarray) -> float | None:
+    """Доля тишины в куске по тем же кадрам и порогу, что у отбора.
+
+    None — кусок короче одного кадра: тишину в нём измерять нечем, и это не 0.
+    """
+    frame = max(1, int(SAMPLE_RATE * config.QA_SCREEN_FRAME_SEC))
+    y = np.asarray(chunk, dtype=np.float32).reshape(-1)
+    return _silent_fraction(_frame_rms(y, frame))
+
+
+def level_dbfs(chunk: np.ndarray) -> float:
+    """Уровень куска в дБ (RMS) с полом вместо -inf — та же мера, что у отбора."""
+    y = np.asarray(chunk, dtype=np.float32).reshape(-1)
+    if not y.size:
+        return float(_to_db(np.zeros(1))[0])
+    return float(_to_db(np.array([np.sqrt(np.mean(np.square(y, dtype=np.float64)))]))[0])
+
+
+def duration_reasons(duration_sec: float, text: str) -> list[str]:
+    """Причины по длительности куска относительно текста.
+
+    Разделено с `screen_chunk`, чтобы отбор и диагностика take'а сравнивали
+    длительность с одним и тем же ожиданием и одними порогами.
+    """
+    expected = _expected_sec(text)
+    reasons: list[str] = []
+    if duration_sec < config.QA_SCREEN_MIN_DURATION_SEC:
+        reasons.append(REASON_TOO_SHORT)
+    if duration_sec < expected * config.QA_SCREEN_SHORT_RATIO:
+        reasons.append(REASON_DURATION_SHORT)
+    elif duration_sec > expected * config.QA_SCREEN_LONG_RATIO:
+        reasons.append(REASON_DURATION_LONG)
+    return reasons
+
+
 def _has_repeat(y: np.ndarray, frame: int) -> bool:
     """Ищет участок, который повторяет более ранний участок того же куска.
 
@@ -126,23 +169,14 @@ def screen_chunk(chunk: np.ndarray, text: str) -> Screening:
         return Screening(suspicious=True, reasons=[REASON_EMPTY])
 
     duration = y.size / SAMPLE_RATE
-    expected = _expected_sec(text)
-    reasons: list[str] = []
-    if duration < config.QA_SCREEN_MIN_DURATION_SEC:
-        reasons.append(REASON_TOO_SHORT)
-    if duration < expected * config.QA_SCREEN_SHORT_RATIO:
-        reasons.append(REASON_DURATION_SHORT)
-    elif duration > expected * config.QA_SCREEN_LONG_RATIO:
-        reasons.append(REASON_DURATION_LONG)
+    reasons: list[str] = duration_reasons(duration, text)
 
     frame = max(1, int(SAMPLE_RATE * config.QA_SCREEN_FRAME_SEC))
     frames = _frame_rms(y, frame)
-    if frames.size:
-        frames_db = _to_db(frames)
-        silent = float(np.count_nonzero(frames_db < config.QA_SCREEN_SILENCE_DB)) / frames.size
-        if silent > config.QA_SCREEN_SILENCE_RATIO:
-            reasons.append(REASON_SILENCE)
-    level_db = float(_to_db(np.array([np.sqrt(np.mean(np.square(y, dtype=np.float64)))]))[0])
+    silent = _silent_fraction(frames)
+    if silent is not None and silent > config.QA_SCREEN_SILENCE_RATIO:
+        reasons.append(REASON_SILENCE)
+    level_db = level_dbfs(y)
     if not (config.QA_SCREEN_RMS_FLOOR_DB <= level_db <= config.QA_SCREEN_RMS_CEIL_DB):
         reasons.append(REASON_LEVEL)
     # Детектор перегруза общий с загрузкой голосов: второй экземпляр той же
@@ -155,7 +189,7 @@ def screen_chunk(chunk: np.ndarray, text: str) -> Screening:
     if reasons:
         logger.info(
             "Отбор куска (%.2f c, ожидалось %.2f c, уровень %.1f дБ): подозрительный — %s",
-            duration, expected, level_db, ", ".join(reasons),
+            duration, _expected_sec(text), level_db, ", ".join(reasons),
         )
     return Screening(suspicious=bool(reasons), reasons=reasons)
 
