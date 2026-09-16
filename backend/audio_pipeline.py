@@ -4,8 +4,9 @@ import asyncio
 import logging
 import math
 import random
+import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
 from .engines.registry import get_engine
 from .text_preprocess import normalize
+from .transcribe import transcribe_audio, word_error_rate
 from .voices_store import Voice, get_store
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,48 @@ logger = logging.getLogger(__name__)
 _PEAK_LIMIT = 0.99
 
 ProgressCallback = Callable[[int, int, str], None]
+# Ожидание освобождения памяти перед повторной попыткой (её ставит очередь).
+WaitForMemory = Callable[[], Awaitable[None]]
+# Сообщение о ходе работы (попадает в статус задачи в интерфейсе).
+NoteCallback = Callable[[str], None]
+
+# Чем закончился QA-цикл куска. Отдельные значения, а не флаг «получилось»: в
+# интерфейсе важно различать «проверено и прошло» и «проверить не успели» —
+# принятое без полной проверки аудио не должно выглядеть проверенным.
+QA_PASSED = "passed"
+QA_BUDGET = "budget_exhausted"
+QA_ATTEMPTS = "attempts_exhausted"
+QA_UNAVAILABLE = "unavailable"
+
+
+@dataclass
+class QaSettings:
+    """Параметры строгой проверки куска.
+
+    Значения по умолчанию берутся из конфига, но живут отдельным объектом, а не
+    читаются из `config` внутри цикла: в тестах цикл должен прогоняться на своих
+    числах, а не на боевых трёхстах секундах бюджета.
+    """
+
+    wer_threshold: float = config.QA_WER_THRESHOLD
+    max_attempts: int = config.QA_MAX_ATTEMPTS
+    budget_sec: float = config.QA_BUDGET_SEC
+
+
+@dataclass
+class QaOutcome:
+    """Итог проверки одного куска: чем цикл закончился и что из него выбрано."""
+
+    status: str
+    wer: float | None
+    attempts: int
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "wer": None if self.wer is None else round(self.wer, 4),
+            "attempts": self.attempts,
+        }
 
 
 @dataclass
@@ -68,6 +112,10 @@ class RenderSettings:
     cross_fade_duration: float = config.DEFAULT_CROSS_FADE_DURATION
     auto_accent: bool = True
     output_format: str = config.DEFAULT_OUTPUT_FORMAT
+    # Строгая проверка куска (Фаза 7); None — обычный путь, одна попытка без
+    # расшифровки. Выбор пользователя на задачу, а не свойство установки: цена
+    # проверки — синтез плюс отдельный процесс Whisper на каждую попытку.
+    qa: QaSettings | None = None
 
 
 @dataclass
@@ -80,6 +128,8 @@ class RenderResult:
     # Сид каждого куска (`None` — движок сид не принимает). Хранится, чтобы кусок
     # можно было воспроизвести: без него понравившийся вариант не повторить.
     seeds: list[int | None] = field(default_factory=list)
+    # Итог строгой проверки по индексу реплики; None — проверка не гонялась.
+    qa: list[QaOutcome | None] = field(default_factory=list)
 
 
 @dataclass
@@ -98,6 +148,10 @@ class ChunkVariant:
     label: str
     seed: int | None
     duration_sec: float
+    # Итог строгой проверки этого варианта (`None` — проверка не гонялась).
+    # Свойство самого аудио, а не реплики: у вариантов разная история проверок, и
+    # при выборе варианта к реплике должна вернуться именно его отметка.
+    qa: QaOutcome | None = None
 
 
 class ChunkTimeoutError(RuntimeError):
@@ -413,6 +467,158 @@ async def _synthesize_chunk(
     return chunk, seed
 
 
+def _nudge_tuning(
+    voice: Voice, engine: SynthesisEngine, tuning: SpeakerSettings, attempt: int
+) -> SpeakerSettings:
+    """Параметры следующей попытки: шаг в сторону предсказуемости.
+
+    Не перебор вслепую: шаг считается от значения, которое реально ушло в модель
+    (карточка слота важнее карточки голоса — ровно как в `_engine_params`), и
+    зажимается границами, объявленными самим движком. Сид здесь не трогаем: его
+    выбирает `_synthesize_chunk` заново на каждой попытке, и в карточке куска
+    остаётся сид той попытки, что попала в файл.
+    """
+    if attempt <= 0:
+        return tuning
+
+    params = dict(tuning.engine_params)
+    for param in engine.info.params:
+        if param.name not in ("temperature", "repetition_penalty"):
+            continue
+        current = params.get(param.name, voice.engine_params.get(param.name, param.default))
+        step = (
+            -config.QA_TEMPERATURE_STEP
+            if param.name == "temperature"
+            else config.QA_REPETITION_PENALTY_STEP
+        )
+        params[param.name] = param.clamp(float(current) + step * attempt)
+
+    # cfg_strength есть у F5 и не объявлен в паспорте XTTS — там он просто
+    # остаётся неиспользованным, как и остальные чужие ключи в `engine_params`.
+    low, high = config.CFG_RANGE
+    cfg = min(max(tuning.cfg_strength + config.QA_CFG_STEP * attempt, low), high)
+    return replace(tuning, cfg_strength=cfg, engine_params=params)
+
+
+async def _transcribe_chunk(chunk: np.ndarray) -> str:
+    """Расшифровывает готовый кусок отдельным процессом Whisper.
+
+    Через временный файл: воркер читает аудио сам и живёт в своём процессе —
+    передать ему waveform напрямую нечем. Файл удаляется сразу: кусок бывает в
+    несколько минут аудио, и копить такие в output/ незачем.
+    """
+
+    def run() -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            path = Path(handle.name)
+        try:
+            _write_audio(path, chunk, "wav")
+            return transcribe_audio(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    return await asyncio.to_thread(run)
+
+
+async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
+    """Считает WER куска относительно текста, который в него отправляли.
+
+    Расшифровка проходит ту же предобработку (`normalize`), что и текст перед
+    синтезом: Whisper пишет числа цифрами («2026»), а в модель ушло «две тысячи
+    двадцать шестом» — без общего шага они расходились бы в каждом числе, и
+    проверка валилась бы на ровном месте.
+    """
+    recognized = await _transcribe_chunk(chunk)
+    if not recognized.strip():
+        return 1.0  # модель промолчала — это провал проверки, а не «сверять нечего»
+    return word_error_rate(normalize(expected), normalize(recognized))
+
+
+async def _synthesize_checked(
+    engine: SynthesisEngine,
+    voice: Voice,
+    replica: Replica,
+    tuning: SpeakerSettings,
+    settings: RenderSettings,
+    position: str,
+    label: str,
+    wait_for_memory: WaitForMemory | None = None,
+    on_note: NoteCallback | None = None,
+) -> tuple[np.ndarray, int | None, QaOutcome | None]:
+    """Синтез куска: обычный или со строгой проверкой (`settings.qa`).
+
+    Без проверки это ровно один вызов движка. С проверкой каждая попытка — это
+    полный синтез плюс отдельный процесс Whisper, поэтому цикл ограничен и числом
+    попыток, и временем, а из проверенных берётся лучшая по WER, даже если порог
+    так и не взят: выбросить уже сгенерированное аудио и вернуть ошибку значило бы
+    потерять работу ради формальности.
+
+    Ошибки синтеза и таймауты идут наружу, как и раньше: проверка отвечает за
+    качество готового куска, а не за то, чтобы прятать зависший инференс.
+    """
+    # Текст куска готовит `_text_for_engine`: числа и латиница для всех движков,
+    # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
+    text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
+    qa = settings.qa
+    if qa is None:
+        chunk, seed = await _synthesize_chunk(
+            engine, voice, text, tuning, settings, position=position, label=label
+        )
+        return chunk, seed, None
+
+    started = time.monotonic()
+    limit = max(qa.max_attempts, 1)
+    best: tuple[np.ndarray, int | None, float] | None = None
+    attempts = 0
+    status = QA_ATTEMPTS
+    for attempt in range(1, limit + 1):
+        if attempt > 1:
+            if time.monotonic() - started >= qa.budget_sec:
+                status = QA_BUDGET
+                break
+            # Whisper на каждой попытке — это ещё один процесс и ещё ~1.6 ГБ
+            # памяти: перед повтором ждём, пока система её отпустит.
+            if wait_for_memory is not None:
+                await wait_for_memory()
+        if on_note:
+            on_note(f"Реплика {position}: строгая проверка, попытка {attempt} из {limit}")
+
+        chunk, seed = await _synthesize_chunk(
+            engine,
+            voice,
+            text,
+            _nudge_tuning(voice, engine, tuning, attempt - 1),
+            settings,
+            position=position,
+            label=label,
+        )
+        attempts = attempt
+        try:
+            wer = await _measure_wer(chunk, replica.text)
+        except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не должна губить задачу
+            logger.warning(
+                "Реплика %s: строгая проверка недоступна (%s: %s) — принимаю без проверки",
+                position, type(exc).__name__, exc,
+            )
+            return chunk, seed, QaOutcome(status=QA_UNAVAILABLE, wer=None, attempts=attempt)
+
+        if best is None or wer < best[2]:
+            best = (chunk, seed, wer)
+        if on_note:
+            on_note(f"Реплика {position}: проверка {attempt} из {limit}, WER {wer:.2f}")
+        if wer <= qa.wer_threshold:
+            status = QA_PASSED
+            break
+
+    assert best is not None  # первая попытка выполняется всегда
+    chunk, seed, wer = best
+    logger.info(
+        "Реплика %s: строгая проверка — %s, WER %.2f, попыток %s",
+        position, status, wer, attempts,
+    )
+    return chunk, seed, QaOutcome(status=status, wer=wer, attempts=attempts)
+
+
 async def render_dialogue(
     job_id: str,
     replicas: Iterable[Replica],
@@ -420,6 +626,8 @@ async def render_dialogue(
     settings: RenderSettings,
     on_progress: ProgressCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
+    wait_for_memory: WaitForMemory | None = None,
+    on_note: NoteCallback | None = None,
 ) -> RenderResult:
     """Синтезирует реплики строго по одной и склеивает их в один файл.
 
@@ -450,6 +658,7 @@ async def render_dialogue(
     pieces: list[np.ndarray] = []
     segments: list[tuple[int, int]] = []
     seeds: list[int | None] = []
+    checks: list[QaOutcome | None] = []
     total = len(replicas)
     cursor = 0
     for index, replica in enumerate(replicas, start=1):
@@ -463,22 +672,19 @@ async def render_dialogue(
         voice = resolved[replica.voice]
         engine = engines[voice.engine]
 
-        # Текст куска готовит _text_for_engine: числа и латиница для всех движков,
-        # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
-        text = await asyncio.to_thread(
-            _text_for_engine, replica.text, engine, settings.auto_accent
-        )
-
-        chunk, seed = await _synthesize_chunk(
+        chunk, seed, qa_outcome = await _synthesize_checked(
             engine,
             voice,
-            text,
+            replica,
             settings_for_replica,
             settings,
             position=f"{index} из {total}",
             label=replica.label,
+            wait_for_memory=wait_for_memory,
+            on_note=on_note,
         )
         seeds.append(seed)
+        checks.append(qa_outcome)
 
         pause = _pause_samples(settings_for_replica, settings)
         if pieces and pause:
@@ -498,6 +704,7 @@ async def render_dialogue(
         replicas_done=total,
         segments=segments,
         seeds=seeds,
+        qa=checks,
     )
 
 
@@ -506,13 +713,16 @@ async def synthesize_replica(
     speaker: SpeakerSettings,
     settings: RenderSettings,
     index: int,
-) -> tuple[np.ndarray, int | None]:
+    wait_for_memory: WaitForMemory | None = None,
+    on_note: NoteCallback | None = None,
+) -> tuple[np.ndarray, int | None, QaOutcome | None]:
     """Синтезирует и готовит один кусок — без записи в готовый файл.
 
-    Возвращает подготовленный кусок и сид, которым он получен: и то, и другое
-    нужно вызывающему, чтобы сохранить вариант и уже его поставить в файл.
-    Пересобирать весь диалог из-за одной неудачной реплики — десятки секунд на
-    каждый кусок, поэтому перегенерация трогает ровно один кусок.
+    Возвращает подготовленный кусок, сид, которым он получен, и итог строгой
+    проверки (`None` — проверка выключена): всё это нужно вызывающему, чтобы
+    сохранить вариант и уже его поставить в файл. Пересобирать весь диалог из-за
+    одной неудачной реплики — десятки секунд на каждый кусок, поэтому
+    перегенерация трогает ровно один кусок.
     """
     voice = _resolve_voice(replica.label, speaker)
     engine = _engine_for(voice)
@@ -521,23 +731,23 @@ async def synthesize_replica(
     # иначе перегенерация дала бы кусок, несовместимый с соседями по звучанию.
     resolved = _settings_for(replica, speaker)
 
-    text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
-
-    chunk, seed = await _synthesize_chunk(
+    chunk, seed, qa_outcome = await _synthesize_checked(
         engine,
         voice,
-        text,
+        replica,
         resolved,
         settings,
         position=str(index + 1),
         label=replica.label,
+        wait_for_memory=wait_for_memory,
+        on_note=on_note,
     )
     prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
     logger.info(
         "Реплика %s (%s) пересинтезирована: %.2f c аудио, сид %s",
         index + 1, replica.label, prepared.size / SAMPLE_RATE, seed,
     )
-    return prepared, seed
+    return prepared, seed, qa_outcome
 
 
 def variant_path(job_id: str, index: int, variant_id: str) -> Path:
@@ -557,6 +767,7 @@ def save_chunk_variant(
     chunk: np.ndarray,
     seed: int | None,
     label: str,
+    qa: QaOutcome | None = None,
 ) -> ChunkVariant:
     """Сохраняет кусок вариантом: файл для прослушивания + сид в карточке.
 
@@ -573,6 +784,7 @@ def save_chunk_variant(
         label=label,
         seed=seed,
         duration_sec=chunk.size / SAMPLE_RATE,
+        qa=qa,
     )
 
 

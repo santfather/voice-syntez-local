@@ -9,6 +9,8 @@ const state = {
   voiceKeys: [],       // ["#1", "#2", "ИВАН"] — голоса, встреченные в тексте
   voiceMeta: {},       // key -> {key, label, slot}
   configs: {},         // key -> {voice_id, speed, cfg_strength, nfe_step, engine_params}
+  replicaCount: null,  // реплик в последнем разборе; null — разбора ещё не было
+  overrideCount: 0,    // сколько параметров пришло из маркеров текста
   preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, engine_params, text}
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
@@ -926,6 +928,39 @@ function renderVoiceConfigs() {
   }).join('');
 }
 
+// Русская форма слова по числу: 1 реплика, 2 реплики, 5 реплик.
+function plural(count, one, few, many) {
+  const mod100 = Math.abs(count) % 100;
+  const mod10 = mod100 % 10;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
+// Сводка под кнопкой разбора. Про неназначенный голос сообщаем здесь, а не только
+// подсказкой отключённой кнопки: иначе непонятно, почему генерация недоступна.
+// Считаем именно участников (слоты), а не выбранные голоса — их ещё может не быть.
+function renderParseSummary() {
+  const summary = $('parse-summary');
+  if (state.replicaCount === null) {
+    summary.textContent = '';
+    summary.classList.remove('warn');
+    return;
+  }
+  const voices = state.voiceKeys.length;
+  const unassigned = state.voiceKeys
+    .filter((key) => !(state.configs[key] || {}).voice_id).length;
+  const parts = [
+    `${state.replicaCount} ${plural(state.replicaCount, 'реплика', 'реплики', 'реплик')}`,
+    `${voices} ${plural(voices, 'участник', 'участника', 'участников')}`,
+  ];
+  if (unassigned) parts.push(`без голоса: ${unassigned}`);
+  if (state.overrideCount) parts.push(`параметров из текста: ${state.overrideCount}`);
+  summary.textContent = parts.join(' · ');
+  summary.classList.toggle('warn', unassigned > 0);
+}
+
 // Панель голосов должна отражать текущий текст: пользователь правит диалог, а не
 // жмёт каждый раз «Определить голоса». Без этого новый слот («(2)», «(3)») уходил
 // на бэкенд без голоса и задача падала с «Не назначен голос для: …».
@@ -967,9 +1002,9 @@ async function syncVoices({ silent = false } = {}) {
   state.voiceMeta = meta;
   state.configs = configs;
 
-  const overrides = parsed.override_count ? ` · параметров из текста: ${parsed.override_count}` : '';
-  $('parse-summary').textContent =
-    `${parsed.replicas.length} реплик · голосов: ${parsed.voices.length}${overrides}`;
+  state.replicaCount = parsed.replicas.length;
+  state.overrideCount = parsed.override_count;
+  renderParseSummary();
   if (changed) renderVoiceConfigs();
   updateGenerateButton();
   return true;
@@ -1035,6 +1070,7 @@ async function generate() {
     pause_ms: parseInt($('pause').value, 10),
     cross_fade_duration: parseFloat($('crossfade').value),
     auto_accent: $('auto-accent').checked,
+    qa: $('qa').checked,
     output_format: $('output-format').value,
     chunk_strategy: $('chunk-strategy').value,
   };
@@ -1132,10 +1168,28 @@ function renderReplicas(replicas) {
       <span class="replica-label">${esc(replica.label)}</span>
       <span class="replica-text" title="${esc(replica.text)}">${esc(replica.text)}</span>
       <span class="replica-seed muted">${seedText(replica.seed)}</span>
+      ${qaNote(replica.qa)}
       <button class="tiny" data-role="regen">заново</button>
     </div>
     ${renderVariants(replica)}`).join('');
   block.hidden = false;
+}
+
+// Отметка строгой проверки. Показывается только у тех кусков, что не прошли её
+// полностью: «проверено и прошло» — это норма, и подпись у каждой реплики была бы
+// шумом, а принятое без полной проверки должно быть видно — вместе со степенью
+// расхождения, чтобы решать «оставить или перегенерировать» осознанно.
+function qaNote(qa) {
+  if (!qa || qa.status === 'passed') return '';
+  const reasons = {
+    budget_exhausted: 'время проверки вышло',
+    attempts_exhausted: 'попытки исчерпаны',
+    unavailable: 'расшифровка не удалась',
+  };
+  const wer = qa.wer === null || qa.wer === undefined ? '' : `WER ${qa.wer.toFixed(2)} · `;
+  const reason = reasons[qa.status] || qa.status;
+  return `<span class="replica-qa muted warn" title="Попыток: ${esc(String(qa.attempts))}">` +
+    `⚠ ${esc(wer + reason)}</span>`;
 }
 
 // Список вариантов появляется после первой перегенерации: пока звучание одно,
@@ -1360,6 +1414,7 @@ async function renderText() {
     pause_ms: parseInt($('text-pause').value, 10),
     cross_fade_duration: parseFloat($('text-crossfade').value),
     auto_accent: $('text-auto-accent').checked,
+    qa: $('text-qa').checked,
     output_format: $('text-output-format').value,
     chunk_strategy: $('text-chunk-strategy').value,
   };
@@ -1367,6 +1422,8 @@ async function renderText() {
   $('btn-render-text').disabled = true;
   $('text-player').hidden = true;
   $('text-download-link').hidden = true;
+  // Отметка относится к прошлому файлу — до готовности нового она неактуальна.
+  $('text-job-note').hidden = true;
   setTextProgress(0);
 
   try {
@@ -1415,6 +1472,7 @@ async function pollTextJob() {
       link.href = `${job.audio_url}?download=true`;
       link.download = `text.${job.output_format}`;
       link.hidden = false;
+      showTextQaNote(job.replicas);
     }
     updateTextButton();
   } catch (error) {
@@ -1424,6 +1482,28 @@ async function pollTextJob() {
     showAlert($('text-job-error'), error.message);
     updateTextButton();
   }
+}
+
+// У сплошного текста нет списка реплик, поэтому неполное прохождение строгой
+// проверки показываем одной строкой: сколько кусков принято без неё и насколько
+// близко подошёл лучший из них.
+function showTextQaNote(replicas) {
+  const note = $('text-job-note');
+  const all = replicas || [];
+  const failed = all.filter((replica) => replica.qa && replica.qa.status !== 'passed');
+  if (!failed.length) {
+    note.hidden = true;
+    note.classList.remove('warn');
+    return;
+  }
+  const wers = failed
+    .map((replica) => replica.qa.wer)
+    .filter((wer) => wer !== null && wer !== undefined);
+  const best = wers.length ? `, лучший WER ${Math.min(...wers).toFixed(2)}` : '';
+  note.textContent = `Строгая проверка: ${failed.length} из ${all.length} кусков приняты ` +
+    `без полного прохождения${best}`;
+  note.classList.add('warn');
+  note.hidden = false;
 }
 
 // --- статус модели ------------------------------------------------------------
@@ -1770,6 +1850,7 @@ function bindEvents() {
       // относятся, поэтому блок пересобирается с сохранёнными ручками нового голоса.
       state.configs[event.target.closest('.card').dataset.voice].engine_params = {};
       renderVoiceConfigs();
+      renderParseSummary();
       updateGenerateButton();
     }
   });

@@ -8,3 +8,5 @@ __pycache__/
 *.log
 .voice_syntez.lock
 .voice_syntez.pid
+# Артефакт оболочки, к проекту не относится.
+:memory:.ses

@@ -29,6 +29,7 @@ from backend.audio_pipeline import (
 )
 from backend.dialogue_parser import Replica
 from backend.engines.base import SAMPLE_RATE, STATE_READY, EngineInfo, SynthesisEngine
+from backend.transcribe import word_error_rate
 from conftest import dominant_hz, sine
 
 
@@ -274,9 +275,140 @@ def test_render_dialogue_aborts_between_replicas(stub, fake_store):
 
 
 def test_synthesize_replica_returns_seed_and_prepared_chunk(stub, fake_store):
-    prepared, seed = asyncio.run(
+    prepared, seed, qa = asyncio.run(
         audio_pipeline.synthesize_replica(_replica(), _speaker(), RenderSettings(), 0)
     )
     assert isinstance(seed, int)
+    assert qa is None  # проверка выключена — отметки нет
     assert prepared.dtype == np.float32
     assert _rms(prepared) == pytest.approx(config.DEFAULT_TARGET_RMS, abs=0.002)
+
+
+# --- строгая проверка куска (Фаза 7) ------------------------------------------
+def _qa_render(**overrides) -> RenderSettings:
+    """Сборка со включённой проверкой: бюджет и порог задаёт сам тест."""
+    return RenderSettings(
+        pause_ms=0, output_format="wav", qa=audio_pipeline.QaSettings(**overrides)
+    )
+
+
+def _answers(monkeypatch, *texts) -> list[np.ndarray]:
+    """Подменяет Whisper: отдаёт расшифровки по порядку попыток и пишет куски.
+
+    Куски записываются, чтобы отличить «вернули лучшую попытку» от «вернули
+    последнюю»: у заглушки длина зависит от номера вызова.
+    """
+    chunks: list[np.ndarray] = []
+
+    async def fake(chunk: np.ndarray) -> str:
+        chunks.append(chunk)
+        return texts[min(len(chunks) - 1, len(texts) - 1)]
+
+    monkeypatch.setattr(audio_pipeline, "_transcribe_chunk", fake)
+    return chunks
+
+
+def test_qa_passes_on_first_attempt(stub, fake_store, monkeypatch):
+    _answers(monkeypatch, "Привет это тест")
+    result = _render([_replica()], {"#1": _speaker()}, _qa_render())
+
+    assert len(stub.calls) == 1  # порог взят — повторять нечего
+    assert result.qa == [
+        audio_pipeline.QaOutcome(status=audio_pipeline.QA_PASSED, wer=0.0, attempts=1)
+    ]
+
+
+def test_qa_retries_and_moves_tuning_within_passport(stub, fake_store, monkeypatch):
+    _answers(monkeypatch, "совсем другой текст", "Привет это тест")
+    result = _render(
+        [_replica()], {"#1": _speaker()}, _qa_render(wer_threshold=0.5, max_attempts=3)
+    )
+
+    assert len(stub.calls) == 2
+    assert result.qa[0].status == audio_pipeline.QA_PASSED
+    assert result.qa[0].attempts == 2
+    # Подстройка — объявленный шаг в границах движка, а не произвольное значение.
+    first, second = (call["params"]["cfg_strength"] for call in stub.calls)
+    assert second == pytest.approx(first + config.QA_CFG_STEP)
+    assert config.CFG_RANGE[0] <= second <= config.CFG_RANGE[1]
+
+
+def test_qa_budget_stops_cycle_before_retry(stub, fake_store, monkeypatch):
+    _answers(monkeypatch, "совсем другой текст", "Привет это тест")
+    # Нулевой бюджет — вырожденный, но это самая короткая проверка границы: первая
+    # попытка выполняется всегда, вторая уже не начинается.
+    result = _render(
+        [_replica()], {"#1": _speaker()}, _qa_render(wer_threshold=0.1, budget_sec=0.0)
+    )
+
+    assert len(stub.calls) == 1
+    assert result.qa[0].status == audio_pipeline.QA_BUDGET
+    assert result.qa[0].wer == 1.0
+    assert result.qa[0].attempts == 1
+
+
+def test_qa_returns_best_attempt_not_last(stub, fake_store, monkeypatch):
+    chunks = _answers(monkeypatch, "а б в", "и это тест", "совсем другой текст")
+    result = _render(
+        [_replica()], {"#1": _speaker()}, _qa_render(wer_threshold=0.15, max_attempts=3)
+    )
+
+    outcome = result.qa[0]
+    assert len(stub.calls) == 3
+    assert outcome.status == audio_pipeline.QA_ATTEMPTS
+    assert outcome.wer == pytest.approx(1 / 3)  # ближе всех вторая попытка
+    # В файл попала именно она: длина куска — длина второй попытки, а не третьей.
+    assert result.segments[0][1] - result.segments[0][0] == chunks[1].size
+
+
+def test_qa_waits_for_memory_only_before_retry(stub, fake_store, monkeypatch):
+    _answers(monkeypatch, "совсем другой текст", "Привет это тест")
+    waits: list[int] = []
+
+    async def wait_for_memory() -> None:
+        waits.append(len(stub.calls))
+
+    _render(
+        [_replica()],
+        {"#1": _speaker()},
+        _qa_render(wer_threshold=0.5, max_attempts=3),
+        wait_for_memory=wait_for_memory,
+    )
+
+    assert len(stub.calls) == 2
+    assert waits == [1]  # Whisper поднимается заново только перед повтором
+
+
+def test_qa_without_transcription_accepts_chunk_unchecked(stub, fake_store, monkeypatch):
+    async def broken(chunk: np.ndarray) -> str:
+        raise RuntimeError("распознавание не удалось")
+
+    monkeypatch.setattr(audio_pipeline, "_transcribe_chunk", broken)
+    result = _render([_replica()], {"#1": _speaker()}, _qa_render())
+
+    # Упавшая расшифровка — не повод терять уже сгенерированное аудио.
+    assert len(stub.calls) == 1
+    assert result.qa[0].status == audio_pipeline.QA_UNAVAILABLE
+    assert result.qa[0].wer is None
+
+
+def test_render_without_qa_never_transcribes(stub, fake_store, monkeypatch):
+    async def forbidden(chunk: np.ndarray) -> str:
+        raise AssertionError("без включённой проверки расшифровка не запускается")
+
+    monkeypatch.setattr(audio_pipeline, "_transcribe_chunk", forbidden)
+    result = _render([_replica("Первая реплика"), _replica("Вторая реплика")], {"#1": _speaker()})
+
+    assert result.qa == [None, None]
+
+
+def test_word_error_rate_counts_words_not_letters():
+    assert word_error_rate("привет это тест", "привет это тест") == 0.0
+    assert word_error_rate("привет это тест", "и это тест") == pytest.approx(1 / 3)
+    assert word_error_rate("привет это тест", "привет это тест совсем") == pytest.approx(1 / 3)
+    assert word_error_rate("привет это тест", "") == 1.0
+    # «ё» и «е» для проверки одно слово: иначе строгий порог падал бы на ровном месте.
+    assert word_error_rate("всё хорошо", "все хорошо") == 0.0
+    # Перестановка — это замены, а не «половина текста не совпала»: так считает
+    # расстояние Левенштейна, и по нему же принимается решение о повторе.
+    assert word_error_rate("а б в г", "г в б а") == 1.0

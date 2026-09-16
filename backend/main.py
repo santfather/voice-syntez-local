@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import audio_analysis, audio_pipeline, config, denoise, resource_guard, transcribe
 from .accentizer import Accentizer
-from .audio_pipeline import RenderSettings, SpeakerSettings
+from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettings
 from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
 from .engines.base import ENGINE_F5, ENGINE_INFOS
 from .engines.registry import created_engines, get_engine
@@ -142,6 +142,12 @@ class GenerateRequest(TrackOptions):
     dialogue_text: str
     speakers: dict[str, SpeakerConfig] = Field(default_factory=dict)
     auto_accent: bool = True
+    # Строгая проверка (Фаза 7): каждый кусок расшифровывается Whisper'ом и при
+    # расхождении с исходным текстом синтезируется заново. Выключено по умолчанию:
+    # попытка — это синтез плюс отдельный процесс Whisper, и на длинном диалоге
+    # цена растёт кратно. Числа (порог, попытки, бюджет) — из конфига: это не то,
+    # что имеет смысл крутить на каждой задаче.
+    qa: bool = False
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
 
@@ -151,6 +157,7 @@ class RenderTextRequest(SpeakerConfig, TrackOptions):
 
     text: str
     auto_accent: bool = True
+    qa: bool = False
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
 
@@ -520,6 +527,7 @@ async def generate(payload: GenerateRequest) -> dict:
             cross_fade_duration=payload.cross_fade_duration,
             auto_accent=payload.auto_accent,
             output_format=payload.output_format,
+            qa=QaSettings() if payload.qa else None,
         ),
     )
     try:
@@ -556,6 +564,7 @@ async def render_text(payload: RenderTextRequest) -> dict:
             cross_fade_duration=payload.cross_fade_duration,
             auto_accent=payload.auto_accent,
             output_format=payload.output_format,
+            qa=QaSettings() if payload.qa else None,
         ),
     )
     try:
@@ -583,11 +592,18 @@ async def job_status(job_id: str) -> dict:
                 "text": replica.text,
                 # Сид текущего звучания: без него понравившийся кусок не повторить.
                 "seed": queue.active_seed(job, index),
+                # Итог строгой проверки этого звучания; None — проверка не гонялась.
+                "qa": _qa_payload(queue.active_qa(job, index)),
                 "variants": _variants_payload(job_id, index, job),
             }
             for index, replica in enumerate(job.payload.replicas)
         ]
     return data
+
+
+def _qa_payload(outcome: QaOutcome | None) -> dict | None:
+    """Итог строгой проверки для интерфейса; None — кусок не проверялся."""
+    return None if outcome is None else outcome.to_dict()
 
 
 def _variants_payload(job_id: str, index: int, job: Job) -> list[dict]:

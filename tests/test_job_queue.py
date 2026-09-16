@@ -6,20 +6,20 @@ import time
 
 import pytest
 
-from backend import config
-from backend.audio_pipeline import RenderSettings, SpeakerSettings, read_variant
+from backend import audio_pipeline, config
+from backend.audio_pipeline import QaSettings, RenderSettings, SpeakerSettings, read_variant
 from backend.dialogue_parser import Replica
 from backend.job_queue import Job, JobPayload, JobQueue, JobStatus
 
 
-def _payload(count: int = 3, pause_ms: int = 300) -> JobPayload:
+def _payload(count: int = 3, pause_ms: int = 300, qa: QaSettings | None = None) -> JobPayload:
     return JobPayload(
         replicas=[
             Replica(voice="#1", text=f"Реплика номер {index}", line_number=index)
             for index in range(1, count + 1)
         ],
         speakers={"#1": SpeakerSettings(voice_id="voice1")},
-        settings=RenderSettings(pause_ms=pause_ms, output_format="wav"),
+        settings=RenderSettings(pause_ms=pause_ms, output_format="wav", qa=qa),
     )
 
 
@@ -187,3 +187,32 @@ def test_active_seed_falls_back_to_original_and_handles_missing_index():
     assert queue.active_seed(job, 0) == 11
     assert queue.active_seed(job, 1) is None
     assert queue.active_seed(job, 5) is None
+
+
+def test_qa_outcome_is_stored_and_follows_variants(monkeypatch, stub, fake_store):
+    async def fake(chunk):
+        return "Реплика номер 1"
+
+    monkeypatch.setattr(audio_pipeline, "_transcribe_chunk", fake)
+
+    async def scenario():
+        async with _queue() as queue:
+            job = queue.submit(_payload(count=2, qa=QaSettings(wer_threshold=1.0)))
+            assert await _wait_until(lambda: job.status is JobStatus.DONE), job.error
+            # Отметка есть у каждой реплики и относится к её текущему звучанию.
+            assert [outcome.status for outcome in job.qa] == [
+                audio_pipeline.QA_PASSED,
+                audio_pipeline.QA_PASSED,
+            ]
+            assert queue.active_qa(job, 0) is job.qa[0]
+
+            queue.submit_regenerate(job.id, 0)
+            assert await _wait_until(
+                lambda: job.regenerating is None and len(job.variants.get(0, [])) == 2
+            ), job.regen_error
+            # Перегенерация проходит через ту же проверку: новая отметка — у нового
+            # варианта, а исходный вариант сохранил ту, с которой был сгенерирован.
+            assert queue.active_qa(job, 0) is job.variants[0][1].qa
+            assert job.variants[0][0].qa is job.qa[0]
+
+    _run(scenario)

@@ -12,7 +12,13 @@ from pathlib import Path
 import numpy as np
 
 from . import audio_pipeline, config, resource_guard
-from .audio_pipeline import ProgressCallback, RenderSettings, SpeakerSettings
+from .audio_pipeline import (
+    NoteCallback,
+    ProgressCallback,
+    QaOutcome,
+    RenderSettings,
+    SpeakerSettings,
+)
 from .dialogue_parser import Replica
 
 logger = logging.getLogger(__name__)
@@ -54,6 +60,10 @@ class Job:
     segments: list[tuple[int, int]] = field(default_factory=list, repr=False)
     # Сид каждого куска исходной сборки (`None` — движок сид не принимает).
     seeds: list[int | None] = field(default_factory=list, repr=False)
+    # Итог строгой проверки по индексу реплики (`None` — проверка выключена или
+    # кусок пришёл из варианта). Нужен, чтобы показать принятое без полного
+    # прохождения аудио как непроверенное, а не как обычное.
+    qa: list[QaOutcome | None] = field(default_factory=list, repr=False)
     # Варианты кусков: индекс реплики → список вариантов, от старых к новым.
     # Наличие варианта — это и есть история: без него перегенерация означала бы
     # «потерять то, что было», и сравнивать новое на слух было бы не с чем.
@@ -238,6 +248,20 @@ class JobQueue:
                     return variant.seed
         return job.seeds[index] if index < len(job.seeds) else None
 
+    def active_qa(self, job: Job, index: int) -> QaOutcome | None:
+        """Итог строгой проверки куска, который сейчас стоит в файле.
+
+        У варианта — его собственная отметка: варианты генерировались в разное
+        время и с разным результатом проверки, и после выбора варианта у реплики
+        должна показываться отметка именно выбранного аудио.
+        """
+        active = job.active_variant.get(index)
+        if active is not None:
+            for variant in job.variants.get(index, []):
+                if variant.id == active:
+                    return variant.qa
+        return job.qa[index] if index < len(job.qa) else None
+
     def _ready_job(self, job_id: str) -> tuple[Job, "JobPayload"]:
         """Готовая к пересборке задача и её данные; всё остальное — ошибка запроса."""
         job = self._jobs.get(job_id)
@@ -331,6 +355,8 @@ class JobQueue:
                 settings=payload.settings,
                 on_progress=self._progress_callback(job),
                 should_abort=lambda: self._abort_requested,
+                wait_for_memory=lambda: self._wait_for_memory(job.id),
+                on_note=self._note_callback(job),
             )
             job.status = JobStatus.DONE
             job.output_path = result.output_path
@@ -339,6 +365,7 @@ class JobQueue:
             job.payload = payload
             job.segments = result.segments
             job.seeds = result.seeds
+            job.qa = result.qa
             job.current_replica = job.total_replicas
             job.eta_sec = 0.0
             job.message = f"Готово: {result.duration_sec:.1f} c аудио"
@@ -380,13 +407,15 @@ class JobQueue:
             if speaker is None:
                 raise ValueError(f"Для «{replica.label}» не найден голос")
             await self._keep_current(job, task.index, job.payload.settings, job.output_path)
-            prepared, seed = await audio_pipeline.synthesize_replica(
+            prepared, seed, qa_outcome = await audio_pipeline.synthesize_replica(
                 replica=replica,
                 speaker=speaker,
                 settings=job.payload.settings,
                 index=task.index,
+                wait_for_memory=lambda: self._wait_for_memory(job.id),
+                on_note=self._note_callback(job),
             )
-            variant = await self._add_variant(job, task.index, prepared, seed)
+            variant = await self._add_variant(job, task.index, prepared, seed, qa_outcome)
             duration, bounds = await audio_pipeline.apply_variant(
                 source_path=job.output_path,
                 settings=job.payload.settings,
@@ -464,18 +493,24 @@ class JobQueue:
         variant = await asyncio.to_thread(
             audio_pipeline.save_chunk_variant,
             job.id, index, "v0", chunk, self.active_seed(job, index), "исходный",
+            self.active_qa(job, index),
         )
         job.variants[index] = [variant]
         job.active_variant[index] = variant.id
 
     async def _add_variant(
-        self, job: Job, index: int, chunk: np.ndarray, seed: int | None
+        self,
+        job: Job,
+        index: int,
+        chunk: np.ndarray,
+        seed: int | None,
+        qa: QaOutcome | None = None,
     ) -> audio_pipeline.ChunkVariant:
         """Добавляет новый вариант куска и делает его текущим."""
         seq = self._take_seq(job, index)
         variant = await asyncio.to_thread(
             audio_pipeline.save_chunk_variant,
-            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}",
+            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}", qa,
         )
         job.variants.setdefault(index, []).append(variant)
         job.active_variant[index] = variant.id
@@ -548,6 +583,20 @@ class JobQueue:
             job.message = f"Реплика {index} из {total} — {label}"
 
         return on_progress
+
+    @staticmethod
+    def _note_callback(job: Job) -> NoteCallback:
+        """Ход строгой проверки — в то же сообщение задачи, что и прогресс.
+
+        Отдельного поля нет намеренно: это не состояние задачи, а пояснение к
+        текущему шагу («попытка 2 из 4»), и рядом с «Реплика 3 из 10» оно читается
+        ровно так же, как остальные сообщения воркера.
+        """
+
+        def on_note(text: str) -> None:
+            job.message = text
+
+        return on_note
 
     def request_abort(self, reason: str) -> str | None:
         """Прервать текущую задачу между кусками (использует ResourceGuard).

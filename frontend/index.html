@@ -9,6 +9,7 @@
 <body>
 <div class="studio-shell">
 
+<div class="sticky-head">
 <header class="topbar">
   <div class="brand">
     <span class="brand-mark"><span></span><span></span><span></span><span></span><span></span></span>
@@ -48,6 +49,7 @@
   <button class="tab" data-tab="dialogue"><span>02</span>Озвучка диалога</button>
   <button class="tab" data-tab="text"><span>03</span>Сплошной текст</button>
 </nav>
+</div>
 
 <!-- Вкладка 1: голоса -->
 <main class="tab-panel" id="tab-voices">
@@ -71,7 +73,7 @@
         </div>
         <div class="panel-body">
           <div class="subheading">
-            <span>ПРЕСЕТЫ</span>
+            <span>СПИСОК</span>
             <button class="tiny ghost" id="btn-reload-voices">обновить</button>
           </div>
           <div id="voice-cards"></div>
@@ -250,8 +252,18 @@
               </select>
             </label>
           </div>
+          <label class="toggle">
+            <input type="checkbox" id="qa" />
+            Строгая проверка реплик (медленнее)
+          </label>
+          <p class="hint muted">
+            Каждый кусок распознаётся Whisper'ом и при расхождении с исходным текстом
+            синтезируется заново — до 4 попыток или 5 минут на кусок. Проверка поднимает
+            отдельный процесс Whisper (~1.6 ГБ), поэтому сборка идёт заметно дольше и
+            может подолгу ждать освобождения памяти.
+          </p>
           <label class="field" style="margin-top: 12px">
-            <span>Нарезка длинных реплик</span>
+            <span>Нарезка на куски</span>
             <select id="chunk-strategy">
               <option value="paragraph">абзацы — до 600 знаков</option>
               <option value="short">короткие фразы — до 200 знаков</option>
@@ -398,8 +410,18 @@
               </select>
             </label>
           </div>
+          <label class="toggle">
+            <input type="checkbox" id="text-qa" />
+            Строгая проверка кусков (медленнее)
+          </label>
+          <p class="hint muted">
+            Каждый кусок распознаётся Whisper'ом и при расхождении с исходным текстом
+            синтезируется заново — до 4 попыток или 5 минут на кусок. Проверка поднимает
+            отдельный процесс Whisper (~1.6 ГБ), поэтому озвучка идёт заметно дольше и
+            может подолгу ждать освобождения памяти.
+          </p>
           <label class="field" style="margin-top: 12px">
-            <span>Нарезка текста на куски</span>
+            <span>Нарезка на куски</span>
             <select id="text-chunk-strategy">
               <option value="paragraph">абзацы — до 600 знаков</option>
               <option value="short">короткие фразы — до 200 знаков</option>
@@ -484,6 +506,7 @@
           <div class="progress"><div id="text-progress-bar"></div></div>
           <span class="muted job-line" id="text-job-status">—</span>
           <div class="alert error" id="text-job-error"></div>
+          <p class="hint muted" id="text-job-note" hidden></p>
           <audio id="text-player" controls hidden></audio>
           <div class="row" style="margin-top: 12px">
             <a id="text-download-link" class="muted" href="#" download hidden>скачать файл</a>

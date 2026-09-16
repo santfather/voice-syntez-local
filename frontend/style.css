@@ -45,10 +45,16 @@ button { cursor: pointer; }
 }
 
 /* --- шапка -------------------------------------------------------------------- */
-.topbar {
+/* Шапка и вкладки липнут вместе: высота шапки меняется (на узком окне чипы
+   переносятся на вторую строку), поэтому `top` для вкладок не задаётся числом —
+   его считает сам контейнер. */
+.sticky-head {
   position: sticky;
   top: 0;
   z-index: 5;
+}
+
+.topbar {
   display: flex;
   align-items: center;
   gap: 26px;
@@ -126,6 +132,8 @@ button { cursor: pointer; }
   height: 58px;
   padding: 0 34px;
   border-bottom: 1px solid var(--line);
+  background: #0d0d10dd;
+  backdrop-filter: blur(16px);
 }
 
 .tab {
@@ -467,6 +475,7 @@ button.danger:hover:not(:disabled) { border-color: var(--pink); color: var(--pin
 .row.between { justify-content: space-between; }
 .muted { color: var(--muted); font-size: 11px; }
 .muted.err { color: #ffb3d1; }
+.muted.warn { color: var(--amber); }
 .hint { margin: 10px 0 0; line-height: 1.75; }
 code {
   padding: 1px 4px;
@@ -546,6 +555,8 @@ audio { width: 100%; margin-top: 12px; }
 .replica-label { flex: 0 0 auto; min-width: 60px; color: var(--muted); font: 9px var(--mono); letter-spacing: 0.06em; }
 .replica-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b9b7c0; }
 .replica-seed { flex: 0 0 auto; font: 9px var(--mono); }
+/* Отметка строгой проверки: те же габариты, что у сида, но цвет — из .muted.warn. */
+.replica-qa { flex: 0 0 auto; font: 9px var(--mono); }
 .replica-row button { flex: 0 0 auto; }
 
 /* Варианты реплики: сдвинуты вправо и приглушены — это история одного куска,

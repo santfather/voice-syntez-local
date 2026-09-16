@@ -1,9 +1,15 @@
-"""Расшифровка референс-аудио и сверка её с текстом, который ввёл пользователь.
+"""Расшифровка аудио и сверка её с ожидаемым текстом.
 
-F5-TTS выравнивает синтез по паре «референс-аудио + его дословная расшифровка».
-Если текст не совпадает с записью, модель «плывёт»: тянет длительность, добавляет
-лишние слова, ломает интонацию — вплоть до неразборчивой каши. Проверка ниже
-ловит такой рассинхрон (см. `check_ref_text_match`).
+Основное назначение — референс-аудио голоса. F5-TTS выравнивает синтез по паре
+«референс-аудио + его дословная расшифровка». Если текст не совпадает с записью,
+модель «плывёт»: тянет длительность, добавляет лишние слова, ломает интонацию —
+вплоть до неразборчивой каши. Проверка ниже ловит такой рассинхрон
+(см. `check_ref_text_match`).
+
+Второе назначение — готовый результат синтеза (строгая проверка куска, Фаза 7):
+там расшифровка нужна не для модели, а для ответа на вопрос «модель вообще
+сказала то, что просили». Порог для этого случая другой и живёт в конфиге
+(`config.QA_WER_THRESHOLD`), а не здесь: см. `word_error_rate`.
 
 Само распознавание выполняется в отдельном процессе (`transcribe_worker`), потому
 что Whisper large-v3-turbo не помещается в бюджет памяти основного процесса.
@@ -25,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 WORKER_MODULE = "backend.transcribe_worker"
 WORKER_TIMEOUT_SEC = float(os.environ.get("TTS_ASR_TIMEOUT_SEC", "900"))
+# Режим «расшифровать файл целиком»: без него воркер режет запись так же, как
+# референс для модели (первые ~12 секунд).
+WORKER_FULL_FLAG = "--full"
 
 # Ниже этой доли совпавших слов считаем, что расшифровка от другой записи.
 MATCH_THRESHOLD = 0.6
@@ -39,9 +48,11 @@ class Transcription:
     full_sec: float  # длительность исходного файла
 
 
-def transcribe_file(audio_path: Path) -> Transcription:
-    """Распознаёт речь в записи; режет её так же, как это делает синтез."""
+def _run_worker(audio_path: Path, full: bool) -> Transcription:
+    """Запускает воркер распознавания и разбирает его ответ."""
     command = [sys.executable, "-m", WORKER_MODULE, str(audio_path)]
+    if full:
+        command.append(WORKER_FULL_FLAG)
     try:
         proc = subprocess.run(
             command,
@@ -69,9 +80,68 @@ def transcribe_file(audio_path: Path) -> Transcription:
         raise RuntimeError("распознавание вернуло неожиданный ответ") from exc
 
 
+def transcribe_file(audio_path: Path) -> Transcription:
+    """Распознаёт речь в записи; режет её так же, как это делает синтез."""
+    return _run_worker(audio_path, full=False)
+
+
+def transcribe_audio(audio_path: Path) -> str:
+    """Распознаёт запись целиком — без обрезки под референс.
+
+    Нужно строгой проверке синтеза: проверяемый кусок бывает длиннее 12 секунд, а
+    обрезка референса оставила бы от него только начало, и расхождение в хвосте
+    осталось бы незамеченным.
+    """
+    return _run_worker(audio_path, full=True).ref_text
+
+
 def _words(text: str) -> list[str]:
     """Слова в нижнем регистре: пунктуация и знаки ударения (`+`) не в счёт."""
     return _WORD_RE.findall(text.lower())
+
+
+def _matched_words(text: str) -> list[str]:
+    """Слова для сверки результата синтеза: «ё» и «е» считаются одним словом.
+
+    Whisper пишет «е» там, где в исходном тексте «ё» (и наоборот). На строгом
+    пороге проверки результата это давало бы провал на ровном месте, тогда как на
+    слух и по смыслу слово то же.
+    """
+    return [word.replace("ё", "е") for word in _words(text)]
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    """Доля ошибочных слов (0..1): замена, пропуск и вставка весят одинаково.
+
+    Своё расстояние Левенштейна по словам, а не `SequenceMatcher`: тот считает
+    длину совпавших блоков и на перестановках завышает ошибку почти вдвое («а, б,
+    в» против «в, б, а» — это две замены, а не четыре). Для сверки референса, где
+    важно «текст вообще от этой записи или от другой», такая разница не значит
+    ничего, а для приёмки готового куска решает, повторять синтез или нет.
+
+    Пустая расшифровка даёт 1.0: молчание модели — это провал проверки, а не
+    «сверять нечего».
+    """
+    expected = _matched_words(reference)
+    if not expected:
+        return 0.0
+    actual = _matched_words(hypothesis)
+    # Одна строка на память вместо матрицы: кусок — это десятки слов, но цикл
+    # вызывается на каждой попытке каждой реплики.
+    previous = list(range(len(actual) + 1))
+    for row, expected_word in enumerate(expected, start=1):
+        current = [row]
+        for column, actual_word in enumerate(actual, start=1):
+            cost = 0 if expected_word == actual_word else 1
+            current.append(
+                min(
+                    previous[column] + 1,  # лишнее слово в расшифровке
+                    current[column - 1] + 1,  # пропущенное слово
+                    previous[column - 1] + cost,  # замена
+                )
+            )
+        previous = current
+    return previous[-1] / len(expected)
 
 
 def similarity(declared: str, recognized: str) -> float:

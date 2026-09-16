@@ -7,7 +7,7 @@ import time
 import httpx
 import pytest
 
-from backend import config, main
+from backend import audio_pipeline, config, main
 from backend.job_queue import JobQueue
 
 DIALOGUE = "ИВАН: Первая реплика.\nМАРГО: Вторая реплика."
@@ -121,6 +121,8 @@ def test_job_flow_with_variant_history(stub, fake_store, monkeypatch):
             assert len(data["replicas"]) == 2
             assert all(isinstance(replica["seed"], int) for replica in data["replicas"])
             assert all(replica["variants"] == [] for replica in data["replicas"])
+            # Без тумблера строгой проверки отметок нет: это и есть поведение по умолчанию.
+            assert all(replica["qa"] is None for replica in data["replicas"])
 
             regenerate = await client.post(f"/api/jobs/{job_id}/replicas/0/regenerate")
             assert regenerate.status_code == 202
@@ -161,6 +163,24 @@ def test_job_flow_with_variant_history(stub, fake_store, monkeypatch):
             audio = await client.get(f"/api/jobs/{job_id}/audio")
             assert audio.status_code == 200
             assert audio.headers["content-type"] == "audio/wav"
+
+    _run(scenario)
+
+
+def test_generate_with_qa_reports_status_per_replica(stub, fake_store, monkeypatch):
+    async def scenario():
+        # Реплики синтезируются по очереди, поэтому расшифровки идут в том же порядке.
+        answers = iter(["Первая реплика", "Вторая реплика"])
+
+        async def fake(chunk):
+            return next(answers, "")
+
+        monkeypatch.setattr(audio_pipeline, "_transcribe_chunk", fake)
+        async with _client(monkeypatch) as (client, _queue):
+            job_id = await _generate(client, qa=True)
+            data = await _wait(client, job_id, lambda item: item["status"] == "done")
+            assert [replica["qa"]["status"] for replica in data["replicas"]] == ["passed", "passed"]
+            assert [replica["qa"]["attempts"] for replica in data["replicas"]] == [1, 1]
 
     _run(scenario)
 
