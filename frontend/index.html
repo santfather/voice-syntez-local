@@ -197,6 +197,22 @@
           </div>
         </div>
         <div class="panel-body">
+          <!-- Таймлайн читает готовый файл как дорожку: сегменты стоят там, где
+               реплики реально звучат, и клик по сегменту открывает её карточку. -->
+          <div class="timeline">
+            <div class="row between timeline-head">
+              <span class="muted">Таймлайн по реальным длительностям take'ов</span>
+              <span class="row">
+                <span class="muted" id="timeline-duration">—</span>
+                <button class="tiny ghost" id="timeline-refresh" title="перечитать длительности">обновить</button>
+              </span>
+            </div>
+            <div class="timeline-body" id="timeline-body">
+              <span class="muted">Разберите текст — таймлайн покажет, где какая реплика звучит.</span>
+            </div>
+            <div class="alert error" id="timeline-error"></div>
+          </div>
+
           <div class="view-switch" role="tablist">
             <button class="tiny ghost active" data-view="visual" role="tab">Visual editor</button>
             <button class="tiny ghost" data-view="source" role="tab">Source / Advanced</button>

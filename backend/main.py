@@ -25,6 +25,7 @@ from . import (
     engine_lifecycle,
     model_manager,
     resource_guard,
+    timeline,
     transcribe,
 )
 from .accentizer import Accentizer
@@ -1387,11 +1388,13 @@ def _resolved_voice(voice_id: str, voices: dict) -> Voice | None:
 
     `voices.json` читается целиком на каждый `get`, поэтому в ответе про проект
     с десятками реплик голос берётся один раз: кэш живёт внутри сборки ответа.
+    Хранилище берётся из пайплайна: это тот же голос, которым читается кусок, и
+    второй путь к нему разошёлся бы с тем, что уходит в модель.
     """
     if not voice_id:
         return None
     if voice_id not in voices:
-        voices[voice_id] = get_store().get(voice_id)
+        voices[voice_id] = audio_pipeline.get_store().get(voice_id)
     return voices[voice_id]
 
 
@@ -1466,6 +1469,8 @@ def _replica_payload(project: dict, index: int, voices: dict | None = None) -> d
     Отдельно от сырой строки базы: интерфейсу нужно то, что в базе не хранится, —
     движок эффективного голоса, голос спикера (к чему вернёт сброс) и источники
     значений параметров, по которым видно, что унаследовано, а что перекрыто.
+    Эту же форму отдаёт таймлайн: инспектор сегмента — карточка реплики, и второй
+    сборки её полей быть не должно.
     """
     replica = _replica_or_404(project, index)
     speaker = next(
@@ -1501,6 +1506,57 @@ def _replica_render_settings(project: dict) -> RenderSettings:
     """
     settings, _ = _resolved_render_settings(project, ProjectRenderRequest())
     return settings
+
+
+def _timeline_payload(project: dict) -> dict:
+    """Таймлайн проекта: границы реплик по реальным длительностям активных take'ов.
+
+    Ничего не синтезирует и не меняет: длительности уже лежат в базе вместе с
+    take'ами, а границы считаются на каждый запрос (`backend/timeline.py`). Так
+    замена take пересчитывает хвост сама собой — хранить start/end в базе значило
+    бы держать вторую правду, которая разойдётся с собранным файлом.
+
+    Настройки берутся сохранённые в проекте (`_replica_render_settings`): ровно
+    те, которыми будет собран файл, а не дефолты. Сегменты — карточки реплик в
+    той же форме, что у `GET /api/projects/{id}`: инспектор таймлайна переиспользует
+    карточку реплики, а не собирает её заново.
+    """
+    voices: dict = {}
+    render = _replica_render_settings(project)
+    timings = timeline.replica_timings(
+        project["replicas"],
+        render,
+        speakers=timeline.speaker_pause_overrides(project["speakers"]),
+    )
+    return {
+        "project_id": project["id"],
+        **timeline.timeline_view(
+            [
+                {
+                    "key": speaker["key"],
+                    "label": speaker.get("label") or speaker["key"],
+                    "voice_id": speaker.get("voice_id") or "",
+                    "voice_name": _voice_name(speaker.get("voice_id"), voices),
+                }
+                for speaker in project["speakers"]
+            ],
+            lambda index: _replica_payload(project, index, voices),
+            timings,
+            render,
+            timeline.timeline_duration(timings),
+        ),
+    }
+
+
+def _voice_name(voice_id: str | None, voices: dict) -> str:
+    """Имя голоса для дорожки спикера; пустой голос — пустая подпись.
+
+    Через `_resolved_voice` (то же хранилище, что у движка и настроек реплики):
+    читать `voices.json` своим способом означало бы, что «не выбран» на таймлайне
+    выглядит по-разному при разных путях к голосу.
+    """
+    voice = _resolved_voice(str(voice_id or ""), voices)
+    return voice.name if voice is not None else ""
 
 
 @app.post("/api/projects", status_code=201)
@@ -1542,6 +1598,17 @@ async def update_project(project_id: str, payload: ProjectUpdateRequest) -> dict
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _project_payload(project)
+
+
+@app.get("/api/projects/{project_id}/timeline")
+async def project_timeline(project_id: str) -> dict:
+    """Таймлайн проекта: где какая реплика звучит, по реальным длительностям take'ов.
+
+    Только чтение: ни синтеза, ни записи. Границы считаются при каждом запросе,
+    поэтому замена take (или выбор другого take) сразу пересчитывает хвост — в
+    ответе видно и новые границы, и новый активный take каждого сегмента.
+    """
+    return _timeline_payload(_project_or_404(project_id))
 
 
 @app.delete("/api/projects/{project_id}")

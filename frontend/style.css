@@ -624,6 +624,53 @@ audio { width: 100%; margin-top: 12px; }
 /* Пока реплика синтезируется, карточка не должна выглядеть готовой к правкам. */
 .replica-card.busy { opacity: 0.6; }
 
+/* --- таймлайн проекта --------------------------------------------------------- */
+/* Дорожка — общая шкала: сегменты соседних спикеров стоят друг под другом, а
+   соответствие клипа и реплики видно по left/width в пикселях. Длинный трек
+   прокручивается по горизонтали, а не сжимается в нечитаемую полосу. */
+.timeline { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.timeline-head { margin-bottom: 8px; }
+.timeline-head .muted { font: 9px var(--mono); letter-spacing: 0.06em; }
+.timeline-body { overflow-x: auto; padding-bottom: 4px; }
+.timeline-axis { position: relative; height: 15px; margin-left: 86px; border-bottom: 1px solid var(--line); }
+.timeline-tick {
+  position: absolute; bottom: 2px; padding-left: 4px;
+  border-left: 1px solid var(--line-2);
+  color: var(--muted-2); font: 8px var(--mono); white-space: nowrap;
+}
+.timeline-lane { display: flex; align-items: center; gap: 0; min-height: 30px; }
+.timeline-name {
+  flex: 0 0 auto; width: 86px; padding-right: 8px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: #b9b7c0; font: 9px var(--mono); letter-spacing: 0.06em;
+}
+.timeline-track {
+  position: relative; flex: 0 0 auto; min-height: 26px; min-width: 240px;
+  border-left: 1px solid var(--line-2);
+  background: repeating-linear-gradient(90deg, #14141a 0 1px, transparent 1px 40px);
+}
+.timeline-block {
+  position: absolute; top: 3px; height: 20px; min-width: 6px;
+  padding: 0 4px; overflow: hidden; cursor: pointer;
+  border: 1px solid #607b28; border-radius: 3px;
+  background: #202a12; color: var(--lime);
+  font: 700 9px var(--mono); line-height: 18px; text-align: left;
+}
+.timeline-block.alt { border-color: #7454b2; background: #211a33; color: #cbb9ff; }
+.timeline-block:hover { filter: brightness(1.35); }
+.timeline-block b { font-weight: 700; }
+.timeline-block i { margin-left: 5px; color: #d8a6b8; font-style: normal; font-weight: 400; }
+/* Реплика без готового звука: место видно, но клип пустой и штрихованный —
+   именно за него и надо взяться, чтобы сгенерировать реплику. */
+.timeline-block.no-audio {
+  border-style: dashed; border-color: #6b4a1e;
+  background: #1d1710; color: var(--amber);
+}
+.timeline-lane-empty { font: 9px var(--mono); }
+/* Карточка, к которой привёл клик по сегменту: подсветка гаснет сама, чтобы не
+   спорить с остальной разметкой редактора. */
+.replica-card.inspected { border-color: var(--lime); box-shadow: 0 0 0 1px #b9f22755, 0 16px 40px #0005; }
+
 /* --- «что услышит модель» ----------------------------------------------------- */
 /* Стадии идут одна под другой: это последовательность, а не набор равнозначных
    блоков, и разделять их отступами важнее, чем экономить высоту. */
