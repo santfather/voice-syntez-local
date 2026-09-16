@@ -25,7 +25,9 @@ from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
 from .engines.base import ENGINE_F5, ENGINE_INFOS
 from .engines.registry import created_engines, get_engine
 from .job_queue import Job, JobPayload, JobStatus, get_queue
+from .pronunciation import PronunciationConflict, get_store as get_pronunciation_store
 from .resource_guard import ResourceGuard
+from .text_normalization import normalize, normalize_report
 from .voices_store import ALLOWED_AUDIO_SUFFIXES, MAX_AUDIO_BYTES, Voice, get_store
 
 logging.basicConfig(
@@ -587,6 +589,118 @@ async def update_voice(voice_id: str, payload: VoiceEngineUpdate) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return voice.to_dict()
+
+
+class PronunciationEntryRequest(BaseModel):
+    """Новое правило словаря произношения.
+
+    Повторное добавление того же источника (с тем же режимом регистра) обновляет
+    правило: пользователь, дважды отправивший форму, ждёт исправленную замену, а не
+    409. Так же ведёт себя и импорт словаря из внешнего скрипта.
+    """
+
+    source: str
+    target: str
+    case_sensitive: bool = False
+    whole_word: bool = True
+    enabled: bool = True
+    note: str = ""
+
+
+class PronunciationUpdateRequest(BaseModel):
+    """Правка правила: непришедшее поле значит «не трогать»."""
+
+    source: str | None = None
+    target: str | None = None
+    case_sensitive: bool | None = None
+    whole_word: bool | None = None
+    enabled: bool | None = None
+    note: str | None = None
+
+
+class PronunciationPreviewRequest(BaseModel):
+    """Проверка текста словарём. `engine` необязателен и не поднимает модель."""
+
+    text: str
+    engine: str | None = None
+
+
+@app.get("/api/pronunciation")
+async def list_pronunciation() -> dict:
+    """Правила словаря целиком, включая выключенные: интерфейс показывает и их."""
+    entries = get_pronunciation_store().list_entries()
+    return {"entries": entries, "count": len(entries)}
+
+
+@app.post("/api/pronunciation", status_code=201)
+async def create_pronunciation(payload: PronunciationEntryRequest) -> dict:
+    """Добавляет правило; если источник уже есть — обновляет его, а не плодит дубли."""
+    try:
+        return get_pronunciation_store().create(
+            source=payload.source,
+            target=payload.target,
+            case_sensitive=payload.case_sensitive,
+            whole_word=payload.whole_word,
+            enabled=payload.enabled,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/pronunciation/{entry_id}")
+async def update_pronunciation(entry_id: int, payload: PronunciationUpdateRequest) -> dict:
+    """Меняет поля правила, в том числе `enabled`, не удаляя его из словаря."""
+    try:
+        return get_pronunciation_store().update(
+            entry_id, **payload.model_dump(exclude_unset=True)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Правило словаря не найдено") from exc
+    except PronunciationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/pronunciation/{entry_id}")
+async def delete_pronunciation(entry_id: int) -> dict:
+    if not get_pronunciation_store().delete(entry_id):
+        raise HTTPException(status_code=404, detail="Правило словаря не найдено")
+    return {"deleted": entry_id}
+
+
+@app.post("/api/pronunciation/preview")
+async def preview_pronunciation(payload: PronunciationPreviewRequest) -> dict:
+    """Показывает стадии обработки текста: нормализация → словарь → движок.
+
+    Ничего не пишет в базу и не поднимает TTS-движок: `engine` нужен только для
+    флага `supports_accents` из паспорта, а не для синтеза. `matches` — какие
+    правила сработали и сколько раз.
+    """
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой текст для проверки")
+    if len(text) > config.MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Текст длиннее {config.MAX_TEXT_CHARS} символов — сократите его",
+        )
+    supports_accents = True
+    if payload.engine:
+        info = ENGINE_INFOS.get(payload.engine)
+        if info is None:
+            known = ", ".join(sorted(ENGINE_INFOS))
+            raise HTTPException(
+                status_code=400,
+                detail=f"Неизвестный движок: {payload.engine}. Доступны: {known}",
+            )
+        supports_accents = info.supports_accents
+
+    entries = get_pronunciation_store().active_rules()
+    normalized = normalize(text)
+    result, matches = normalize_report(text, entries, supports_accents=supports_accents)
+    return {"original": text, "normalized": normalized, "result": result, "matches": matches}
 
 
 @app.post("/api/preview", status_code=202)

@@ -19,6 +19,7 @@ from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
 from .engines.registry import get_engine
+from .pronunciation import active_rules
 from .settings_resolution import (
     COMMON_FIELDS,
     effective_values,
@@ -434,12 +435,21 @@ def _engine_for(voice: Voice) -> SynthesisEngine:
 def _text_for_engine(text: str, engine: SynthesisEngine, auto_accent: bool) -> str:
     """Готовит текст куска к отправке в модель.
 
-    Порядок важен: сначала числа и латиница (`text_preprocess`), потом ударения.
-    RUAccent ставит «+» перед гласной, и на развёрнутых числах он тоже должен
-    отработать — иначе «две тысячи двадцать шестом» уйдёт без разметки. Ударения
-    при этом остаются только у F5: XTTS знак «+» читает как отдельный символ.
+    Порядок важен и повторяет план фазы 6: нормализация → пользовательский словарь
+    → RUAccent. Правила словаря берутся из сервиса (снимок в памяти, не чтение базы
+    на каждый кусок), а флаг `supports_accents` решает, дойдут ли «+» из замены до
+    движка: XTTS прочитал бы знак как отдельный символ, поэтому для неё словарь
+    отдаёт замену без разметки.
+
+    RUAccent по-прежнему получает уже развёрнутые числа: «12» должно стать
+    «двена́дцать», а не остаться цифрами. Ударения — только у движков, которые их
+    понимают (`supports_accents`).
     """
-    prepared = normalize(text)
+    prepared = normalize(
+        text,
+        pronunciation=active_rules(),
+        supports_accents=engine.supports_accents,
+    )
     if auto_accent and engine.supports_accents:
         return accentuate(prepared)
     return prepared
@@ -635,11 +645,23 @@ async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
     синтезом: Whisper пишет числа цифрами («2026»), а в модель ушло «две тысячи
     двадцать шестом» — без общего шага они расходились бы в каждом числе, и
     проверка валилась бы на ровном месте.
+
+    Словарь произношения применяется к **обеим** сторонам. Модель произносит
+    замену («SQL» → «эскьюэль»), и Whisper запишет именно её; если reference
+    оставить без словаря, каждая такая реплика выглядела бы ошибкой — WER 0.75
+    при пороге 0.2, лишние попытки и лишний запуск Whisper на ровном месте.
+    Обратная сторона той же монеты: Whisper иногда пишет услышанное как «SQL»,
+    и тогда словарь нужен уже расшифровке. Один шаг на оба текста закрывает оба
+    случая — ровно так же, как `normalize` закрывает числа.
     """
     recognized = await _transcribe_chunk(chunk)
     if not recognized.strip():
         return 1.0  # модель промолчала — это провал проверки, а не «сверять нечего»
-    return word_error_rate(normalize(expected), normalize(recognized))
+    rules = active_rules()
+    return word_error_rate(
+        normalize(expected, pronunciation=rules, supports_accents=False),
+        normalize(recognized, pronunciation=rules, supports_accents=False),
+    )
 
 
 async def _synthesize_checked(

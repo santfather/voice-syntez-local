@@ -84,7 +84,32 @@ _MIGRATION_2 = """
 ALTER TABLE replicas ADD COLUMN voice_override TEXT;
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _MIGRATION_1), (2, _MIGRATION_2))
+# Словарь произношения. Хранится глобально, без привязки к проекту: правило
+# «SQL читается как эскьюэль» пользователь задаёт один раз и ожидает его во всех
+# диалогах сразу. Уникальность по источнику и режиму регистра — это то, по чему
+# повторное добавление обновляет правило, а не плодит дубли (см. pronunciation.py).
+_MIGRATION_3 = """
+CREATE TABLE IF NOT EXISTS pronunciation_entries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    source         TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    case_sensitive INTEGER NOT NULL DEFAULT 0,
+    whole_word     INTEGER NOT NULL DEFAULT 1,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE (source, case_sensitive)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pronunciation_enabled ON pronunciation_entries(enabled);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (1, _MIGRATION_1),
+    (2, _MIGRATION_2),
+    (3, _MIGRATION_3),
+)
 
 
 def apply_migrations(connection: sqlite3.Connection) -> int:

@@ -15,8 +15,19 @@
    и не оказалось датой, остаётся как есть.
 7. Знак номера, диапазоны, деньги, единицы — до общих чисел, иначе число
    прочитается само, а существительное после него останется без согласования.
-8. Общие числа, сокращения, латиница — по остаточному принципу.
-9. Словарь произношения (пока no-op) — последним, уже по готовому тексту.
+8. Общие числа и сокращения — по остаточному принципу.
+9. Словарь произношения — до латиницы и до возврата технических строк. Числа и
+   сокращения к этому моменту уже развёрнуты, поэтому правило видит готовое
+   слово; а латиница ещё не прочитана по буквам, поэтому пользователь может
+   переопределить чтение аббревиатуры («SQL»), которое шаг латиницы иначе сделал
+   бы сам. Технические строки спрятаны в плейсхолдеры — правило не перепишет URL
+   или версию случайно.
+10. Латиница — последней: она читает то, что осталось латинским, включая
+    латиницу внутри замены словаря.
+
+Дополнительно словарь умеет вычитать ударения для движков, которые знак «+» не
+понимают (`supports_accents=False`). Нормализация об этом не знает: она лишь
+передаёт флаг в шаг словаря.
 
 Плейсхолдеры — символы из области для приватного использования: они не цифры,
 не латиница и не кириллица, поэтому ни один шаблон их не видит. Так защита не
@@ -26,7 +37,8 @@
 import logging
 import re
 
-from . import abbreviations, dates, latin, money, numbers, pronunciation, time, units
+from . import abbreviations, dates, latin, money, numbers, time, units
+from .pronunciation import PronunciationEntries, apply_pronunciation_report
 
 logger = logging.getLogger(__name__)
 
@@ -95,15 +107,14 @@ def _protect_first(text: str, protector: Protector) -> str:
     return text
 
 
-def normalize(text: str) -> str:
-    """Готовит текст реплики к отправке в модель.
-
-    Идемпотентна: после шага в тексте не остаётся ни цифр, требующих чтения, ни
-    разобранных сокращений, а защищённые URL, email, версии и IP возвращаются в
-    исходном виде — повторный проход ничего не меняет.
-    """
+def _normalize(
+    text: str,
+    pronunciation: PronunciationEntries,
+    supports_accents: bool,
+) -> tuple[str, list[dict]]:
+    """Общий проход нормализации: возвращает готовый текст и отчёт словаря."""
     if not text:
-        return text
+        return text, []
 
     protector = Protector()
     result = _protect_first(text, protector)
@@ -118,10 +129,43 @@ def normalize(text: str) -> str:
     result = units.expand_units(result)
     result = numbers.expand_numbers(result)
     result = abbreviations.expand_abbreviations(result)
+    result, matches = apply_pronunciation_report(
+        result, pronunciation, supports_accents=supports_accents
+    )
     result = latin.expand_latin(result)
-    result = pronunciation.apply_pronunciation(result)
     result = protector.restore(result)
 
     if result != text:
         logger.info("Текст до модели: «%s» → «%s»", text[:120], result[:120])
-    return result
+    return result, matches
+
+
+def normalize(
+    text: str,
+    pronunciation: PronunciationEntries = None,
+    supports_accents: bool = True,
+) -> str:
+    """Готовит текст реплики к отправке в модель.
+
+    Идемпотентна: после шага в тексте не остаётся ни цифр, требующих чтения, ни
+    разобранных сокращений, а защищённые URL, email, версии и IP возвращаются в
+    исходном виде — повторный проход ничего не меняет.
+
+    `pronunciation` — правила словаря произношения (или устаревший словарь замен),
+    `supports_accents` — понимает ли движок знак «+». Оба параметра необязательны:
+    вызов `normalize(text)` работает как раньше.
+    """
+    return _normalize(text, pronunciation, supports_accents)[0]
+
+
+def normalize_report(
+    text: str,
+    pronunciation: PronunciationEntries = None,
+    supports_accents: bool = True,
+) -> tuple[str, list[dict]]:
+    """Как `normalize`, но вместе с отчётом словаря — для preview «что услышит модель».
+
+    Отчёт считается в том же проходе, что и результат: preview не может показать
+    одно, а синтез получить другое.
+    """
+    return _normalize(text, pronunciation, supports_accents)

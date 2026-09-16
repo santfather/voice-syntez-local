@@ -20,12 +20,13 @@ from .numbers import (
     expand_phones,
     expand_roman,
 )
-from .pipeline import normalize
-from .pronunciation import apply_pronunciation
+from .pipeline import normalize, normalize_report
+from .pronunciation import PronunciationRule, apply_pronunciation
 
 __all__ = [
     "YEAR_CASE_BY_TAIL",
     "YEAR_RANGE",
+    "PronunciationRule",
     "agree",
     "agree_decimal",
     "apply_pronunciation",
@@ -34,6 +35,7 @@ __all__ = [
     "expand_phones",
     "expand_roman",
     "normalize",
+    "normalize_report",
     "numeral_case",
     "ordinal",
     "plural_form",

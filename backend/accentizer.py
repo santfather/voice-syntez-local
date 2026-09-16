@@ -13,6 +13,22 @@ logger = logging.getLogger(__name__)
 # Уже расставленное пользователем ударение: "+" перед гласной (формат F5-TTS_RUSSIAN).
 _MANUAL_STRESS_RE = re.compile(r"\+[аеёиоуыэюяАЕЁИОУЫЭЮЯaeiouyAEIOUY]")
 
+
+def _tokens(text: str) -> list[str]:
+    """Текст, разбитый на слова и пробелы: разделитель с группой сохраняет пробелы."""
+    return re.split(r"(\s+)", text)
+
+
+def _is_manual(token: str) -> bool:
+    """Слово, ударение в котором уже расставлено вручную."""
+    return bool(token) and not token.isspace() and _MANUAL_STRESS_RE.search(token) is not None
+
+
+def _needs_accentuation(text: str) -> bool:
+    """Есть ли в тексте слово без ручного ударения — то, ради чего грузить модель."""
+    return any(not _is_manual(token) and token.strip() for token in _tokens(text))
+
+
 # Если загрузка упала — не долбить сеть/диск на каждой реплике, но и не оставаться
 # без ударений до перезапуска сервера: пробуем снова не чаще раза в минуту.
 _RETRY_COOLDOWN_SEC = 60.0
@@ -110,18 +126,52 @@ class Accentizer:
                 return False
 
     def accentuate(self, text: str) -> str:
-        """Расставляет ударения. Текст с ручными "+" возвращается без изменений."""
-        if not text.strip() or _MANUAL_STRESS_RE.search(text):
+        """Расставляет ударения, сохраняя уже размеченные пользователем слова.
+
+        Без ручных «+» поведение прежнее: весь текст уходит в модель одним куском.
+        Если размеченные слова есть, они остаются дословно, а промежутки между ними
+        акцентируются сегментами — один вызов модели на промежуток, а не на слово:
+        RUAccent читает контекст, и на одиночных словах ошибается чаще. Раньше одна
+        такая запись лишала ударений всю реплику — теперь только своё слово.
+        """
+        if not text.strip():
+            return text
+        manual = _MANUAL_STRESS_RE.search(text) is not None
+        if manual and not _needs_accentuation(text):
+            # Размечено каждое слово — модели здесь делать нечего (и грузить её незачем).
             return text
         if not self.load():
             return text
         try:
+            if manual:
+                return self._accent_between_manual(text)
             return self._accent.process_all(text)
         except Exception as exc:
             self._state = STATE_FAILED
             self._last_error = str(exc)
             logger.warning("Не удалось расставить ударения (%s). Синтез без них.", exc)
             return text
+
+    def _accent_between_manual(self, text: str) -> str:
+        """Акцентирует промежутки между словами с ручным «+», не трогая сами слова."""
+        result: list[str] = []
+        pending: list[str] = []
+
+        def flush() -> None:
+            if not pending:
+                return
+            segment = "".join(pending)
+            pending.clear()
+            result.append(self._accent.process_all(segment) if segment.strip() else segment)
+
+        for token in _tokens(text):
+            if _is_manual(token):
+                flush()
+                result.append(token)
+            else:
+                pending.append(token)
+        flush()
+        return "".join(result)
 
 
 def accentuate(text: str) -> str:

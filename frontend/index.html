@@ -48,6 +48,7 @@
   <button class="tab active" data-tab="voices"><span>01</span>Голоса</button>
   <button class="tab" data-tab="dialogue"><span>02</span>Озвучка диалога</button>
   <button class="tab" data-tab="text"><span>03</span>Сплошной текст</button>
+  <button class="tab" data-tab="dictionary"><span>04</span>Словарь</button>
 </nav>
 </div>
 
@@ -541,6 +542,124 @@
           <div class="row" style="margin-top: 12px">
             <a id="text-download-link" class="muted" href="#" download hidden>скачать файл</a>
           </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+</main>
+
+<!-- Вкладка 4: словарь произношения -->
+<main class="tab-panel" id="tab-dictionary" hidden>
+<div class="workspace">
+  <section class="section-heading">
+    <div>
+      <p class="eyebrow">04 · СЛОВАРЬ ПРОИЗНОШЕНИЯ</p>
+      <h1>Словарь <span>//</span> как читать термины</h1>
+    </div>
+  </section>
+
+  <div class="voice-layout">
+    <div class="column">
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">01</span>
+          <div>
+            <h2>ПРАВИЛА</h2>
+            <p>Словарь общий для всех проектов: правило достаточно добавить один раз.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="subheading">
+            <span>СЛОВАРЬ</span>
+            <button class="tiny ghost" id="btn-reload-dictionary">обновить</button>
+          </div>
+          <div class="alert error" id="dictionary-error"></div>
+          <div id="dictionary-list"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">02</span>
+          <div>
+            <h2>ПРОВЕРИТЬ ТЕКСТ</h2>
+            <p>Показывает, что услышит модель. Синтез не запускается, движок не поднимается.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <label class="field">
+            <span>Текст</span>
+            <textarea id="dict-preview-text" style="min-height:90px"
+              placeholder="Например: Мы используем PostgreSQL, SQL и OpenAI API."></textarea>
+          </label>
+          <label class="field">
+            <span>Движок (необязательно)</span>
+            <select id="dict-preview-engine">
+              <option value="">как для F5 — с ударениями</option>
+            </select>
+            <span class="muted">От движка зависит, дойдут ли до него знаки «+».</span>
+          </label>
+          <div class="row" style="margin-top: 12px">
+            <button class="outline-button" id="btn-dict-preview">Проверить</button>
+            <span class="muted preview-status" id="dict-preview-status"></span>
+          </div>
+          <div id="dict-preview-result" hidden>
+            <p class="eyebrow" style="margin: 16px 0 6px">ПОСЛЕ НОРМАЛИЗАЦИИ</p>
+            <blockquote class="ref-phrase" id="dict-preview-normalized"></blockquote>
+            <p class="eyebrow" style="margin: 16px 0 6px">УЙДЁТ В МОДЕЛЬ</p>
+            <blockquote class="ref-phrase" id="dict-preview-final"></blockquote>
+            <div id="dict-preview-matches"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="column">
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">03</span>
+          <div>
+            <h2 id="dict-form-title">НОВОЕ ПРАВИЛО</h2>
+            <p>Слева — слово или фраза как в тексте, справа — как это читать.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="grid-2">
+            <label class="field">
+              <span>Источник (в тексте)</span>
+              <input type="text" id="dict-source" placeholder="OpenAI" />
+            </label>
+            <label class="field">
+              <span>Замена (как читать)</span>
+              <input type="text" id="dict-target" placeholder="оупен эй-ай" />
+            </label>
+          </div>
+          <label class="field">
+            <span>Заметка (необязательно)</span>
+            <input type="text" id="dict-note" placeholder="например: название продукта" />
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="dict-whole-word" checked />
+            только целое слово — «SQL» не заменится внутри «PostgreSQL»
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="dict-case-sensitive" />
+            учитывать регистр
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="dict-enabled" checked />
+            правило включено
+          </label>
+          <div class="row" style="margin-top: 6px">
+            <button class="primary" id="btn-save-dict-entry">Сохранить правило</button>
+            <button class="tiny ghost" id="btn-reset-dict-form" hidden>отменить правку</button>
+          </div>
+          <p class="hint muted">
+            Ударение F5 пишется знаком <b>+</b> перед гласной: <code>звонит → звон+ит</code>.
+            Движкам без поддержки ударений (XTTS) знак не отправляется. Правило с тем же
+            источником обновляет прежнее, а не создаёт второе.
+          </p>
         </div>
       </section>
     </div>

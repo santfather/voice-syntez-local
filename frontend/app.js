@@ -14,6 +14,9 @@ const state = {
   replicaTimer: null,
   takeKey: null,       // "индекс:take_id" варианта, играющего в плеере реплик
   preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, engine_params, text}
+  dictionary: [],      // правила словаря произношения: [{id, source, target, ...}]
+  dictionaryLoaded: false, // словарь уже запрашивался (чтобы не мигать «загружаю»)
+  dictionaryEditing: null, // id правила, которое правится в форме (null — новое)
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
@@ -221,6 +224,21 @@ async function loadEngines() {
   const select = $('new-voice-engine');
   select.innerHTML = engineOptionsHtml(select.value || suggestedEngine($('new-voice-gender').value));
   updateNewVoiceEngineNote();
+  renderDictionaryEngineOptions();
+}
+
+// Список движков для проверки словаря: от движка зависит только одно — уйдут ли
+// ему знаки «+». Синтеза здесь нет, поэтому подпись честно говорит об этом.
+function renderDictionaryEngineOptions() {
+  const select = $('dict-preview-engine');
+  if (!select) return;
+  const current = select.value;
+  select.innerHTML = '<option value="">как для F5 — с ударениями</option>'
+    + Object.values(state.engines).map((info) => {
+      const suffix = info.supports_accents ? 'ударения есть' : 'без ударений';
+      return `<option value="${esc(info.id)}">${esc(info.label)} — ${suffix}</option>`;
+    }).join('');
+  select.value = current;
 }
 
 function updateNewVoiceEngineNote() {
@@ -290,6 +308,190 @@ function switchTab(name) {
   $('tab-voices').hidden = name !== 'voices';
   $('tab-dialogue').hidden = name !== 'dialogue';
   $('tab-text').hidden = name !== 'text';
+  $('tab-dictionary').hidden = name !== 'dictionary';
+  // Словарь грузится при первом открытии вкладки: он не нужен для озвучки, и
+  // запрашивать его на каждом старте дашборда незачем.
+  if (name === 'dictionary') {
+    loadDictionary().catch((error) => showAlert($('dictionary-error'), error.message));
+  }
+}
+
+// --- словарь произношения -----------------------------------------------------
+// Словарь глобальный: правило, добавленное здесь, применяется во всех проектах.
+// Проверка текста идёт тем же эндпоинтом, что и стадии синтеза, поэтому фронт не
+// повторяет порядок шагов и не может показать одно, а отправить в модель другое.
+
+async function loadDictionary() {
+  if (!state.dictionaryLoaded) {
+    $('dictionary-list').innerHTML = '<div class="muted" style="padding:6px 0">Загружаю словарь…</div>';
+  }
+  const data = await api('/api/pronunciation');
+  state.dictionary = data.entries;
+  state.dictionaryLoaded = true;
+  renderDictionary();
+}
+
+function renderDictionary() {
+  const box = $('dictionary-list');
+  if (!state.dictionary.length) {
+    box.innerHTML = '<div class="muted" style="padding:6px 0">Словарь пуст. Добавьте первое правило '
+      + 'справа — например <b>OpenAI → оупен эй-ай</b>. Оно сразу начнёт работать во всех проектах.</div>';
+    return;
+  }
+  box.innerHTML = state.dictionary.map((entry) => `
+    <div class="card dict-rule${entry.enabled ? '' : ' off'}" data-entry-id="${entry.id}">
+      <div class="row between">
+        <div class="dict-pair">
+          <b>${esc(entry.source)}</b><span class="dict-arrow">→</span><span>${esc(entry.target)}</span>
+        </div>
+        <div class="row">
+          <button class="tiny ghost" data-role="edit">правка</button>
+          <button class="tiny ghost danger" data-role="delete">удалить</button>
+        </div>
+      </div>
+      <div class="tag-row" style="margin:10px 0 0">
+        <span class="tag">${entry.case_sensitive ? 'регистр' : 'без регистра'}</span>
+        <span class="tag${entry.whole_word ? '' : ' warn'}">${entry.whole_word ? 'целое слово' : 'подстрока'}</span>
+        ${entry.note ? `<span class="tag">${esc(entry.note)}</span>` : ''}
+      </div>
+      <div class="grid-2" style="margin-top:10px">
+        <label class="toggle" style="margin:0">
+          <input type="checkbox" data-role="enabled" ${entry.enabled ? 'checked' : ''} /> включено
+        </label>
+        <label class="toggle" style="margin:0">
+          <input type="checkbox" data-role="case" ${entry.case_sensitive ? 'checked' : ''} /> учитывать регистр
+        </label>
+      </div>
+    </div>`).join('');
+}
+
+function dictionaryEntry(id) {
+  return state.dictionary.find((entry) => entry.id === id) || null;
+}
+
+function editDictionaryEntry(id) {
+  const entry = dictionaryEntry(id);
+  if (!entry) return;
+  state.dictionaryEditing = id;
+  $('dict-form-title').textContent = 'ПРАВКА ПРАВИЛА';
+  $('dict-source').value = entry.source;
+  $('dict-target').value = entry.target;
+  $('dict-note').value = entry.note || '';
+  $('dict-whole-word').checked = entry.whole_word;
+  $('dict-case-sensitive').checked = entry.case_sensitive;
+  $('dict-enabled').checked = entry.enabled;
+  $('btn-reset-dict-form').hidden = false;
+  showAlert($('dictionary-error'), '');
+}
+
+function resetDictionaryForm() {
+  state.dictionaryEditing = null;
+  $('dict-form-title').textContent = 'НОВОЕ ПРАВИЛО';
+  $('dict-source').value = '';
+  $('dict-target').value = '';
+  $('dict-note').value = '';
+  $('dict-whole-word').checked = true;
+  $('dict-case-sensitive').checked = false;
+  $('dict-enabled').checked = true;
+  $('btn-reset-dict-form').hidden = true;
+}
+
+async function saveDictionaryEntry() {
+  const source = $('dict-source').value.trim();
+  const target = $('dict-target').value.trim();
+  showAlert($('dictionary-error'), '');
+  if (!source || !target) {
+    showAlert($('dictionary-error'), 'Заполните источник и замену — пустое правило ничего не меняет');
+    return;
+  }
+  const payload = {
+    source,
+    target,
+    note: $('dict-note').value.trim(),
+    whole_word: $('dict-whole-word').checked,
+    case_sensitive: $('dict-case-sensitive').checked,
+    enabled: $('dict-enabled').checked,
+  };
+  // Правка отправляется целиком, как и создание: правило small, и частичный
+  // PATCH здесь только запутал бы — что именно ушло, видно в форме.
+  const editing = state.dictionaryEditing;
+  const button = $('btn-save-dict-entry');
+  button.disabled = true;
+  try {
+    await api(editing === null ? '/api/pronunciation' : `/api/pronunciation/${editing}`, {
+      method: editing === null ? 'POST' : 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    resetDictionaryForm();
+    await loadDictionary();
+  } catch (error) {
+    showAlert($('dictionary-error'), error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function updateDictionaryEntry(id, patch) {
+  showAlert($('dictionary-error'), '');
+  try {
+    await api(`/api/pronunciation/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  } catch (error) {
+    showAlert($('dictionary-error'), error.message);
+  }
+  // Список перечитывается и при ошибке: переключатель не должен остаться в
+  // состоянии, которого нет в базе.
+  await loadDictionary();
+}
+
+async function deleteDictionaryEntry(id) {
+  const entry = dictionaryEntry(id);
+  if (!entry) return;
+  if (!confirm(`Удалить правило «${entry.source} → ${entry.target}»?`)) return;
+  showAlert($('dictionary-error'), '');
+  try {
+    await api(`/api/pronunciation/${id}`, { method: 'DELETE' });
+    if (state.dictionaryEditing === id) resetDictionaryForm();
+    await loadDictionary();
+  } catch (error) {
+    showAlert($('dictionary-error'), error.message);
+  }
+}
+
+async function previewDictionary() {
+  const text = $('dict-preview-text').value.trim();
+  showAlert($('dictionary-error'), '');
+  if (!text) {
+    showAlert($('dictionary-error'), 'Введите текст для проверки');
+    return;
+  }
+  const status = $('dict-preview-status');
+  status.textContent = 'проверяю…';
+  try {
+    const data = await api('/api/pronunciation/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, engine: $('dict-preview-engine').value || null }),
+    });
+    $('dict-preview-normalized').textContent = data.normalized;
+    $('dict-preview-final').textContent = data.result;
+    $('dict-preview-matches').innerHTML = data.matches.length
+      ? '<p class="eyebrow" style="margin:16px 0 6px">СРАБОТАЛИ ПРАВИЛА</p>'
+        + `<div class="tag-row">${data.matches.map((match) => (
+          `<span class="tag">${esc(match.source)} → ${esc(match.target)} ×${match.count}</span>`
+        )).join('')}</div>`
+      : '<p class="hint muted">Ни одно правило не сработало — текст уйдёт как есть.</p>';
+    $('dict-preview-result').hidden = false;
+  } catch (error) {
+    $('dict-preview-result').hidden = true;
+    showAlert($('dictionary-error'), error.message);
+  } finally {
+    status.textContent = '';
+  }
 }
 
 // --- голоса -------------------------------------------------------------------
@@ -2256,6 +2458,31 @@ function bindEvents() {
   });
   $('text-rms').addEventListener('input', (e) => {
     $('text-rms-label').textContent = fmtRms(parseFloat(e.target.value));
+  });
+
+  // --- вкладка «Словарь» ---
+  $('btn-reload-dictionary').addEventListener('click', () => {
+    loadDictionary().catch((error) => showAlert($('dictionary-error'), error.message));
+  });
+  $('btn-save-dict-entry').addEventListener('click', saveDictionaryEntry);
+  $('btn-reset-dict-form').addEventListener('click', resetDictionaryForm);
+  $('btn-dict-preview').addEventListener('click', previewDictionary);
+
+  const dictionaryList = $('dictionary-list');
+  dictionaryList.addEventListener('change', (event) => {
+    const card = event.target.closest('.dict-rule');
+    if (!card) return;
+    const id = Number(card.dataset.entryId);
+    if (event.target.dataset.role === 'enabled') updateDictionaryEntry(id, { enabled: event.target.checked });
+    if (event.target.dataset.role === 'case') updateDictionaryEntry(id, { case_sensitive: event.target.checked });
+  });
+  dictionaryList.addEventListener('click', (event) => {
+    const card = event.target.closest('.dict-rule');
+    const button = event.target.closest('button');
+    if (!card || !button) return;
+    const id = Number(card.dataset.entryId);
+    if (button.dataset.role === 'edit') editDictionaryEntry(id);
+    if (button.dataset.role === 'delete') deleteDictionaryEntry(id);
   });
 
   // --- форма нового голоса ---

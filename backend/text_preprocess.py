@@ -13,6 +13,7 @@
 from .text_normalization import (
     YEAR_CASE_BY_TAIL,
     YEAR_RANGE,
+    PronunciationRule,
     agree,
     agree_decimal,
     apply_pronunciation,
@@ -21,6 +22,7 @@ from .text_normalization import (
     expand_phones,
     expand_roman,
     normalize,
+    normalize_report,
     numeral_case,
     ordinal,
     plural_form,
@@ -29,6 +31,7 @@ from .text_normalization import (
 __all__ = [
     "YEAR_CASE_BY_TAIL",
     "YEAR_RANGE",
+    "PronunciationRule",
     "agree",
     "agree_decimal",
     "apply_pronunciation",
@@ -37,6 +40,7 @@ __all__ = [
     "expand_phones",
     "expand_roman",
     "normalize",
+    "normalize_report",
     "numeral_case",
     "ordinal",
     "plural_form",

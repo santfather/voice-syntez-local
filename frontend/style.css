@@ -609,6 +609,27 @@ footer {
 }
 footer b { color: #aaa8b0; font-weight: 400; }
 
+/* --- словарь произношения ----------------------------------------------------- */
+/* Карточка правила: слева пара «источник → замена», справа действия. Выключенное
+   правило остаётся в списке, но приглушено — его видно и легко вернуть. */
+.dict-rule.off { opacity: 0.55; }
+.dict-pair { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.dict-pair b {
+  color: #e4e3e8;
+  font: 700 12px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dict-pair span {
+  color: #c2c0c8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dict-pair .dict-arrow { flex: 0 0 auto; color: var(--lime); }
+.dict-rule code { padding: 1px 5px; border-radius: 3px; background: #1b1b21; color: #d9caff; }
+
 /* --- адаптив ------------------------------------------------------------------ */
 @media (max-width: 1180px) {
   .status-cluster { gap: 11px; }
