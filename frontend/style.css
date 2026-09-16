@@ -441,6 +441,9 @@ button.primary {
 button.primary:hover:not(:disabled) { background: #c9ff36; border-color: #c9ff36; color: #111; }
 
 .primary-button, .generate-button { width: 100%; padding: 13px; }
+/* Отмена — не основной путь: компактная кнопка под «Сгенерировать», а не вторая
+   широкая кнопка на всю панель. */
+.cancel-button { width: auto; margin-top: 8px; padding: 7px 12px; font-size: 9px; }
 
 button.ghost { background: transparent; }
 button.tiny { padding: 5px 9px; font-size: 9px; letter-spacing: 0.05em; }

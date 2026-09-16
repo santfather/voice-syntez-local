@@ -40,7 +40,15 @@ from .engines.base import (
     EngineInfo,
 )
 from .engines.registry import created_engine, created_engines, get_engine
-from .job_queue import Job, JobPayload, JobStatus, get_queue
+from .job_queue import (
+    PRIORITY_BACKGROUND,
+    PRIORITY_PREVIEW,
+    PRIORITY_RENDER,
+    Job,
+    JobPayload,
+    JobStatus,
+    get_queue,
+)
 from .model_manager import (
     ModelBusyError,
     ModelNotDownloadableError,
@@ -214,6 +222,9 @@ class GenerateRequest(TrackOptions):
     qa: QaMode = config.QA_MODE_OFF
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
+    # Фоновая задача (Фаза 11): рендер уходит в приоритет 3 и пропускает вперёд
+    # preview и перегенерацию. Поле необязательное — без него поведение прежнее.
+    background: bool = False
 
 
 class RenderTextRequest(SpeakerConfig, TrackOptions):
@@ -224,6 +235,8 @@ class RenderTextRequest(SpeakerConfig, TrackOptions):
     qa: QaMode = config.QA_MODE_OFF
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
+    # См. `GenerateRequest.background`.
+    background: bool = False
 
 
 # --- модели запросов проектов -------------------------------------------------
@@ -290,6 +303,9 @@ class ProjectRenderRequest(BaseModel):
     qa: QaModeOrNone = None
     output_format: Literal["wav", "mp3"] | None = None
     chunk_strategy: ChunkStrategy | None = None
+    # Фоновая задача (Фаза 11): приоритет 3. Не запоминается в настройках проекта:
+    # это свойство запуска, а не сборки.
+    background: bool = False
 
 
 # --- жизненный цикл -----------------------------------------------------------
@@ -1074,7 +1090,8 @@ async def preview(payload: PreviewRequest) -> dict:
         ),
     )
     try:
-        job = get_queue().submit(job_payload)
+        # Приоритет 0: прослушивание короткое, и человек ждёт его на месте.
+        job = get_queue().submit(job_payload, priority=PRIORITY_PREVIEW)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"job_id": job.id, "status": job.status.value, "total_replicas": 1}
@@ -1107,7 +1124,8 @@ async def generate(payload: GenerateRequest) -> dict:
         ),
     )
     try:
-        job = get_queue().submit(job_payload)
+        priority = PRIORITY_BACKGROUND if payload.background else PRIORITY_RENDER
+        job = get_queue().submit(job_payload, priority=priority)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"job_id": job.id, "status": job.status.value, "total_replicas": job.total_replicas}
@@ -1144,7 +1162,8 @@ async def render_text(payload: RenderTextRequest) -> dict:
         ),
     )
     try:
-        job = get_queue().submit(job_payload)
+        priority = PRIORITY_BACKGROUND if payload.background else PRIORITY_RENDER
+        job = get_queue().submit(job_payload, priority=priority)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"job_id": job.id, "status": job.status.value, "total_replicas": job.total_replicas}
@@ -1585,7 +1604,8 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
         project_id=project_id,
     )
     try:
-        job = get_queue().submit(job_payload)
+        priority = PRIORITY_BACKGROUND if payload.background else PRIORITY_RENDER
+        job = get_queue().submit(job_payload, priority=priority)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     get_projects_store().set_project_status(
@@ -1674,6 +1694,19 @@ async def project_take_audio(project_id: str, index: int, take_id: int) -> FileR
         raise HTTPException(status_code=410, detail="Файл варианта удалён")
     # Варианты всегда wav: они служат для сравнения, а не для выдачи пользователю.
     return FileResponse(path, media_type="audio/wav")
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str) -> dict:
+    """Отменяет задачу: ожидающую — сразу, идущую — на безопасной точке.
+
+    Повторная отмена — не ошибка: ответ тот же, а состояние задачи не меняется
+    (`done`/`error`/`cancelled` остаются собой). Неизвестный id — 404.
+    """
+    job = get_queue().cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return {"job": job.to_dict()}
 
 
 @app.get("/api/jobs/{job_id}")

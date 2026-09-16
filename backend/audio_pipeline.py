@@ -211,6 +211,16 @@ class JobAbortedError(RuntimeError):
     """Задача прервана watchdog'ом (перерасход ресурсов), а не упала сама."""
 
 
+class JobCancelledError(JobAbortedError):
+    """Задача отменена пользователем на безопасной точке.
+
+    Наследник `JobAbortedError`, а не соседний класс: для пайплайна это тот же
+    «прерванный прогон» (см. `should_abort`), и старый код, ловящий прерывание,
+    продолжает работать. Различает их вызывающий: отмена — не ошибка, а
+    отдельное состояние задачи (`cancelled`), тогда как watchdog — `error`.
+    """
+
+
 def _pitch_shift(chunk: np.ndarray, semitones: float) -> np.ndarray:
     """Меняет высоту тона, не трогая длительность. Тяжёлый импорт — только по факту."""
     if not semitones:
@@ -751,6 +761,7 @@ async def _synthesize_checked(
     label: str,
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None]:
     """Синтез куска: обычный или с проверкой (`settings.qa`).
 
@@ -770,6 +781,8 @@ async def _synthesize_checked(
     """
     # Текст куска готовит `_text_for_engine`: числа и латиница для всех движков,
     # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
+    if should_abort and should_abort():
+        raise JobCancelledError(f"Реплика {position}: отменено до синтеза")
     text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
     qa = settings.qa
     if qa is None or qa.mode == config.QA_MODE_OFF:
@@ -785,7 +798,11 @@ async def _synthesize_checked(
     status = QA_ATTEMPTS
     screening: qa_screening.Screening | None = None
     for attempt in range(1, limit + 1):
+        # Между попытками проверки — безопасная точка: здесь не убивается поток
+        # внутри инференса, а просто не начинается следующая попытка.
         if attempt > 1:
+            if should_abort and should_abort():
+                raise JobCancelledError(f"Реплика {position}: отменено между попытками")
             if time.monotonic() - started >= qa.budget_sec:
                 status = QA_BUDGET
                 break
@@ -914,9 +931,11 @@ async def render_dialogue(
     cursor = 0
     for index, replica in enumerate(replicas, start=1):
         if should_abort and should_abort():
-            raise JobAbortedError(
-                f"Прервано на реплике {index} из {total}: превышен лимит памяти"
-            )
+            # Отмена пользователя и прерывание watchdog'ом приходят одним
+            # сигналом: различить их — дело вызывающего (job_queue), а пайплайн
+            # обязан просто остановиться между кусками, не убивая поток внутри
+            # вызова модели.
+            raise JobCancelledError(f"Прервано на реплике {index} из {total}")
         if on_progress:
             on_progress(index, total, replica.label)
         settings_for_replica = per_replica[index - 1]
@@ -966,6 +985,7 @@ async def synthesize_replica(
     index: int,
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None]:
     """Синтезирует и готовит один кусок — без записи в готовый файл.
 
@@ -996,6 +1016,7 @@ async def synthesize_replica(
         label=replica.label,
         wait_for_memory=wait_for_memory,
         on_note=on_note,
+        should_abort=should_abort,
     )
     prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
     logger.info(
@@ -1015,6 +1036,7 @@ async def synthesize_take(
     label: str,
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None]:
     """Синтезирует одну фразу вне диалога — тем же путём, что и реплику.
 
@@ -1034,6 +1056,7 @@ async def synthesize_take(
         label=label,
         wait_for_memory=wait_for_memory,
         on_note=on_note,
+        should_abort=should_abort,
     )
 
 

@@ -29,12 +29,39 @@ MAX_KEPT_JOBS = 50
 # Как часто перепроверять системную память, пока задача ждёт своей очереди.
 MEMORY_WAIT_RETRY_SEC = 5.0
 
+# Приоритеты очереди (фаза 11). Воркер по-прежнему один: приоритет меняет только
+# порядок, в котором задачи доходят до модели, а не число одновременных
+# прогонов. Меньше число — раньше задача.
+PRIORITY_PREVIEW = 0        # прослушивание голоса: короткое и интерактивное
+PRIORITY_REGENERATE = 1     # пересинтез одной реплики: человек ждёт результат
+PRIORITY_RENDER = 2         # обычная сборка файла
+PRIORITY_BACKGROUND = 3     # сравнение движков и рендер, явно помеченный фоном
+
+# Приоритет по виду задачи — для тех, кто ставит задачу без явного класса.
+PRIORITY_BY_TASK = {
+    "RenderTask": PRIORITY_RENDER,
+    "RegenerateTask": PRIORITY_REGENERATE,
+    "SelectVariantTask": PRIORITY_REGENERATE,
+    "ProjectTakeTask": PRIORITY_REGENERATE,
+    "BenchmarkTask": PRIORITY_BACKGROUND,
+}
+
+# Сообщения об отмене — их читает интерфейс, поэтому они на русском.
+CANCEL_QUEUED_MESSAGE = "Отменено до запуска"
+CANCEL_PROCESSING_MESSAGE = "Отменено: прервано на ближайшей безопасной точке"
+# Кто остановил задачу. Сигнал в пайплайн один, а исход разный (см.
+# `_finish_interrupted`): отмена — состояние `cancelled`, прерывание
+# watchdog'ом — ошибка с причиной.
+ABORT_USER = "user"
+ABORT_WATCHDOG = "watchdog"
+
 
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
     DONE = "done"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 def _now_iso() -> str:
@@ -57,6 +84,17 @@ class Job:
     created_at: str = field(default_factory=_now_iso)
     started_at: str | None = None
     finished_at: str | None = None
+    # Запрошена ли отмена этой задачи (фаза 11). Отдельно от статуса: у идущей
+    # задачи отмена кооперативная — статус меняется тогда, когда воркер дойдёт до
+    # безопасной точки, а флаг виден интерфейсу сразу после запроса.
+    cancel_requested: bool = False
+    # Кто попросил остановку: `"user"` или `"watchdog"`. Сигнал в пайплайн идёт
+    # один (`cancel_requested`), но исход разный: отмена пользователя — это
+    # состояние `cancelled`, а прерывание watchdog'ом — ошибка с причиной
+    # («превышен лимит памяти»), и терять её нельзя: пользователь должен знать,
+    # что рендер остановила не он.
+    abort_kind: str = ""
+    abort_reason: str | None = None
     # Данные готовой задачи: без них нельзя перегенерировать отдельную реплику.
     payload: "JobPayload | None" = field(default=None, repr=False)
     segments: list[tuple[int, int]] = field(default_factory=list, repr=False)
@@ -101,6 +139,7 @@ class Job:
             "current_voice": self.current_voice,
             "message": self.message,
             "error": self.error,
+            "cancel_requested": self.cancel_requested,
             "duration_sec": round(self.duration_sec, 2) if self.duration_sec else None,
             "eta_sec": round(self.eta_sec, 1) if self.eta_sec else None,
             "output_format": self.output_format,
@@ -182,22 +221,30 @@ class BenchmarkTask:
 
 
 class JobQueue:
-    """Единственный воркер: следующая задача не начнётся, пока не закончится текущая."""
+    """Единственный воркер: следующая задача не начнётся, пока не закончится текущая.
+
+    Очередь приоритетная (`asyncio.PriorityQueue`), но воркер по-прежнему один:
+    приоритет решает только, какая из ожидающих задач дойдёт до модели первой.
+    Внутри одного приоритета порядок строгий FIFO — за это отвечает счётчик
+    постановки `_seq`, второй элемент кортежа.
+    """
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue | None = None
+        self._queue: asyncio.PriorityQueue | None = None
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._worker_task: asyncio.Task | None = None
-        # Текущая задача и запрос на её прерывание (ставит ResourceGuard)
+        # Монотонный счётчик постановки: приоритеты равны — решает порядок прихода.
+        self._seq = 0
+        # Текущая задача. Отмена адресуется конкретной задаче (`Job.cancel_requested`),
+        # а не общему флагу процесса: иначе отмена одной задачи прервала бы следующую.
         self._current_job_id: str | None = None
-        self._abort_requested = False
 
     # -- жизненный цикл --------------------------------------------------------
     async def start(self) -> None:
         if self._worker_task is not None:
             return
-        self._queue = asyncio.Queue()
+        self._queue = asyncio.PriorityQueue()
         self._worker_task = asyncio.create_task(self._worker(), name="tts-worker")
         logger.info("Воркер очереди запущен")
 
@@ -214,7 +261,7 @@ class JobQueue:
         logger.info("Воркер очереди остановлен")
 
     # -- API -------------------------------------------------------------------
-    def submit(self, payload: JobPayload) -> Job:
+    def submit(self, payload: JobPayload, priority: int = PRIORITY_RENDER) -> Job:
         if self._queue is None:
             raise RuntimeError("Очередь не запущена")
         job = Job(
@@ -225,11 +272,16 @@ class JobQueue:
         self._jobs[job.id] = job
         self._order.append(job.id)
         self._prune()
-        self._queue.put_nowait(RenderTask(job_id=job.id, payload=payload))
-        logger.info("Задача %s принята (%s реплик)", job.id, job.total_replicas)
+        self._enqueue(RenderTask(job_id=job.id, payload=payload), priority)
+        logger.info(
+            "Задача %s принята (%s реплик, приоритет %s)",
+            job.id, job.total_replicas, priority,
+        )
         return job
 
-    def submit_regenerate(self, job_id: str, index: int) -> Job:
+    def submit_regenerate(
+        self, job_id: str, index: int, priority: int = PRIORITY_REGENERATE
+    ) -> Job:
         """Ставит в очередь перегенерацию одной реплики готовой задачи.
 
         Идёт через ту же очередь, что и генерация: модель тёплая одна на процесс,
@@ -245,11 +297,13 @@ class JobQueue:
         job.regenerating = index
         job.regen_error = None
         job.message = f"Перегенерирую реплику {index + 1}"
-        self._enqueue(RegenerateTask(job_id=job_id, index=index))
+        self._enqueue(RegenerateTask(job_id=job_id, index=index), priority)
         logger.info("Задача %s: перегенерация реплики %s", job_id, index + 1)
         return job
 
-    def submit_variant(self, job_id: str, index: int, variant_id: str) -> Job:
+    def submit_variant(
+        self, job_id: str, index: int, variant_id: str, priority: int = PRIORITY_REGENERATE
+    ) -> Job:
         """Ставит в очередь выбор уже сохранённого варианта куска.
 
         Через очередь, а не сразу в обработчике запроса: постановка варианта
@@ -264,7 +318,9 @@ class JobQueue:
         job.regenerating = index
         job.regen_error = None
         job.message = f"Ставлю «{variant.label}» в реплику {index + 1}"
-        self._enqueue(SelectVariantTask(job_id=job_id, index=index, variant_id=variant.id))
+        self._enqueue(
+            SelectVariantTask(job_id=job_id, index=index, variant_id=variant.id), priority
+        )
         logger.info("Задача %s: реплика %s → вариант %s", job_id, index + 1, variant.id)
         return job
 
@@ -275,6 +331,7 @@ class JobQueue:
         replica: Replica,
         speakers: dict[str, SpeakerSettings],
         settings: RenderSettings,
+        priority: int = PRIORITY_REGENERATE,
     ) -> Job:
         """Ставит в очередь пересинтез одной реплики проекта.
 
@@ -294,7 +351,7 @@ class JobQueue:
         self._jobs[job.id] = job
         self._order.append(job.id)
         self._prune()
-        self._queue.put_nowait(
+        self._enqueue(
             ProjectTakeTask(
                 job_id=job.id,
                 project_id=project_id,
@@ -302,7 +359,8 @@ class JobQueue:
                 replica=replica,
                 speakers=speakers,
                 settings=settings,
-            )
+            ),
+            priority,
         )
         logger.info("Проект %s: пересинтез реплики %s", project_id, index + 1)
         return job
@@ -314,6 +372,7 @@ class JobQueue:
         engines: list[str],
         qa: str,
         auto_accent: bool,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> tuple[Job, benchmark.BenchmarkRun]:
         """Ставит в очередь сравнение голоса на нескольких движках.
 
@@ -343,7 +402,7 @@ class JobQueue:
                 engines=engines,
             )
         )
-        self._queue.put_nowait(
+        self._enqueue(
             BenchmarkTask(
                 job_id=job.id,
                 run_id=run.id,
@@ -352,7 +411,8 @@ class JobQueue:
                 engines=engines,
                 qa=qa,
                 auto_accent=auto_accent,
-            )
+            ),
+            priority,
         )
         logger.info("Сравнение %s: голос %s, движки %s", run.id, voice.id, ", ".join(engines))
         return job, run
@@ -406,11 +466,22 @@ class JobQueue:
     def _enqueue(
         self,
         task: RenderTask | RegenerateTask | SelectVariantTask | ProjectTakeTask | BenchmarkTask,
+        priority: int | None = None,
     ) -> None:
+        """Кладёт задачу в очередь: `(приоритет, номер постановки, задача)`.
+
+        Меньший приоритет уходит первым; при равных решает `_seq`, то есть строгий
+        FIFO. Кортеж с уникальным вторым элементом ещё и снимает сравнение самих
+        датаклассов: `PriorityQueue` сравнивает элементы, а `RenderTask` с `JobPayload`
+        несравнимы.
+        """
         queue = self._queue
         if queue is None:
             raise RuntimeError("Очередь не запущена")
-        queue.put_nowait(task)
+        if priority is None:
+            priority = PRIORITY_BY_TASK.get(type(task).__name__, PRIORITY_RENDER)
+        self._seq += 1
+        queue.put_nowait((int(priority), self._seq, task))
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -427,16 +498,65 @@ class JobQueue:
         Проверяются три источника, потому что задача проходит через них
         последовательно: очередь (`queued`), `current_job_id` (`processing`) и
         флаг `regenerating`, который выставляется ещё до взятия задачи воркером.
+
+        Отменённая задача занятостью не считается: она уже не ждёт синтеза и не
+        синтезируется, и держать из-за неё движок в памяти незачем.
         """
         if self._current_job_id is not None:
-            return True
-        if self._queue is not None and not self._queue.empty():
+            job = self._jobs.get(self._current_job_id)
+            if job is None or job.status is not JobStatus.CANCELLED:
+                return True
+        if self._queue is not None and self._queue.qsize() > 0:
             return True
         return any(
             job.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
-            or job.regenerating is not None
+            or (
+                job.regenerating is not None
+                and job.status is not JobStatus.CANCELLED
+            )
             for job in self._jobs.values()
         )
+
+    def cancel(self, job_id: str) -> Job | None:
+        """Отменяет задачу: ожидающую — сразу, идущую — кооперативно.
+
+        - `queued` → `cancelled` немедленно: синтез ещё не начинался, и воркер,
+          достав такую задачу из очереди, обязан её пропустить.
+        - `processing` → выставляется `cancel_requested`, а воркер прерывает её на
+          ближайшей безопасной точке — между куском и куском или между попытками
+          проверки. Поток внутри вызова модели не убивается: это и есть причина,
+          по которой отмена кооперативная, а не `Task.cancel()`.
+        - `done`/`error`/`cancelled` → ничего не меняется (идемпотентно):
+          повторная отмена — не ошибка, а ответ с текущим состоянием.
+
+        Неизвестный id → `None`: это ошибка запроса, и роут отдаёт 404.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if job.status is JobStatus.QUEUED:
+            self._mark_cancelled(job, CANCEL_QUEUED_MESSAGE)
+            logger.info("Задача %s отменена до запуска", job.id)
+            return job
+        if job.status is JobStatus.PROCESSING:
+            if not job.cancel_requested:
+                job.cancel_requested = True
+                job.abort_kind = ABORT_USER
+                job.message = "Отмена запрошена: остановлюсь на ближайшей безопасной точке"
+                logger.warning("Запрошена отмена задачи %s", job.id)
+            return job
+        # Готовый файл с идущей перегенерацией: отменяется именно она, а не сам
+        # рендер — файл уже собран и должен остаться готовым.
+        if job.regenerating is not None:
+            if not job.cancel_requested:
+                job.cancel_requested = True
+                job.abort_kind = ABORT_USER
+                job.regen_error = "Отменено"
+                job.message = f"Реплика {job.regenerating + 1}: отмена перегенерации"
+                logger.warning("Запрошена отмена перегенерации задачи %s", job.id)
+            return job
+        logger.info("Задача %s уже завершена (%s) — отменять нечего", job.id, job.status.value)
+        return job
 
     @property
     def current_job_id(self) -> str | None:
@@ -448,7 +568,66 @@ class JobQueue:
         """
         return self._current_job_id
 
-    # -- внутреннее ------------------------------------------------------------
+    # -- отмена ----------------------------------------------------------------
+    def _cancelled(self, job_id: str) -> bool:
+        """Признак отмены именно этой задачи — то, что видит пайплайн в `should_abort`."""
+        job = self._jobs.get(job_id)
+        return job is not None and job.cancel_requested
+
+    def _mark_cancelled(self, job: Job, message: str = CANCEL_PROCESSING_MESSAGE) -> None:
+        """Переводит задачу в `cancelled` и подчищает её недописанные файлы.
+
+        Статус сохраняется в реестре: отменённая задача должна быть видна через
+        `GET /api/jobs/{id}`, а не исчезать. Данные проектов не трогаются —
+        удаляются только транзитные файлы самой задачи.
+        """
+        if job.status is not JobStatus.CANCELLED:
+            job.status = JobStatus.CANCELLED
+            job.finished_at = _now_iso()
+        job.cancel_requested = True
+        job.error = None
+        job.message = message
+        job.regenerating = None
+        self._discard_partial(job)
+
+    def _finish_interrupted(self, job: Job, project_id: str | None = None) -> None:
+        """Завершает задачу, остановленную на безопасной точке.
+
+        Один и тот же сигнал приводит к двум разным исходам, и различать их
+        обязан именно этот метод: отмена пользователем — состояние `cancelled`
+        (проект возвращается в черновик, работа не потеряна), прерывание
+        watchdog'ом — ошибка с причиной, потому что рендер упал не по воле
+        пользователя, и проект должен показать ошибку, а не «отменено».
+        """
+        if job.abort_kind == ABORT_WATCHDOG:
+            reason = job.abort_reason or "нехватка памяти"
+            job.status = JobStatus.ERROR
+            job.error = reason
+            job.message = "Прервано"
+            job.regenerating = None
+            self._discard_partial(job)
+            self._mark_project(project_id, config.PROJECT_STATUS_ERROR, job.id, reason)
+            logger.warning("Задача %s прервана watchdog'ом: %s", job.id, reason)
+            return
+        self._mark_cancelled(job)
+        self._mark_project(project_id, config.PROJECT_STATUS_DRAFT, job.id)
+        logger.info("Задача %s отменена пользователем", job.id)
+
+    def _discard_partial(self, job: Job) -> None:
+        """Удаляет недописанный вывод задачи: готовый файл и её варианты кусков.
+
+        Файлы проектов (`output/projects/{id}/`) не трогаются: уже сохранённые
+        takes реплик — это данные проекта, и отмена задачи не должна их портить.
+        """
+        if job.output_path is not None and job.output_path.exists():
+            try:
+                job.output_path.unlink()
+                logger.info("Задача %s: удалён недописанный файл %s", job.id, job.output_path)
+            except OSError as exc:
+                logger.warning("Задача %s: не удалось удалить %s (%s)", job.id, job.output_path, exc)
+        if job.payload is not None:
+            for variant in (v for items in job.variants.values() for v in items):
+                audio_pipeline.drop_variant(variant)
     def _prune(self) -> None:
         while len(self._order) > MAX_KEPT_JOBS:
             oldest = self._order.pop(0)
@@ -465,9 +644,20 @@ class JobQueue:
         if queue is None:
             return
         while True:
-            task = await queue.get()
+            _priority, _seq, task = await queue.get()
             try:
+                # Флаг отмены обнуляется до проверки очереди: запрос, пришедший
+                # между проверкой и стартом задачи, не должен потеряться.
+                job = self._jobs.get(task.job_id)
+                if job is not None:
+                    job.cancel_requested = False
+                    job.abort_kind = ""
+                    job.abort_reason = None
+                if self._skip_cancelled(task):
+                    continue
                 await self._wait_for_memory(task.job_id)
+                if self._skip_cancelled(task):
+                    continue
                 if isinstance(task, RegenerateTask):
                     await self._regenerate(task)
                 elif isinstance(task, SelectVariantTask):
@@ -492,6 +682,8 @@ class JobQueue:
         job = self._jobs.get(job_id)
         warned = False
         while resource_guard.check_system_memory_pressure():
+            if self._cancelled(job_id):
+                return
             percent = resource_guard.snapshot()["system_mem_percent"]
             if job is not None:
                 job.message = f"Система перегружена: память занята на {percent:.0f}% — ожидание"
@@ -505,6 +697,53 @@ class JobQueue:
         if warned:
             logger.info("Задача %s: память освободилась, начинаю", job_id)
 
+    def _drop_variants(self, job: Job) -> None:
+        """Убирает снятые варианты и их файлы.
+
+        Готовый файл при отмене не переписывается, поэтому и «исходный» вариант,
+        вырезанный из него перед пересинтезом, теряет смысл: он лишь обозначил бы
+        историю, которой не было.
+        """
+        for variants in job.variants.values():
+            for variant in variants:
+                audio_pipeline.drop_variant(variant)
+        job.variants.clear()
+        job.active_variant.clear()
+
+    def _cancel_pending_take(self, job: Job) -> None:
+        """Снимает перегенерацию, которую воркер так и не начал.
+
+        Статус задачи не трогается: у готового рендера он и остаётся `done`, а
+        отменяется именно пересборка реплики — файл не переписан, прежнее звучание
+        на месте. Интерфейс узнаёт об отмене из `regen_error` и снимает занятость
+        реплики (`regenerating`).
+        """
+        index = job.regenerating
+        self._drop_variants(job)
+        job.regenerating = None
+        job.cancel_requested = False
+        job.abort_kind = ""
+        job.abort_reason = None
+        job.regen_error = "Отменено"
+        if index is not None:
+            job.message = f"Реплика {index + 1}: перегенерация отменена"
+        logger.info("Задача %s: перегенерация отменена до запуска", job.id)
+
+    def _skip_cancelled(self, task) -> bool:
+        """Пропускает задачу, отменённую до запуска: синтез не начинается вовсе."""
+        job = self._jobs.get(task.job_id)
+        if job is None or job.status is JobStatus.CANCELLED:
+            return True
+        if not job.cancel_requested:
+            return False
+        if isinstance(task, RenderTask) or job.status is JobStatus.QUEUED:
+            self._mark_cancelled(job, CANCEL_QUEUED_MESSAGE)
+            return True
+        # Отменённая перегенерация или выбор варианта у готового рендера: статус
+        # остаётся `done` — файл на месте, отменена только пересборка реплики.
+        self._cancel_pending_take(job)
+        return True
+
     async def _render(self, task: RenderTask) -> None:
         job = self._jobs[task.job_id]
         payload = task.payload
@@ -512,7 +751,6 @@ class JobQueue:
         job.started_at = _now_iso()
         job.message = "Готовлю модель"
         self._current_job_id = job.id
-        self._abort_requested = False
         self._mark_project(payload.project_id, config.PROJECT_STATUS_RENDERING, job.id)
         started = time.monotonic()
         try:
@@ -522,7 +760,7 @@ class JobQueue:
                 speakers=payload.speakers,
                 settings=payload.settings,
                 on_progress=self._progress_callback(job),
-                should_abort=lambda: self._abort_requested,
+                should_abort=lambda: self._cancelled(job.id),
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
             )
@@ -536,8 +774,8 @@ class JobQueue:
             job.current_replica = job.total_replicas
             job.eta_sec = 0.0
             # Статус DONE ставится после записи кусков в проект: «готово» должно
-            # означать, что открытый следом проект уже показывает этот рендер, а
-            # не что файл есть, а история реплик появится когда-нибудь потом.
+            # означать, что открытый следом проект уже показывает этот рендер,
+            # а не что файл есть, а история реплик появится когда-нибудь потом.
             await self._persist_project_takes(job, payload, result)
             job.message = f"Готово: {result.duration_sec:.1f} c аудио"
             job.status = JobStatus.DONE
@@ -545,7 +783,13 @@ class JobQueue:
         except asyncio.CancelledError:
             job.status = JobStatus.ERROR
             job.error = "Отменено (остановка сервера)"
+            job.cancel_requested = True
+            self._discard_partial(job)
             raise
+        except audio_pipeline.JobCancelledError:
+            # Отмена пользователя — `cancelled`, прерывание watchdog'ом — ошибка
+            # с причиной; различает их `_finish_interrupted`.
+            self._finish_interrupted(job, payload.project_id)
         except audio_pipeline.JobAbortedError as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
@@ -560,7 +804,6 @@ class JobQueue:
             logger.exception("Задача %s упала", job.id)
         finally:
             self._current_job_id = None
-            self._abort_requested = False
             job.finished_at = _now_iso()
 
     @staticmethod
@@ -651,6 +894,8 @@ class JobQueue:
             if speaker is None:
                 raise ValueError(f"Для «{replica.label}» не найден голос")
             await self._keep_current(job, task.index, job.payload.settings, job.output_path)
+            if self._cancelled(job.id):
+                raise audio_pipeline.JobCancelledError("Отменено до синтеза")
             prepared, seed, qa_outcome = await audio_pipeline.synthesize_replica(
                 replica=replica,
                 speaker=speaker,
@@ -658,7 +903,12 @@ class JobQueue:
                 index=task.index,
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
+                should_abort=lambda: self._cancelled(job.id),
             )
+            # Синтез мог вернуться уже после запроса отмены: тогда вариант не
+            # сохраняем — в файл попадёт недоделанная пересборка.
+            if self._cancelled(job.id):
+                raise audio_pipeline.JobCancelledError("Отменено до сохранения варианта")
             variant = await self._add_variant(job, task.index, prepared, seed, qa_outcome)
             duration, bounds = await audio_pipeline.apply_variant(
                 source_path=job.output_path,
@@ -676,6 +926,14 @@ class JobQueue:
             )
         except asyncio.CancelledError:
             raise
+        except audio_pipeline.JobCancelledError:
+            # Отмена не портит исходный файл: новая версия куска ещё не встала.
+            # Убираем транзитные варианты — «исходный» и, если успел появиться,
+            # новый: рендер остаётся готовым и звучит как прежде.
+            self._drop_variants(job)
+            job.regen_error = "Отменено"
+            job.message = f"Реплика {task.index + 1}: перегенерация отменена"
+            logger.info("Задача %s: перегенерация реплики %s отменена", job.id, task.index + 1)
         except Exception as exc:
             job.regen_error = str(exc)
             job.message = "Перегенерация не удалась"
@@ -741,6 +999,7 @@ class JobQueue:
                 index=task.index,
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
+                should_abort=lambda: self._cancelled(job.id),
             )
             variant = await asyncio.to_thread(
                 audio_pipeline.save_chunk_variant,
@@ -782,7 +1041,24 @@ class JobQueue:
         except asyncio.CancelledError:
             job.status = JobStatus.ERROR
             job.error = "Отменено (остановка сервера)"
+            job.cancel_requested = True
             raise
+        except audio_pipeline.JobCancelledError:
+            # Вариант в проект ещё не сохранён — терять нечего, и данные проекта
+            # остаются согласованными: реплика просто не получила нового take.
+            # Прерывание watchdog'ом — исключение: реплика не пересинтезирована
+            # из-за нехватки памяти, и об этом надо сказать внятно.
+            if job.abort_kind == ABORT_WATCHDOG:
+                job.regen_error = job.abort_reason or "прервано из-за нехватки памяти"
+                job.message = f"Реплика {task.index + 1}: прервано"
+                self._drop_variants(job)
+                logger.warning(
+                    "Проект %s: пересинтез реплики %s прерван watchdog'ом: %s",
+                    task.project_id, task.index + 1, job.regen_error,
+                )
+            else:
+                self._mark_cancelled(job)
+                logger.info("Проект %s: пересинтез реплики %s отменён", task.project_id, task.index + 1)
         except Exception as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
@@ -806,7 +1082,6 @@ class JobQueue:
         if job is None or run is None:
             return
         self._current_job_id = job.id
-        self._abort_requested = False
         job.status = JobStatus.PROCESSING
         job.started_at = _now_iso()
         run.status = benchmark.RUN_RUNNING
@@ -826,6 +1101,7 @@ class JobQueue:
                 wait_for_memory=lambda: self._wait_for_memory(job.id),
                 on_note=self._note_callback(job),
                 on_progress=on_progress,
+                should_abort=lambda: self._cancelled(job.id),
             )
             job.current_replica = job.total_replicas
             job.message = "Сравнение готово"
@@ -834,9 +1110,23 @@ class JobQueue:
         except asyncio.CancelledError:
             job.status = JobStatus.ERROR
             job.error = "Отменено (остановка сервера)"
+            job.cancel_requested = True
             run.status = benchmark.RUN_ERROR
             run.error = job.error
             raise
+        except audio_pipeline.JobCancelledError:
+            # Уже снятые take-файлы движков остаются: это результат сравнения,
+            # а не транзитный вывод задачи, и доигранные строки в нём полезны.
+            if job.abort_kind == ABORT_WATCHDOG:
+                job.status = JobStatus.ERROR
+                job.error = job.abort_reason or "прервано из-за нехватки памяти"
+                job.message = "Прервано"
+                logger.warning("Сравнение %s прервано watchdog'ом: %s", task.run_id, job.error)
+            else:
+                self._mark_cancelled(job, "Отменено: прервано между движками")
+            run.status = benchmark.RUN_ERROR
+            run.error = job.error or job.message
+            logger.info("Сравнение %s остановлено (%s)", task.run_id, job.status.value)
         except Exception as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
@@ -846,7 +1136,6 @@ class JobQueue:
             logger.exception("Сравнение %s упало", task.run_id)
         finally:
             self._current_job_id = None
-            self._abort_requested = False
             job.finished_at = _now_iso()
             run.finished_at = job.finished_at
 
@@ -981,12 +1270,26 @@ class JobQueue:
         Возвращает id задачи, которая будет прервана, или None, если очередь
         свободна. Процесс приложения при этом не останавливается: прерывается
         только конкретная задача, чтобы память успела освободиться.
+
+        Это тот же кооперативный механизм, что и у `cancel`, поэтому флаг ставится
+        конкретной задаче: отмена одной задачи не должна задевать следующую.
         """
-        if self._current_job_id is None:
+        job_id = self._current_job_id
+        if job_id is None:
             return None
-        self._abort_requested = True
-        logger.warning("Запрошено прерывание задачи %s: %s", self._current_job_id, reason)
-        return self._current_job_id
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if self.cancel(job_id) is None:
+            return None
+        # Порядок важен: `cancel` помечает остановку как пользовательскую, а здесь
+        # причина известна точнее. Причина важнее самого факта — по ней
+        # `_finish_interrupted` покажет ошибку вместо тихого «отменено».
+        job.abort_kind = ABORT_WATCHDOG
+        job.abort_reason = reason
+        job.message = f"Прерываю: {reason}"
+        logger.warning("Запрошено прерывание задачи %s: %s", job_id, reason)
+        return job_id
 
 
 _queue_instance: JobQueue | None = None

@@ -17,6 +17,7 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -221,12 +222,17 @@ async def _run_engine(
     settings: RenderSettings,
     wait_for_memory: WaitForMemory | None,
     on_note: NoteCallback | None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> BenchmarkResult:
     """Готовит модель и синтезирует фразу одним движком.
 
     Ошибка любого шага — результат этого движка со статусом `error` и понятным
     русским текстом: недоступная модель не должна рушить сравнение остальных.
+    Отмена сюда не относится: она поднимается наружу (`JobCancelledError`), иначе
+    прогон продолжился бы со следующим движком, как будто ничего не случилось.
     """
+    if should_abort and should_abort():
+        raise audio_pipeline.JobCancelledError("Отменено до запуска движка")
     info = ENGINE_INFOS.get(engine_id)
     if info is None:
         return BenchmarkResult(
@@ -242,6 +248,8 @@ async def _run_engine(
     try:
         engine = audio_pipeline.engine_for_id(engine_id)
         await asyncio.to_thread(engine.load)
+    except audio_pipeline.JobCancelledError:
+        raise  # отмена — не ошибка движка, а остановка всего прогона
     except Exception as exc:  # noqa: BLE001 — модель может не подняться по десятку причин
         logger.warning("Сравнение %s: движок %s не поднялся (%s)", run.id, engine_id, exc)
         result.status = STATUS_ERROR
@@ -263,10 +271,13 @@ async def _run_engine(
             label=info.label,
             wait_for_memory=wait_for_memory,
             on_note=on_note,
+            should_abort=should_abort,
         )
         render_sec = time.monotonic() - started
         path = take_path(run.id, engine_id)
         duration = await asyncio.to_thread(audio_pipeline.write_take, path, chunk, tuning)
+    except audio_pipeline.JobCancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001 — движок может упасть на самом синтезе
         logger.warning("Сравнение %s: движок %s не синтезировал (%s)", run.id, engine_id, exc)
         result.status = STATUS_ERROR
@@ -295,6 +306,7 @@ async def run_benchmark(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
     on_progress: ProgressCallback | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> None:
     """Прогоняет фразу голоса по движкам строго по одному.
 
@@ -302,6 +314,10 @@ async def run_benchmark(
     запуск в это время, никогда не видит строку без итога. Ошибка движка
     остаётся в его строке, поэтому весь прогон завершается `done` — сравнение
     состоялось, если состоялся хотя бы один движок.
+
+    Отмена проверяется между движками (и внутри синтеза — между попытками
+    проверки): уже снятые take остаются в `run.results`, а прогон поднимает
+    `JobCancelledError` наружу, к очереди.
     """
     settings = RenderSettings(
         pause_ms=0,
@@ -312,10 +328,14 @@ async def run_benchmark(
     )
     total = len(run.engines)
     for index, engine_id in enumerate(run.engines, start=1):
+        if should_abort and should_abort():
+            raise audio_pipeline.JobCancelledError(
+                f"Отменено на движке {index} из {total}"
+            )
         if on_progress:
             label = ENGINE_INFOS[engine_id].label if engine_id in ENGINE_INFOS else engine_id
             on_progress(index, total, label)
         result = await _run_engine(
-            run, voice, engine_id, run.text, settings, wait_for_memory, on_note
+            run, voice, engine_id, run.text, settings, wait_for_memory, on_note, should_abort
         )
         run.results.append(result)

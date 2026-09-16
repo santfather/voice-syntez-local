@@ -11,6 +11,7 @@ const state = {
   openDetails: {},     // индекс реплики -> раскрыт ли блок «ещё настройки»
   speakerDetails: {},  // ключ спикера -> раскрыт ли блок «ещё настройки голоса»
   replicaBusy: null,   // индекс реплики, которая синтезируется прямо сейчас
+  replicaJobId: null,  // задача этого пересинтеза — по ней работает отмена
   replicaTimer: null,
   takeKey: null,       // "индекс:take_id" варианта, играющего в плеере реплик
   preview: {},         // voice_id -> {speed, cfg_strength, nfe_step, engine_params, text}
@@ -1092,6 +1093,7 @@ function renderVoiceCards() {
           <button class="tiny primary" data-role="preview">Прослушать</button>
           <button class="tiny" data-role="save-preset"
                   title="Записать подобранные настройки в голос — новый диалог начнётся с них">сохранить настройки</button>
+          <button class="tiny ghost danger" data-role="preview-cancel" hidden>Отменить</button>
           <span class="muted preview-status" data-role="preview-status"></span>
         </div>
         <p class="muted preset-state" data-role="preset-state">${esc(presetText(voice))}</p>
@@ -1111,6 +1113,20 @@ function setPreviewStatus(card, message, isError = false) {
   const el = card.querySelector('[data-role="preview-status"]');
   el.textContent = message;
   el.classList.toggle('err', isError);
+}
+
+// Отменяемость показывается у задачи, которая ещё ждёт или уже синтезируется:
+// у завершённой отменять нечего, и кнопка только сбивала бы с толку.
+async function cancelJob(jobId) {
+  return api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+}
+
+function setCancelButton(button, jobId, visible) {
+  if (!button) return;
+  button.hidden = !visible;
+  button.dataset.jobId = visible ? jobId : '';
+  button.disabled = false;
+  button.textContent = 'Отменить';
 }
 
 async function previewVoice(card) {
@@ -1140,9 +1156,28 @@ async function previewVoice(card) {
       }),
     });
     state.previewJob = { jobId: job.job_id, voiceId };
+    setCancelButton(card.querySelector('[data-role="preview-cancel"]'), job.job_id, true);
     state.previewTimer = setInterval(pollPreview, 1500);
   } catch (error) {
     // Ошибку показываем у самой кнопки: иначе сетевой сбой читается как «кнопка не работает»
+    setCancelButton(card.querySelector('[data-role="preview-cancel"]'), '', false);
+    setPreviewStatus(card, error.message, true);
+  }
+}
+
+// Отмена прослушивания: эндпоинт сразу переводит ожидающую задачу в `cancelled`,
+// а идущую просит остановиться на безопасной точке. Опрос не бросаем: статус
+// `cancelled` придёт ответом на ближайший же запрос, и его покажет pollPreview.
+async function cancelPreview(card) {
+  const active = state.previewJob;
+  if (!active) return;
+  const button = card.querySelector('[data-role="preview-cancel"]');
+  if (button) { button.disabled = true; button.textContent = 'Отменяю…'; }
+  try {
+    await cancelJob(active.jobId);
+    setPreviewStatus(card, 'отменяю…');
+  } catch (error) {
+    if (button) { button.disabled = false; button.textContent = 'Отменить'; }
     setPreviewStatus(card, error.message, true);
   }
 }
@@ -1159,11 +1194,25 @@ async function pollPreview() {
   }
   try {
     const job = await api(`/api/jobs/${active.jobId}`);
-    if (job.status === 'queued') { setPreviewStatus(card, 'в очереди…'); return; }
-    if (job.status === 'processing') { setPreviewStatus(card, 'генерирую…'); return; }
+    const button = card.querySelector('[data-role="preview-cancel"]');
+    if (job.status === 'queued') {
+      setPreviewStatus(card, 'в очереди…');
+      setCancelButton(button, active.jobId, true);
+      return;
+    }
+    if (job.status === 'processing') {
+      setPreviewStatus(card, job.cancel_requested ? 'останавливаю…' : 'генерирую…');
+      setCancelButton(button, active.jobId, true);
+      return;
+    }
     clearInterval(state.previewTimer);
     state.previewTimer = null;
     state.previewJob = null;
+    setCancelButton(button, '', false);
+    if (job.status === 'cancelled') {
+      setPreviewStatus(card, 'отменено');
+      return;
+    }
     if (job.status === 'error') {
       setPreviewStatus(card, job.error || 'Не удалось синтезировать голос', true);
       return;
@@ -2325,6 +2374,8 @@ function updateGenerateButton() {
   const button = $('btn-generate');
   button.disabled = !(state.modelReady && assigned)
     || Boolean(state.jobId) || state.sourceDirty;
+  // Кнопка отмены живёт ровно столько, сколько живёт задача.
+  $('btn-cancel-job').hidden = !state.jobId;
   if (!state.modelReady) button.title = 'Модель ещё загружается';
   else if (!speakers.length) button.title = 'Сначала разберите текст на реплики';
   else if (state.sourceDirty) button.title = 'Текст изменён — нажмите «Применить и разобрать»';
@@ -2455,6 +2506,9 @@ function replicaCardHtml(replica) {
         <span class="row">
           <button class="tiny" data-role="play">Play</button>
           <button class="tiny" data-role="regen"${state.replicaBusy === index ? ' disabled' : ''}>Regenerate</button>
+          ${state.replicaBusy === index
+            ? '<button class="tiny ghost danger" data-role="regen-cancel">Отменить</button>'
+            : ''}
           <button class="tiny" data-role="preview">Что услышит модель</button>
         </span>
         <span class="muted">${takeLine}</span>
@@ -2584,15 +2638,31 @@ async function regenerateReplica(index) {
   }
   showAlert($('replica-error'), '');
   state.replicaBusy = index;
+  state.replicaJobId = null;
   renderReplicaCards();
   try {
     const job = await api(`/api/projects/${state.project.id}/replicas/${index}/regenerate`, {
       method: 'POST',
     });
+    state.replicaJobId = job.job_id;
     startTakePoll(job.job_id);
   } catch (error) {
     state.replicaBusy = null;
     renderReplicaCards();
+    showAlert($('replica-error'), error.message);
+  }
+}
+
+// Отмена пересинтеза: реплика остаётся с прежним звучанием — вариант в проект
+// сохраняется только после успешного синтеза, так что терять нечего.
+async function cancelReplicaRegen() {
+  const jobId = state.replicaJobId;
+  if (!jobId) return;
+  showAlert($('replica-error'), '');
+  try {
+    await cancelJob(jobId);
+    showAlert($('replica-error'), 'Отменяю пересинтез', 'info');
+  } catch (error) {
     showAlert($('replica-error'), error.message);
   }
 }
@@ -2612,6 +2682,13 @@ async function pollTakeJob(jobId) {
     clearInterval(state.replicaTimer);
     state.replicaTimer = null;
     state.replicaBusy = null;
+    state.replicaJobId = null;
+    if (job.status === 'cancelled') {
+      // Опрос прекращён: задача отменена, и прогресс по ней больше не идёт.
+      renderReplicaCards();
+      showAlert($('replica-error'), 'Пересинтез отменён', 'info');
+      return;
+    }
     if (job.status === 'error') {
       renderReplicaCards();
       showAlert($('replica-error'), job.error || 'Реплика не пересинтезировалась');
@@ -2624,6 +2701,7 @@ async function pollTakeJob(jobId) {
     clearInterval(state.replicaTimer);
     state.replicaTimer = null;
     state.replicaBusy = null;
+    state.replicaJobId = null;
     renderReplicaCards();
     showAlert($('replica-error'), error.message);
   }
@@ -2679,6 +2757,7 @@ async function generate() {
     });
     state.jobId = job.job_id;
     $('job-status').textContent = `задача ${job.job_id}: в очереди`;
+    $('btn-cancel-job').hidden = false;
     state.pollTimer = setInterval(pollJob, 1500);
     watchEngines();
   } catch (error) {
@@ -2702,12 +2781,22 @@ async function pollJob() {
     }
     if (job.status === 'processing') {
       const eta = job.eta_sec ? `, осталось ~${Math.round(job.eta_sec)} с` : '';
-      $('job-status').textContent = `${job.message}${eta}`;
+      $('job-status').textContent = job.cancel_requested
+        ? 'останавливаю на безопасной точке…'
+        : `${job.message}${eta}`;
       return;
     }
     clearInterval(state.pollTimer);
     state.pollTimer = null;
     state.jobId = null;
+    $('btn-cancel-job').hidden = true;
+    if (job.status === 'cancelled') {
+      // Опрос прекращён: задача больше не живая, и прогресс по ней не идёт.
+      $('job-status').textContent = 'отменено';
+      setProgress(0);
+      updateGenerateButton();
+      return;
+    }
     if (job.status === 'error') {
       $('job-status').textContent = 'ошибка';
       showAlert($('job-error'), job.error || 'Неизвестная ошибка генерации');
@@ -2732,8 +2821,28 @@ async function pollJob() {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
     state.jobId = null;
+    $('btn-cancel-job').hidden = true;
     showAlert($('job-error'), error.message);
     updateGenerateButton();
+  }
+}
+
+// Отмена идущего рендера. Кнопка сразу показывает, что запрос ушёл, а состояние
+// `cancelled` придёт ответом на ближайший опрос — отдельного запроса статуса не нужно.
+async function cancelRender() {
+  const jobId = state.jobId;
+  if (!jobId) return;
+  const button = $('btn-cancel-job');
+  button.disabled = true;
+  button.textContent = 'Отменяю…';
+  try {
+    await cancelJob(jobId);
+    $('job-status').textContent = 'останавливаю на безопасной точке…';
+  } catch (error) {
+    showAlert($('job-error'), error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Отменить';
   }
 }
 
@@ -2824,6 +2933,7 @@ function updateTextButton() {
   const hasVoice = Boolean($('text-voice').value);
   const hasText = Boolean($('text-body').value.trim());
   button.disabled = !(state.modelReady && hasVoice && hasText) || Boolean(state.textJobId);
+  $('btn-cancel-text-job').hidden = !state.textJobId;
   if (!state.modelReady) button.title = 'Модель ещё загружается';
   else if (!hasVoice) button.title = 'Выберите голос';
   else if (!hasText) button.title = 'Вставьте текст или загрузите файл';
@@ -2884,6 +2994,7 @@ async function renderText() {
     });
     state.textJobId = job.job_id;
     $('text-job-status').textContent = `задача ${job.job_id}: кусков ${job.total_replicas}`;
+    $('btn-cancel-text-job').hidden = false;
     state.textPollTimer = setInterval(pollTextJob, 1500);
     watchEngines();
   } catch (error) {
@@ -2903,13 +3014,19 @@ async function pollTextJob() {
     }
     if (job.status === 'processing') {
       const eta = job.eta_sec ? `, осталось ~${Math.round(job.eta_sec)} с` : '';
-      $('text-job-status').textContent = `кусок ${job.current_replica + 1} из ${job.total_replicas}${eta}`;
+      $('text-job-status').textContent = job.cancel_requested
+        ? 'останавливаю на безопасной точке…'
+        : `кусок ${job.current_replica + 1} из ${job.total_replicas}${eta}`;
       return;
     }
     clearInterval(state.textPollTimer);
     state.textPollTimer = null;
     state.textJobId = null;
-    if (job.status === 'error') {
+    $('btn-cancel-text-job').hidden = true;
+    if (job.status === 'cancelled') {
+      $('text-job-status').textContent = 'отменено';
+      setTextProgress(0);
+    } else if (job.status === 'error') {
       $('text-job-status').textContent = 'ошибка';
       showAlert($('text-job-error'), job.error || 'Неизвестная ошибка генерации');
       setTextProgress(0);
@@ -2929,8 +3046,27 @@ async function pollTextJob() {
     clearInterval(state.textPollTimer);
     state.textPollTimer = null;
     state.textJobId = null;
+    $('btn-cancel-text-job').hidden = true;
     showAlert($('text-job-error'), error.message);
     updateTextButton();
+  }
+}
+
+// Отмена идущей озвучки сплошного текста — тем же эндпоинтом, что и у задач рендера.
+async function cancelTextRender() {
+  const jobId = state.textJobId;
+  if (!jobId) return;
+  const button = $('btn-cancel-text-job');
+  button.disabled = true;
+  button.textContent = 'Отменяю…';
+  try {
+    await cancelJob(jobId);
+    $('text-job-status').textContent = 'останавливаю на безопасной точке…';
+  } catch (error) {
+    showAlert($('text-job-error'), error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Отменить';
   }
 }
 
@@ -3117,6 +3253,7 @@ function bindReplicaCards() {
     }
     if (event.target.closest('[data-role="play"]')) { playActiveTake(index); return; }
     if (event.target.closest('[data-role="regen"]')) { regenerateReplica(index); return; }
+    if (event.target.closest('[data-role="regen-cancel"]')) { cancelReplicaRegen(); return; }
     if (event.target.closest('[data-role="preview"]')) { previewReplica(index); return; }
     const row = event.target.closest('.variant-row');
     if (!row) return;
@@ -3161,6 +3298,7 @@ function bindEvents() {
   $('auto-accent').addEventListener('change', () => syncPreviewAccent('dialogue-preview', 'auto-accent'));
   $('text-auto-accent').addEventListener('change', () => syncPreviewAccent('text-preview', 'text-auto-accent'));
   $('btn-generate').addEventListener('click', generate);
+  $('btn-cancel-job').addEventListener('click', cancelRender);
   $('btn-reload-voices').addEventListener('click', () => loadVoices().catch((e) => alert(e.message)));
   $('btn-save-voice').addEventListener('click', createVoice);
   $('btn-recognize-voice').addEventListener('click', recognizeRefText);
@@ -3196,6 +3334,7 @@ function bindEvents() {
     if (event.target.dataset.engineParam) updateEngineParamLabel($('text-engine-params'), event.target);
   });
   $('btn-render-text').addEventListener('click', renderText);
+  $('btn-cancel-text-job').addEventListener('click', cancelTextRender);
   $('text-pause').addEventListener('input', (e) => { $('text-pause-value').textContent = `${e.target.value} мс`; });
   $('text-crossfade').addEventListener('input', (e) => {
     $('text-crossfade-value').textContent = `${parseFloat(e.target.value).toFixed(2)} с`;
@@ -3357,6 +3496,7 @@ function bindEvents() {
     if (!card || !button) return;
     const voiceId = card.dataset.voiceId;
     if (button.dataset.role === 'preview') previewVoice(card);
+    if (button.dataset.role === 'preview-cancel') cancelPreview(card);
     if (button.dataset.role === 'save-preset') saveVoicePreset(voiceId);
     if (button.dataset.role === 'compare') toggleBenchmark(voiceId);
     if (button.dataset.role === 'benchmark-run') runBenchmark(voiceId);
