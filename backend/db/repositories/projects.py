@@ -24,6 +24,12 @@ def _row_to_project(row: sqlite3.Row, replicas: int = 0) -> dict:
         "status": row["status"],
         "job_id": row["job_id"],
         "last_error": row["last_error"],
+        # Готовность текста к синтезу — отдельная ось от `status` (см. миграцию 5).
+        "analysis_status": row["analysis_status"],
+        "analysis_version": row["analysis_version"],
+        "analysis_error": row["analysis_error"],
+        "analysis_started_at": row["analysis_started_at"],
+        "analysis_finished_at": row["analysis_finished_at"],
         "replicas_count": replicas,
     }
 
@@ -94,7 +100,22 @@ class ProjectsRepository:
         лежат в других таблицах (назначение голосов, новый вариант реплики), иначе
         список проектов остался бы отсортированным по времени открытия, а не правки.
         """
-        allowed = {"name", "source_text", "mode", "status", "job_id", "last_error"}
+        allowed = {
+            "name",
+            "source_text",
+            "mode",
+            "status",
+            "job_id",
+            "last_error",
+            # Состояние подготовки текста пишется только через `store`: рендер
+            # обязан видеть его согласованным со стадиями реплик, а прямая запись
+            # из обработчика запроса легко оставила бы «ready» без стадий.
+            "analysis_status",
+            "analysis_version",
+            "analysis_error",
+            "analysis_started_at",
+            "analysis_finished_at",
+        }
         values: dict[str, object] = {}
         for key, value in fields.items():
             if key == "render_settings":

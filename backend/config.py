@@ -62,6 +62,30 @@ PROJECT_STATUS_ERROR = "error"
 REPLICA_STATUS_PENDING = "pending"
 REPLICA_STATUS_RENDERED = "rendered"
 
+# Готовность текста — отдельная ось от статуса рендера. `PROJECT_STATUS_*`
+# отвечает на «что с аудио» (идёт сборка, готово, упало), а `PROJECT_ANALYSIS_*`
+# на «можно ли вообще синтезировать»: пока текст не проанализирован, рендер
+# запрещён, и смешивать эти состояния значило бы потерять это различие.
+PROJECT_ANALYSIS_RAW = "raw"
+PROJECT_ANALYSIS_ANALYZING = "analyzing"
+PROJECT_ANALYSIS_NEEDS_REVIEW = "needs_review"
+PROJECT_ANALYSIS_READY = "ready"
+PROJECT_ANALYSIS_ERROR = "error"
+PROJECT_ANALYSIS_STATUSES = (
+    PROJECT_ANALYSIS_RAW,
+    PROJECT_ANALYSIS_ANALYZING,
+    PROJECT_ANALYSIS_NEEDS_REVIEW,
+    PROJECT_ANALYSIS_READY,
+    PROJECT_ANALYSIS_ERROR,
+)
+
+# Готовность текста одной реплики: `pending` — стадии устарели или их нет,
+# `done` — `final_text` актуален и его можно отправлять в модель, `error` —
+# подготовить не удалось (причина остаётся в `analysis_error`).
+REPLICA_ANALYSIS_PENDING = "pending"
+REPLICA_ANALYSIS_DONE = "done"
+REPLICA_ANALYSIS_ERROR = "error"
+
 # --- Веса модели --------------------------------------------------------------
 # Misha24-10/F5-TTS_RUSSIAN -> F5TTS_v1_Base_accent_tune (полная разметка ударений)
 HF_REPO_ID = os.environ.get("TTS_HF_REPO_ID", "Misha24-10/F5-TTS_RUSSIAN")

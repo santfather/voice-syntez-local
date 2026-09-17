@@ -26,6 +26,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from . import config
 from .audio_pipeline import (
     SpeakerSettings,
     preview_text,
@@ -39,22 +40,19 @@ from .voices_store import Voice
 
 logger = logging.getLogger(__name__)
 
-# Состояние подготовки проекта. Отдельно от `projects.status`, который описывает
-# рендер: «идёт сборка» и «текст ещё не подготовлен» — разные вещи, и именно их
-# различие запрещает запускать синтез по сырому тексту.
-STATUS_RAW = "raw"
-STATUS_ANALYZING = "analyzing"
-STATUS_NEEDS_REVIEW = "needs_review"
-STATUS_READY = "ready"
-STATUS_ERROR = "error"
+# Словарь состояний живёт в `config` рядом с остальными статусами проекта и
+# реплики: он же нужен репозиториям и API, а второй набор констант разошёлся бы с
+# первым на первой же правке.
+STATUS_RAW = config.PROJECT_ANALYSIS_RAW
+STATUS_ANALYZING = config.PROJECT_ANALYSIS_ANALYZING
+STATUS_NEEDS_REVIEW = config.PROJECT_ANALYSIS_NEEDS_REVIEW
+STATUS_READY = config.PROJECT_ANALYSIS_READY
+STATUS_ERROR = config.PROJECT_ANALYSIS_ERROR
+PROJECT_STATUSES = config.PROJECT_ANALYSIS_STATUSES
 
-PROJECT_STATUSES = (STATUS_RAW, STATUS_ANALYZING, STATUS_NEEDS_REVIEW, STATUS_READY, STATUS_ERROR)
-
-# Состояние подготовки одной реплики. `pending` — стадии устарели или их нет,
-# `done` — `final_text` актуален, `error` — подготовить не удалось.
-REPLICA_PENDING = "pending"
-REPLICA_DONE = "done"
-REPLICA_ERROR = "error"
+REPLICA_PENDING = config.REPLICA_ANALYSIS_PENDING
+REPLICA_DONE = config.REPLICA_ANALYSIS_DONE
+REPLICA_ERROR = config.REPLICA_ANALYSIS_ERROR
 
 # Сколько кандидатов показывать на реплику. Меньше, чем в общем списке: реплика
 # диалога короткая, и два десятка предложений на неё — уже шум, а не подсказка.

@@ -11,6 +11,11 @@ def row_to_replica(row: sqlite3.Row) -> dict:
         "id": row["id"],
         "index": row["idx"],
         "text": row["text"],
+        # `source_text` — то же самое, что `text`: отдельной колонки нет, чтобы не
+        # держать два источника правды об исходнике. Второе имя нужно интерфейсу и
+        # API: рядом лежат производные стадии, и «исходный» рядом с «подготовленным»
+        # читается однозначнее, чем `text` рядом с `final_text`.
+        "source_text": row["text"],
         "speaker": row["speaker"],
         "voice_id": row["voice_id"],
         # Собственный голос реплики; None — наследует голос спикера. Отдельно от
@@ -20,6 +25,21 @@ def row_to_replica(row: sqlite3.Row) -> dict:
         "overrides": loads(row["overrides"], {}),
         "status": row["status"],
         "selected_take_id": row["selected_take_id"],
+        # Стадии подготовки (см. миграцию 5). Пустые значения — реплика ещё не
+        # анализировалась; `analysis_status` говорит, можно ли брать `final_text`.
+        "normalized_text": row["normalized_text"],
+        "yo_text": row["yo_text"],
+        "dictionary_text": row["dictionary_text"],
+        "accentized_text": row["accentized_text"],
+        "final_text": row["final_text"],
+        "analysis_status": row["analysis_status"],
+        "analysis_version": row["analysis_version"],
+        "analysis_error": row["analysis_error"],
+        "dictionary_matches": loads(row["dictionary_matches"], []),
+        "pronunciation_candidates": loads(row["pronunciation_candidates"], []),
+        "supports_accents": bool(row["supports_accents"]),
+        "auto_accent": bool(row["auto_accent"]),
+        "effective_engine_params": loads(row["effective_engine_params"], {}),
     }
 
 
@@ -43,20 +63,42 @@ class ReplicasRepository:
         ).fetchone()
         return None if row is None else row_to_replica(row)
 
-    def sync_voices(self, project_id: str, speakers: dict[str, dict]) -> None:
+    def sync_voices(self, project_id: str, speakers: dict[str, dict]) -> list[int]:
         """Разносит назначенный голос спикера по его репликам.
 
         Реплики с собственным голосом не трогаются: пользователь выбрал голос
         именно этой реплике, и смена голоса спикера не должна её переписывать.
+
+        Возвращает индексы реплик, у которых голос **действительно** изменился: по
+        ним инвалидируется подготовка (ударения зависят от движка голоса), а
+        сохранение карточки спикера без правок голоса анализ не сбрасывает —
+        иначе каждое нажатие «сохранить» требовало бы прогонять анализ заново.
         """
+        changed: list[int] = []
         for key, data in speakers.items():
             if "voice_id" not in data:
                 continue
-            self._conn.execute(
-                "UPDATE replicas SET voice_id = ? WHERE project_id = ? AND speaker = ?"
+            new_voice = str(data.get("voice_id") or "")
+            rows = self._conn.execute(
+                "SELECT idx, voice_id FROM replicas WHERE project_id = ? AND speaker = ?"
                 " AND voice_override IS NULL",
-                (str(data.get("voice_id") or ""), project_id, key),
-            )
+                (project_id, key),
+            ).fetchall()
+            changed.extend(int(row["idx"]) for row in rows if row["voice_id"] != new_voice)
+            if rows:
+                self._conn.execute(
+                    "UPDATE replicas SET voice_id = ? WHERE project_id = ? AND speaker = ?"
+                    " AND voice_override IS NULL",
+                    (new_voice, project_id, key),
+                )
+        return sorted(changed)
+
+    def set_text(self, replica_id: int, text: str) -> bool:
+        """Меняет исходный текст одной реплики (правка в карточке)."""
+        cursor = self._conn.execute(
+            "UPDATE replicas SET text = ? WHERE id = ?", (text, replica_id)
+        )
+        return cursor.rowcount > 0
 
     def replace(self, project_id: str, replicas: list[dict]) -> None:
         """Приводит список реплик проекта к новому результату разбора.
@@ -151,6 +193,64 @@ class ReplicasRepository:
             "UPDATE replicas SET status = ? WHERE id = ?", (status, replica_id)
         )
         return cursor.rowcount > 0
+
+    # -- подготовка текста (см. миграцию 5) ------------------------------------
+    def save_analysis(self, replica_id: int, analysis: dict) -> bool:
+        """Записывает стадии подготовки реплики одним обновлением.
+
+        Одним, а не по шагам: половина записанных стадий — это реплика, у которой
+        `final_text` от одной версии анализа, а кандидаты от другой. Рендер потом
+        берёт `final_text`, и такая половинчатость означала бы, что в модель ушёл
+        текст, которого пользователь не видел.
+        """
+        cursor = self._conn.execute(
+            "UPDATE replicas SET normalized_text = ?, yo_text = ?, dictionary_text = ?,"
+            " accentized_text = ?, final_text = ?, analysis_status = ?, analysis_version = ?,"
+            " analysis_error = ?, dictionary_matches = ?, pronunciation_candidates = ?,"
+            " supports_accents = ?, auto_accent = ?, effective_engine_params = ?"
+            " WHERE id = ?",
+            (
+                analysis.get("normalized_text"),
+                analysis.get("yo_text"),
+                analysis.get("dictionary_text"),
+                analysis.get("accentized_text"),
+                analysis.get("final_text"),
+                analysis.get("analysis_status", config.REPLICA_ANALYSIS_DONE),
+                int(analysis.get("analysis_version") or 0),
+                analysis.get("analysis_error"),
+                dumps(analysis.get("dictionary_matches") or []),
+                dumps(analysis.get("pronunciation_candidates") or []),
+                1 if analysis.get("supports_accents", True) else 0,
+                1 if analysis.get("auto_accent", True) else 0,
+                dumps(analysis.get("effective_engine_params") or {}),
+                replica_id,
+            ),
+        )
+        return cursor.rowcount > 0
+
+    def mark_analysis_pending(self, project_id: str, indexes: list[int] | None = None) -> int:
+        """Помечает реплики как требующие повторной подготовки.
+
+        Стадии при этом не стираются: пользователю полезно видеть, что было
+        подготовлено в прошлый раз, а `analysis_status = pending` уже говорит, что
+        брать этот `final_text` для рендера нельзя. Без списка индексов помечаются
+        все реплики проекта — например, когда поменялся движок сразу у всех.
+        """
+        if indexes is None:
+            cursor = self._conn.execute(
+                "UPDATE replicas SET analysis_status = ? WHERE project_id = ?",
+                (config.REPLICA_ANALYSIS_PENDING, project_id),
+            )
+            return cursor.rowcount
+        if not indexes:
+            return 0
+        placeholders = ", ".join("?" for _ in indexes)
+        cursor = self._conn.execute(
+            f"UPDATE replicas SET analysis_status = ? WHERE project_id = ?"
+            f" AND idx IN ({placeholders})",
+            (config.REPLICA_ANALYSIS_PENDING, project_id, *indexes),
+        )
+        return cursor.rowcount
 
     def select_take(self, replica_id: int, take_id: int | None) -> bool:
         cursor = self._conn.execute(

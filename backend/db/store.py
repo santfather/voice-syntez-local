@@ -8,6 +8,7 @@ API работает только через этот класс: держать
 import logging
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config
@@ -16,6 +17,11 @@ from .connection import transaction
 from .repositories.projects import ProjectsRepository
 from .repositories.replicas import ReplicasRepository
 from .repositories.takes import TakesRepository
+
+
+def _now_iso() -> str:
+    """Метка времени анализа в том же формате, что у остальных записей базы."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 logger = logging.getLogger(__name__)
 
@@ -120,15 +126,39 @@ class ProjectsStore:
         speakers = fields.pop("speakers", None)
         with transaction() as connection:
             projects = ProjectsRepository(connection)
-            if projects.get(project_id) is None:
+            current = projects.get(project_id)
+            if current is None:
                 raise KeyError(project_id)
+            replicas = ReplicasRepository(connection)
+            # Причина, по которой подготовка перестала быть актуальной. Список
+            # реплик (`None` — все) и текст причины идут вместе: интерфейс обязан
+            # показать не только «кнопка недоступна», но и почему.
+            stale: list[int] | None = None
+            reason: str | None = None
             if speakers is not None:
                 projects.replace_speakers(project_id, speakers)
-                ReplicasRepository(connection).sync_voices(project_id, speakers)
+                changed = replicas.sync_voices(project_id, speakers)
+                if changed:
+                    stale = changed
+                    reason = "изменился голос спикера: подготовка зависит от движка"
+            if "source_text" in fields and fields["source_text"] != current["source_text"]:
+                stale = None  # текст переписан целиком — устарели все реплики
+                reason = "исходный текст изменён"
+            if "mode" in fields and fields["mode"] != current["mode"]:
+                stale = None
+                reason = "изменён режим проекта"
             if fields:
                 projects.update(project_id, **fields)
             else:
                 projects.update(project_id)
+            if reason is not None:
+                replicas.mark_analysis_pending(project_id, stale)
+                projects.update(
+                    project_id,
+                    analysis_status=config.PROJECT_ANALYSIS_RAW,
+                    analysis_error=reason,
+                )
+                logger.info("Проект %s: подготовка устарела (%s)", project_id, reason)
         return self.get_project(project_id)  # type: ignore[return-value]
 
     def delete_project(self, project_id: str) -> bool:
@@ -193,6 +223,15 @@ class ProjectsStore:
             render_settings = dict(project["render_settings"])
             render_settings["chunk_strategy"] = strategy
             projects.update(project_id, render_settings=render_settings)
+            # Новый разбор — новая подготовка: старые стадии относились к прежним
+            # репликам, и «готово» после правки одной строки было бы неправдой.
+            replicas = ReplicasRepository(connection)
+            replicas.mark_analysis_pending(project_id)
+            projects.update(
+                project_id,
+                analysis_status=config.PROJECT_ANALYSIS_RAW,
+                analysis_error="текст разобран заново — нужен анализ",
+            )
         logger.info("Проект %s: разобрано %s реплик", project_id, len(parsed.replicas))
         return self.get_project(project_id)  # type: ignore[return-value]
 
@@ -204,11 +243,17 @@ class ProjectsStore:
         voice_id: object = UNSET,
         overrides: dict | None = None,
         reset_overrides: bool = False,
+        text: object = UNSET,
     ) -> dict:
-        """Правит одну реплику: голос, отдельные параметры или всё сразу.
+        """Правит одну реплику: текст, голос, отдельные параметры или всё сразу.
 
-        Один вызов на все правки: карточка меняет то голос, то ползунок, и
-        отдельные ручки означали бы, что интерфейс помнит, чем что менять.
+        Один вызов на все правки: карточка меняет то текст, то голос, то ползунок,
+        и отдельные ручки означали бы, что интерфейс помнит, чем что менять.
+
+        Инвалидация подготовки — точечная и по делу: правка текста и смена голоса
+        меняют то, что уйдёт в модель, а ползунок громкости — нет. Поэтому
+        `overrides` не сбрасывают анализ: иначе каждое движение слайдера требовало
+        бы прогонять подготовку заново.
         """
         with transaction() as connection:
             replicas = ReplicasRepository(connection)
@@ -216,13 +261,25 @@ class ProjectsStore:
             if replica is None:
                 raise KeyError(index)
             replica_id = int(replica["id"])
+            reason: str | None = None
+            if text is not UNSET and str(text) != replica["text"]:
+                replicas.set_text(replica_id, str(text))
+                reason = "изменён текст реплики"
             if voice_id is not UNSET:
                 replicas.set_voice(replica_id, voice_id or None)  # type: ignore[arg-type]
+                reason = reason or "изменён голос реплики"
             if reset_overrides:
                 replicas.set_overrides(replica_id, {})
             elif overrides:
                 replicas.set_overrides(
                     replica_id, merge_overrides(replica["overrides"], overrides)
+                )
+            if reason is not None:
+                replicas.mark_analysis_pending(project_id, [index])
+                ProjectsRepository(connection).update(
+                    project_id,
+                    analysis_status=config.PROJECT_ANALYSIS_RAW,
+                    analysis_error=f"реплика {index + 1}: {reason}",
                 )
         return self.get_project(project_id)  # type: ignore[return-value]
 
@@ -237,6 +294,81 @@ class ProjectsStore:
             if replica is None:
                 raise KeyError(index)
             replicas.set_overrides(int(replica["id"]), overrides)
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    # -- подготовка текста (анализ) --------------------------------------------
+    def save_analysis(self, project_id: str, summary) -> dict:
+        """Сохраняет результаты анализа проекта одной транзакцией.
+
+        Одной — потому что состояние проекта и стадии реплик обязаны совпадать:
+        половина записанного анализа означала бы либо «ready» без подготовленного
+        текста, либо подготовленный текст, о котором проект ещё не знает.
+        Версия анализа увеличивается здесь же, поэтому стадии всегда помечены той
+        версией, в которой они получены.
+        """
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            project = projects.get(project_id)
+            if project is None:
+                raise KeyError(project_id)
+            version = int(project["analysis_version"]) + 1
+            replicas = ReplicasRepository(connection)
+            rows = {int(item["index"]): item for item in replicas.list_for_project(project_id)}
+            saved = 0
+            for preparation in summary.replicas:
+                row = rows.get(preparation.index)
+                if row is None:  # реплику убрали, пока шёл анализ
+                    continue
+                replicas.save_analysis(int(row["id"]), {**preparation.to_dict(), "analysis_version": version})
+                saved += 1
+            projects.update(
+                project_id,
+                analysis_status=summary.status,
+                analysis_version=version,
+                analysis_error=summary.error,
+                analysis_finished_at=_now_iso(),
+            )
+        logger.info(
+            "Проект %s: анализ версии %s — %s из %s реплик, состояние %s",
+            project_id, version, saved, len(summary.replicas), summary.status,
+        )
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def mark_analysis_started(self, project_id: str) -> dict:
+        """Отмечает начало анализа: интерфейс видит «анализируется», а не «сырой»."""
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            if projects.get(project_id) is None:
+                raise KeyError(project_id)
+            projects.update(
+                project_id,
+                analysis_status=config.PROJECT_ANALYSIS_ANALYZING,
+                analysis_started_at=_now_iso(),
+                analysis_error=None,
+            )
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def invalidate_analysis(
+        self, project_id: str, *, indexes: list[int] | None = None, reason: str
+    ) -> dict:
+        """Помечает подготовку устаревшей, не стирая её.
+
+        Стадии остаются: пользователю полезно видеть, что было подготовлено в
+        прошлый раз, а `analysis_status = pending` уже говорит, что брать этот
+        `final_text` нельзя. `indexes=None` — устарели все реплики (например,
+        изменился словарь произношения).
+        """
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            if projects.get(project_id) is None:
+                raise KeyError(project_id)
+            replicas = ReplicasRepository(connection)
+            replicas.mark_analysis_pending(project_id, indexes)
+            projects.update(
+                project_id,
+                analysis_status=config.PROJECT_ANALYSIS_RAW,
+                analysis_error=reason,
+            )
         return self.get_project(project_id)  # type: ignore[return-value]
 
     def get_take(self, project_id: str, index: int, take_id: int) -> dict | None:
