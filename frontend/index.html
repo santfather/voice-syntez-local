@@ -199,6 +199,29 @@
           </div>
         </div>
         <div class="panel-body">
+          <!-- Обязательная подготовка диалога: пока текст не проанализирован,
+               синтез запрещён (сервер отвечает 409). Здесь видно состояние и
+               причину, а кнопка анализа отдельная от разбора: разбор — это
+               структура, анализ — подготовленный текст. -->
+          <div class="analysis-bar">
+            <span class="badge" id="analysis-badge">—</span>
+            <span class="muted" id="analysis-state">Анализ ещё не выполнялся</span>
+            <button id="btn-analyze" class="primary">Анализировать диалог</button>
+          </div>
+          <div class="alert error" id="analyze-error"></div>
+          <div id="prepare-summary" class="prepare-summary" hidden></div>
+
+          <!-- Предложения для словаря: неоднозначные слова, которые нельзя
+               разрешать молча. Пока они не подтверждены или не пропущены,
+               проект не станет готовым, и синтез останется недоступным. -->
+          <div id="review-panel" class="review-panel" hidden>
+            <div class="row between">
+              <span class="muted" id="review-title">Слова для проверки</span>
+            </div>
+            <div id="review-list"></div>
+            <div class="alert info" id="review-note"></div>
+          </div>
+
           <!-- Таймлайн читает готовый файл как дорожку: сегменты стоят там, где
                реплики реально звучат, и клик по сегменту открывает её карточку. -->
           <div class="timeline">

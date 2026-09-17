@@ -14,6 +14,8 @@ const state = {
   replicaJobId: null,  // задача этого пересинтеза — по ней работает отмена
   replicaTimer: null,
   takeKey: null,       // "индекс:take_id" варианта, играющего в плеере реплик
+  analysis: null,      // последний ответ /analysis: состояние подготовки диалога
+  analyzeBusy: false,  // анализ в полёте — кнопка заблокирована
   timeline: null,      // последний ответ /timeline: дорожки спикеров и сегменты реплик
   timelineBusy: false, // запрос таймлайна в полёте — кнопка «обновить» заблокирована
   timelineError: null, // текст ошибки таймлайна (показывается под дорожками)
@@ -2431,7 +2433,189 @@ function setSourceState() {
     : 'разбор ещё не выполнялся';
 }
 
-// --- проект: загрузка, разбор, применение ответа API --------------------------
+// --- обязательная подготовка диалога ------------------------------------------
+// Синтез возможен только по проанализированному тексту, и запрет держит сервер
+// (409), а не погашенная кнопка. Здесь показывается состояние, причина и то, что
+// делать дальше: «кнопка не работает» без объяснения — худший вид интерфейса.
+const ANALYSIS_LABELS = {
+  raw: 'не подготовлен',
+  analyzing: 'анализируется',
+  needs_review: 'нужно подтверждение',
+  ready: 'готов',
+  error: 'ошибка анализа',
+};
+
+function analysisStatus() {
+  return (state.analysis && state.analysis.status) || 'raw';
+}
+
+function updateAnalysisBar() {
+  const analysis = state.analysis;
+  const badge = $('analysis-badge');
+  const text = $('analysis-state');
+  const button = $('btn-analyze');
+  const summary = $('prepare-summary');
+
+  if (!state.project || !analysis) {
+    badge.textContent = '—';
+    badge.className = 'badge';
+    text.textContent = 'Разберите текст — анализ подготовит реплики к синтезу';
+    button.disabled = !state.project || state.analyzeBusy;
+    summary.hidden = true;
+    renderReviewPanel();
+    return;
+  }
+
+  const status = analysisStatus();
+  badge.textContent = ANALYSIS_LABELS[status] || status;
+  badge.className = `badge analysis-${status}`;
+  const done = analysis.replicas_done || 0;
+  const total = analysis.replicas_total || 0;
+  const parts = [`реплик подготовлено: ${done} из ${total}`];
+  if (analysis.replicas_pending) parts.push(`ждут анализа: ${analysis.replicas_pending}`);
+  if (analysis.replicas_error) parts.push(`с ошибкой: ${analysis.replicas_error}`);
+  if (analysis.candidates_total) parts.push(`слов на проверку: ${analysis.candidates_total}`);
+  text.textContent = parts.join(' · ');
+
+  button.disabled = state.analyzeBusy || !total;
+  button.textContent = status === 'ready' ? 'Пересчитать анализ' : 'Анализировать диалог';
+
+  // Подтверждение перед синтезом (§7 шаг D): что именно подготовлено.
+  const voices = (state.project.speakers || []).filter((item) => item.voice_id).length;
+  const rules = (state.project.replicas || []).reduce(
+    (sum, replica) => sum + ((replica.dictionary_matches || []).length), 0
+  );
+  const engines = [
+    ...new Set((state.project.replicas || []).map((replica) => replica.engine).filter(Boolean)),
+  ];
+  const accents = engines.length
+    ? engines.map((engine) => `${engineLabel(engine)}: ${engineInfo(engine).supports_accents ? 'включены' : 'не поддерживает'}`).join(', ')
+    : '—';
+  summary.hidden = false;
+  summary.innerHTML = [
+    `<span>Подготовлено реплик: <b>${done}</b></span>`,
+    `<span>Голоса: <b>${voices}</b></span>`,
+    `<span>Словарь: <b>${rules}</b> применённых правил</span>`,
+    `<span>Ударения: <b>${esc(accents)}</b></span>`,
+  ].join('');
+  renderReviewPanel();
+}
+
+async function refreshAnalysis() {
+  if (!state.project) {
+    state.analysis = null;
+    updateAnalysisBar();
+    return null;
+  }
+  try {
+    state.analysis = await api(`/api/projects/${state.project.id}/analysis`);
+  } catch (error) {
+    // Состояние — вспомогательная информация: не смогли прочитать, покажем
+    // «не подготовлен» и не будем мешать работать с карточками.
+    state.analysis = null;
+    showAlert($('analyze-error'), error.message);
+  }
+  updateAnalysisBar();
+  updateGenerateButton();
+  return state.analysis;
+}
+
+async function analyzeDialogue() {
+  if (!state.project || state.analyzeBusy) return;
+  showAlert($('analyze-error'), '');
+  state.analyzeBusy = true;
+  updateAnalysisBar();
+  try {
+    if (state.sourceDirty) {
+      // Анализ разбирает текст сам: держать несохранённую правку в стороне
+      // значило бы анализировать не то, что видит пользователь.
+      const parsed = await api(`/api/projects/${state.project.id}/parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunk_strategy: $('chunk-strategy').value }),
+      });
+      state.sourceDirty = false;
+      applyProject(parsed);
+    }
+    const report = await api(`/api/projects/${state.project.id}/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_accent: $('auto-accent').checked }),
+    });
+    await applyProject(await api(`/api/projects/${state.project.id}`), { analysis: false });
+    await refreshAnalysis();
+    if (report.status === 'error') {
+      showAlert($('analyze-error'), report.errors.map((item) => item.text).join('; '));
+    }
+  } catch (error) {
+    showAlert($('analyze-error'), error.message);
+  } finally {
+    state.analyzeBusy = false;
+    updateAnalysisBar();
+    updateGenerateButton();
+  }
+}
+
+function renderReviewPanel() {
+  const panel = $('review-panel');
+  const list = $('review-list');
+  const candidates = (state.analysis && state.analysis.candidates) || [];
+  panel.hidden = !candidates.length;
+  if (!candidates.length) {
+    list.innerHTML = '';
+    return;
+  }
+  $('review-title').textContent =
+    `Слова для проверки: ${candidates.length}. Пока они не решены, синтез недоступен.`;
+  $('review-note').textContent =
+    'Подтверждение добавляет правило в общий словарь произношения — оно подействует на все проекты. '
+    + 'Пропуск оставляет слово как есть и больше его не предлагает.';
+  list.innerHTML = candidates
+    .map(
+      (item, index) => `
+      <div class="card review-row" data-index="${index}">
+        <div class="row between">
+          <span><b>${esc(item.word)}</b> → <span class="muted">${esc(item.target || 'нужна замена')}</span></span>
+          <span class="muted">реплика ${item.replica_index + 1}</span>
+        </div>
+        <div class="muted review-reason">${esc(item.reason || '')}</div>
+        <div class="row">
+          <button class="tiny primary" data-review="accept" data-index="${index}">Добавить в словарь</button>
+          <button class="tiny ghost" data-review="skip" data-index="${index}">Пропустить</button>
+        </div>
+      </div>`
+    )
+    .join('');
+}
+
+async function reviewCandidate(index, action) {
+  const item = (state.analysis.candidates || [])[index];
+  if (!item) return;
+  const accepted = action === 'accept' && Boolean((item.target || '').trim());
+  try {
+    await api('/api/pronunciation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: item.word,
+        target: item.target || item.word,
+        enabled: accepted,
+        note: accepted ? '' : 'пропущено при подготовке диалога',
+      }),
+    });
+    // Пересчитываем только затронутую реплику: слово встретилось в ней.
+    await api(`/api/projects/${state.project.id}/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ indexes: [item.replica_index] }),
+    });
+    await applyProject(await api(`/api/projects/${state.project.id}`), { analysis: false });
+    await refreshAnalysis();
+  } catch (error) {
+    showAlert($('analyze-error'), error.message);
+  }
+}
+
 async function ensureProject() {
   if (state.project) return state.project;
   const source = $('dialogue').value;
@@ -2478,7 +2662,7 @@ async function loadSavedProject() {
   setSourceState();
 }
 
-function applyProject(project, { speakers = true } = {}) {
+function applyProject(project, { speakers = true, analysis = true } = {}) {
   state.project = project;
   // Реплики заменены целиком: показанный ранее preview относился к прежнему
   // тексту или голосу и после разбора был бы уже неправдой. Таймлайн тоже
@@ -2490,9 +2674,14 @@ function applyProject(project, { speakers = true } = {}) {
   renderReplicaCards();
   renderParseSummary();
   setSourceState();
+  updateAnalysisBar();
   updateGenerateButton();
   renderTimeline();
   refreshTimeline();
+  // Состояние подготовки живёт отдельным запросом: оно меняется и без правок
+  // проекта (словарь, инвалидация), поэтому обновляем его вместе с карточками.
+  // Вызывающий, который уже получил свежий ответ, просит не повторять запрос.
+  if (analysis) refreshAnalysis().catch(() => {});
 }
 
 async function refreshProject() {
@@ -2816,15 +3005,27 @@ function updateGenerateButton() {
   const speakers = (state.project && state.project.speakers) || [];
   const assigned = speakers.length > 0 && speakers.every((speaker) => speaker.voice_id);
   const button = $('btn-generate');
-  button.disabled = !(state.modelReady && assigned)
+  // Анализ — не подсказка, а условие: сервер откажет в рендере без него (409),
+  // поэтому кнопка гаснет по тому же признаку и объясняет причину.
+  const status = analysisStatus();
+  const prepared = Boolean(state.analysis) && status === 'ready';
+  button.disabled = !(state.modelReady && assigned && prepared)
     || Boolean(state.jobId) || state.sourceDirty;
   // Кнопка отмены живёт ровно столько, сколько живёт задача.
   $('btn-cancel-job').hidden = !state.jobId;
+  const reason = (state.analysis && state.analysis.analysis_error) || '';
   if (!state.modelReady) button.title = 'Модель ещё загружается';
   else if (!speakers.length) button.title = 'Сначала разберите текст на реплики';
   else if (state.sourceDirty) button.title = 'Текст изменён — нажмите «Применить и разобрать»';
   else if (!assigned) button.title = 'Выберите голос для каждого участника диалога';
-  else button.title = '';
+  else if (!state.analysis) button.title = 'Состояние подготовки неизвестно — откройте вкладку заново';
+  else if (status === 'needs_review') {
+    button.title = 'Есть слова для проверки — подтвердите или пропустите их в панели «Слова для проверки»';
+  } else if (status === 'error') {
+    button.title = `Анализ не удался${reason ? `: ${reason}` : ''}`;
+  } else if (status !== 'ready') {
+    button.title = `Сначала выполните анализ диалога${reason ? ` (${reason})` : ''}`;
+  } else button.title = '';
   // Кнопка экспорта живёт по другому условию — проекта с репликами, а не модели:
   // выгрузка ничего не синтезирует и от готовности движка не зависит.
   updateExportButtons();
@@ -4142,7 +4343,12 @@ function bindEvents() {
   // переписывать их (вместе с правками карточек и историей вариантов) нельзя.
   $('dialogue').addEventListener('input', markSourceDirty);
   $('btn-apply-source').addEventListener('click', applySource);
+  $('btn-analyze').addEventListener('click', analyzeDialogue);
   bindReplicaCards();
+  $('review-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-review]');
+    if (button) reviewCandidate(Number(button.dataset.index), button.dataset.review);
+  });
   // Панели «что услышит модель» монтируются здесь, а списки голосов и движков
   // заполняются, когда они придут из API (renderPreviewPanels).
   renderPreviewPanels();

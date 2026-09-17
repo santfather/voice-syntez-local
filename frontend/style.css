@@ -831,3 +831,65 @@ footer b { color: #aaa8b0; font-weight: 400; }
   .parse-button { margin-left: 0; }
   footer { flex-direction: column; padding: 12px 16px; }
 }
+
+/* --- обязательная подготовка диалога ------------------------------------------ */
+.analysis-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.analysis-bar .badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid currentColor;
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
+/* Цвет состояния: серый — не готов, жёлтый — нужно решение, зелёный — готов,
+   красный — ошибка. Цвет дублируется подписью: одним цветом состояние не
+   сообщают. */
+.analysis-bar .badge.analysis-raw { color: #9aa4b2; }
+.analysis-bar .badge.analysis-analyzing { color: #8ab4f8; }
+.analysis-bar .badge.analysis-needs_review { color: #e8b84b; }
+.analysis-bar .badge.analysis-ready { color: #4caf7d; }
+.analysis-bar .badge.analysis-error { color: #e05a5a; }
+
+.analysis-bar #btn-analyze { margin-left: auto; }
+
+.prepare-summary {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted, #9aa4b2);
+  padding: 6px 2px 2px;
+}
+
+.review-panel {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid #e8b84b55;
+  border-radius: 8px;
+  background: rgba(232, 184, 75, 0.06);
+}
+
+.review-panel .review-row {
+  margin-top: 8px;
+  padding: 8px 10px;
+}
+
+.review-panel .review-reason {
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
