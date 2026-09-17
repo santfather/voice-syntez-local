@@ -162,6 +162,65 @@ def engine_idle_unload_minutes() -> float:
         return DEFAULT_ENGINE_IDLE_UNLOAD_MIN
     return minutes if minutes > 0 else 0.0
 
+
+# --- Изоляция синтеза в отдельном процессе (creash_report) --------------------
+# Модель и инференс живут в дочернем процессе. Причина не в архитектурной
+# красоте: падение нативной библиотеки (SIGABRT/SIGSEGV) или убийство процесса
+# по памяти убивало весь бэкенд вместе с базой, очередью и уже готовыми
+# репликами. С изоляцией падает только воркер, а бэкенд видит код возврата,
+# объясняет причину и поднимает замену.
+WORKER_ISOLATION_ENV = "TTS_WORKER_ISOLATION"
+DEFAULT_WORKER_ISOLATION = True
+# Маркер дочернего процесса: внутри воркера реестр обязан собирать настоящий
+# движок, а не ещё одного воркера (иначе рекурсия).
+WORKER_CHILD_ENV = "TTS_WORKER_CHILD"
+# Фабрика движка для дочернего процесса в формате «модуль:функция» — шов для
+# тестов изоляции: проверять падение и перезапуск на настоящей модели нельзя.
+WORKER_ENGINE_FACTORY_ENV = "TTS_WORKER_ENGINE_FACTORY"
+WORKER_MODULE = "backend.engines.worker_process"
+# Запас к таймауту куска: сам таймаут ставит пайплайн (`CHUNK_TIMEOUT_SEC`), и
+# его вердикт точнее — там известна реплика. Воркер получает таймаут чуть
+# больше, иначе ответ «не уложился» приходил бы из двух мест по-разному.
+WORKER_TIMEOUT_SLACK_SEC = float(os.environ.get("TTS_WORKER_TIMEOUT_SLACK_SEC", "60"))
+WORKER_REQUEST_TIMEOUT_SEC = CHUNK_TIMEOUT_SEC + WORKER_TIMEOUT_SLACK_SEC
+# Подъём модели в воркере: XTTS-banana грузится минутами, поэтому таймаут не
+# меньше, чем у куска.
+WORKER_LOAD_TIMEOUT_SEC = float(
+    os.environ.get("TTS_WORKER_LOAD_TIMEOUT_SEC", str(max(CHUNK_TIMEOUT_SEC, 600.0)))
+)
+# Сколько ждать добровольного выхода воркера при выгрузке и выключении, прежде
+# чем убить его: `shutdown` по каналу + `SIGTERM` + `SIGKILL`.
+WORKER_SHUTDOWN_GRACE_SEC = float(os.environ.get("TTS_WORKER_SHUTDOWN_GRACE_SEC", "10"))
+# Защита от цикла падений: столько отказов за окно переводят движок в DEGRADED —
+# новые задачи по нему не стартуют, пока не истечёт пауза. Без этого «падение на
+# каждой реплике» превращалось бы в бесконечный перезапуск процессов.
+WORKER_CRASH_LIMIT = int(os.environ.get("TTS_WORKER_CRASH_LIMIT", "3"))
+WORKER_CRASH_WINDOW_SEC = float(os.environ.get("TTS_WORKER_CRASH_WINDOW_SEC", "60"))
+WORKER_DEGRADED_COOLDOWN_SEC = float(os.environ.get("TTS_WORKER_DEGRADED_COOLDOWN_SEC", "120"))
+# Сколько раз задача автоматически повторяется после падения воркера. Один
+# повтор — компромисс: разовый сбой (OOM от соседнего процесса) лечится сам, а
+# систематический не превращается в бесконечный цикл.
+WORKER_CRASH_RETRIES = int(os.environ.get("TTS_WORKER_CRASH_RETRIES", "1"))
+# Потолок памяти воркера (МБ): вес моделей виден только в его процессе, поэтому
+# watchdog следит за ним отдельно (см. resource_guard).
+WORKER_MAX_RSS_MB = int(os.environ.get("TTS_WORKER_MAX_RSS_MB", str(MAX_RSS_MB)))
+
+
+def worker_isolation_enabled() -> bool:
+    """Включена ли изоляция инференса — читается **в момент вызова**.
+
+    Функцией, а не константой: тесты выключают изоляцию на время одного теста
+    (`monkeypatch.setenv`), а дочерний процесс обязан получить `False` по
+    маркеру `TTS_WORKER_CHILD` независимо от настроек родителя.
+    """
+    if os.environ.get(WORKER_CHILD_ENV):
+        return False
+    raw = os.environ.get(WORKER_ISOLATION_ENV)
+    if raw is None:
+        return DEFAULT_WORKER_ISOLATION
+    return raw.strip().lower() not in ("0", "false", "no", "off", "выкл")
+
+
 # Сколько хранить готовые файлы в output/
 OUTPUT_TTL_HOURS = float(os.environ.get("TTS_OUTPUT_TTL_HOURS", "24"))
 # Максимальная длина куска (символов), который уходит в модель за один прогон.

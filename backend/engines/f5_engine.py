@@ -26,7 +26,6 @@ class F5Engine(SynthesisEngine):
     """F5-TTS как один из движков синтеза."""
 
     info = ENGINE_INFOS[ENGINE_F5]
-    supports_seed = True
 
     def __init__(self) -> None:
         super().__init__()

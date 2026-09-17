@@ -1,13 +1,24 @@
 """Реестр движков: по одному тёплому экземпляру на движок на весь процесс.
 
-Конкретные классы импортируются лениво, внутри `get_engine`: импорт XTTS тянет
-torch и coqui-tts (десятки секунд и сотни мегабайт RSS), и делать это при старте
-сервера незачем — движок поднимается, только когда его выбрал хотя бы один голос.
+Конкретные классы импортируются лениво, внутри `create_local_engine`: импорт XTTS
+тянет torch и coqui-tts (десятки секунд и сотни мегабайт RSS), и делать это при
+старте сервера незачем — движок поднимается, только когда его выбрал хотя бы один
+голос.
+
+С изоляцией инференса (creash_report) у реестра две роли, и они разведены
+намеренно:
+
+* `get_engine` отдаёт то, чем пользуется пайплайн: при включённой изоляции —
+  прокси воркера (`WorkerEngine`), иначе — настоящий движок в этом процессе;
+* `create_local_engine` собирает настоящий движок в **текущем** процессе. Его
+  зовёт дочерний процесс воркера, и это единственное место, где классы моделей
+  вообще появляются. Второй реализации F5/XTTS не существует.
 """
 
 import logging
 import threading
 
+from .. import config
 from .base import (
     ENGINE_F5,
     ENGINE_INFOS,
@@ -22,7 +33,8 @@ _instances: dict[str, SynthesisEngine] = {}
 _lock = threading.Lock()
 
 
-def _create(engine_id: str) -> SynthesisEngine:
+def create_local_engine(engine_id: str) -> SynthesisEngine:
+    """Настоящий движок в текущем процессе. Тяжёлый импорт — внутри, не на входе."""
     if engine_id == ENGINE_F5:
         from .f5_engine import F5Engine
 
@@ -32,6 +44,16 @@ def _create(engine_id: str) -> SynthesisEngine:
 
         return create_xtts_engine(engine_id)
     raise ValueError(f"Неизвестный движок синтеза: {engine_id}")
+
+
+def _create(engine_id: str) -> SynthesisEngine:
+    """Что кладётся в реестр: прокси воркера или движок в этом процессе."""
+    if config.worker_isolation_enabled():
+        from .worker_engine import WorkerEngine
+
+        logger.info("Движок %s будет работать в отдельном процессе", engine_id)
+        return WorkerEngine(engine_id)
+    return create_local_engine(engine_id)
 
 
 def get_engine(engine_id: str) -> SynthesisEngine:

@@ -117,6 +117,11 @@ class EngineInfo:
     # Короткая справка про ресурсы и лицензию — показывается в интерфейсе.
     note: str = ""
     params: tuple[EngineParam, ...] = ()
+    # Понимает ли движок `seed`. Живёт в паспорте, а не только атрибутом класса:
+    # паспорт читает и прокси изолированного движка (engines/worker_engine.py),
+    # который обязан знать про сид, не импортируя модуль движка (тот тянет torch
+    # и веса). Источник истины один — здесь.
+    supports_seed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +129,7 @@ class EngineInfo:
             "label": self.label,
             "description": self.description,
             "supports_accents": self.supports_accents,
+            "supports_seed": self.supports_seed,
             "note": self.note,
             "params": [param.to_dict() for param in self.params],
         }
@@ -135,6 +141,7 @@ ENGINE_INFOS: dict[str, EngineInfo] = {
         label="F5-TTS Russian",
         description="Файнтюн под русский с разметкой ударений. Основной движок проекта.",
         supports_accents=True,
+        supports_seed=True,
         note="Веса ~1.4 ГБ, работает офлайн.",
     ),
     ENGINE_XTTS: EngineInfo(
@@ -142,6 +149,7 @@ ENGINE_INFOS: dict[str, EngineInfo] = {
         label="XTTS v2 (базовая)",
         description="Многоязычная модель Coqui, клонирование по 6–15 с референса.",
         supports_accents=False,
+        supports_seed=True,
         note="Веса ~1.9 ГБ, лицензия CPML (некоммерческая). Ударения не понимает — текст идёт как есть.",
         params=(
             EngineParam(
@@ -169,6 +177,7 @@ ENGINE_INFOS: dict[str, EngineInfo] = {
         label="XTTS v2 + русский файнтюн (banana)",
         description="Комьюнити-файнтюн под живую русскую речь: лучше держит разговорные ударения.",
         supports_accents=False,
+        supports_seed=True,
         note=(
             "Веса ~5.2 ГБ, лицензия базовой модели (CPML, некоммерческая). Обучен преимущественно "
             "на женских голосах — мужские реплики через него могут звучать феминизированно."
@@ -242,7 +251,14 @@ class SynthesisEngine(ABC):
     # torch: без него одна и та же реплика каждый раз звучит по-новому, и
     # понравившийся вариант нельзя ни выбрать осознанно, ни повторить. Пайплайн
     # передаёт сид только таким движкам и записывает его рядом с куском.
-    supports_seed: bool = False
+    #
+    # Значение берётся из паспорта, а не из атрибута класса: у изолированного
+    # движка (engines/worker_engine.py) нет доступа к классу модели — его импорт
+    # стоит десятков секунд и сотни мегабайт. Движки, которым нужно иное значение
+    # (заглушки в тестах), по-прежнему могут перекрыть его атрибутом класса.
+    @property
+    def supports_seed(self) -> bool:
+        return self.info.supports_seed
 
     def __init__(self) -> None:
         self._state = STATE_IDLE

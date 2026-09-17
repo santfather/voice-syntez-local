@@ -14,9 +14,27 @@ import soundfile as sf
 
 from backend import audio_pipeline, config, job_queue, model_manager
 from backend.engines.base import SAMPLE_RATE, STATE_READY, EngineInfo, SynthesisEngine
+from backend.engines.supervisor import get_supervisor
 from backend.voices_store import Voice
 
 STUB_ENGINE_ID = "stub"
+
+
+@pytest.fixture(autouse=True)
+def _no_worker_isolation(monkeypatch):
+    """По умолчанию изоляция синтеза выключена — как и раньше, модели не поднимаются.
+
+    Иначе любой тест, дёрнувший настоящий реестр (`registry.get_engine("f5")`),
+    запускал бы дочерний процесс с torch и весами. Тесты самой изоляции включают
+    её сами и подставляют лёгкую фабрику движка (см. test_worker_isolation.py).
+    """
+    monkeypatch.setenv(config.WORKER_ISOLATION_ENV, "0")
+    yield
+    # Процессы, поднятые тестом изоляции, не должны переживать тест: осиротевший
+    # воркер держал бы память и портил бы следующий прогон.
+    supervisor = get_supervisor()
+    supervisor.stop_all(grace=1.0)
+    supervisor.reset_after_stop()
 
 
 class StubEngine(SynthesisEngine):

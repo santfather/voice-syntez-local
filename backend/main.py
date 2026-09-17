@@ -48,6 +48,7 @@ from .engines.base import (
     EngineInfo,
 )
 from .engines.registry import created_engine, created_engines, get_engine
+from .engines.supervisor import get_supervisor
 from .job_queue import (
     PRIORITY_BACKGROUND,
     PRIORITY_PREVIEW,
@@ -438,6 +439,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await get_queue().stop()
+        # Воркеры синтеза останавливаются последними: очередь уже не запускает
+        # новых задач, поэтому ни один процесс не остаётся с моделью в памяти и
+        # без хозяина (см. engines/supervisor).
+        get_supervisor().stop_all()
         guard_task.cancel()
         warmup_task.cancel()
         idle_unload_task.cancel()
@@ -473,6 +478,13 @@ async def status() -> dict:
         # Опциональная очистка референса: без DeepFilterNet тумблер в форме гаснет.
         "denoise_available": denoise.is_available(),
         "queue_size": get_queue().queue_size(),
+        # Изоляция синтеза: где живёт модель и что с процессом воркера. Отдельным
+        # блоком, а не внутри движков, потому что процесс — единица отказа: он
+        # падает, перезапускается и временно отключается независимо от модели.
+        # Читается из памяти супервизора: ни модели, ни инференса статус не ждёт,
+        # поэтому остаётся доступным, даже когда воркер мёртв.
+        "worker_isolation": config.worker_isolation_enabled(),
+        "workers": get_supervisor().status(),
         # Память MPS: на Apple Silicon вес моделей не виден в RSS (см. MAX_RSS_MB),
         # поэтому здесь best-effort счётчики torch. `None` — torch/MPS недоступны;
         # ошибка чтения метрики не должна валить статус.

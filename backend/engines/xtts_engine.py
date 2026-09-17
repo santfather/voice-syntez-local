@@ -72,8 +72,6 @@ def resolve_checkpoint_dir(root: Path) -> Path | None:
 class XTTSEngine(SynthesisEngine):
     """Одна модель XTTS v2: загрузка, кеш латентов референсов и инференс."""
 
-    supports_seed = True
-
     def __init__(self, info_id: str, checkpoint_root: Path) -> None:
         super().__init__()
         self.info = ENGINE_INFOS[info_id]

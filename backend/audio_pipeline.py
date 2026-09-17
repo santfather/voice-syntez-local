@@ -19,6 +19,7 @@ from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
 from .engines.registry import get_engine
+from .engines.worker_protocol import text_fingerprint
 from .pronunciation import active_rules
 from .settings_resolution import (
     COMMON_FIELDS,
@@ -35,6 +36,20 @@ logger = logging.getLogger(__name__)
 
 # Ограничитель пика после нормализации: выше 0 dBFS файл клипует.
 _PEAK_LIMIT = 0.99
+
+
+def _text_fingerprint_text(text: str) -> str:
+    """Отпечаток реплики для лога: длина, хеш и короткая выжимка.
+
+    Текст реплики — пользовательский контент, и в логе он не нужен целиком; но
+    при разборе падения важно понять, на какой именно реплике оно случилось, и
+    сверить это с тем, что человек видит в интерфейсе (см. worker_protocol).
+    """
+    fingerprint = text_fingerprint(text)
+    return (
+        f"{fingerprint['length']} знаков, sha1 {fingerprint['sha1']}, "
+        f"«{fingerprint['preview']}»"
+    )
 
 ProgressCallback = Callable[[int, int, str], None]
 # Ожидание освобождения памяти перед повторной попыткой (её ставит очередь).
@@ -225,6 +240,12 @@ class ChunkVariant:
 
 class ChunkTimeoutError(RuntimeError):
     """Синтез одного куска не уложился в TTS_CHUNK_TIMEOUT_SEC — похоже на зависание."""
+
+
+# Сколько ждать подтверждения, что зависший воркер убит. Короткий шаг: ответ
+# пользователю важнее, а `abort_current` — это `kill()` плюс ожидание кода
+# возврата, то есть секунды, а не минуты.
+ABORT_TIMEOUT_SEC = 15.0
 
 
 class JobAbortedError(RuntimeError):
@@ -698,9 +719,25 @@ async def _synthesize_chunk(
             timeout=config.CHUNK_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError as exc:
+        # Зависший инференс нельзя прервать снаружи, если модель живёт в отдельном
+        # процессе: поток остался бы в нативном вызове, воркер — занятым навсегда,
+        # и следующая реплика встала бы за ним в очередь. Поэтому таймаут не
+        # только сообщается наверх, но и убивает процесс движка. Хук
+        # необязательный (`abort_current` есть только у изолированного движка):
+        # движки в процессе бэкенда о нём не знают и знать не должны.
+        abort = getattr(engine, "abort_current", None)
+        if callable(abort):
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(abort, f"таймаут {config.CHUNK_TIMEOUT_SEC:.0f} с"),
+                    timeout=ABORT_TIMEOUT_SEC,
+                )
+            except Exception as abort_exc:  # noqa: BLE001 — исход всё равно таймаут
+                logger.error("Не удалось прервать зависший синтез %s: %s", engine.id, abort_exc)
         logger.warning(
-            "Таймаут синтеза: реплика %s не готова за %.0f c (движок %s, голос %s, %s знаков): %.200s",
-            position, config.CHUNK_TIMEOUT_SEC, engine.id, tuning.voice_id, len(text), text,
+            "Таймаут синтеза: реплика %s не готова за %.0f c (движок %s, голос %s, %s)",
+            position, config.CHUNK_TIMEOUT_SEC, engine.id, tuning.voice_id,
+            _text_fingerprint_text(text),
         )
         raise ChunkTimeoutError(
             f"Реплика {position} не синтезировалась за {config.CHUNK_TIMEOUT_SEC:.0f} c "
