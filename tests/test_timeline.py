@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 import soundfile as sf
+from conftest import analyze_project
 
 from backend import audio_pipeline, config, main, timeline
 from backend.audio_pipeline import RenderSettings
@@ -91,6 +92,7 @@ async def _patch_speakers(client, project_id: str, speakers: dict) -> dict:
 
 
 async def _render(client, project_id: str, **options) -> str:
+    await analyze_project(client, project_id)
     accepted = await client.post(f"/api/projects/{project_id}/render", json=options)
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]
@@ -467,6 +469,9 @@ def test_replica_without_take_keeps_cursor(stub, fake_store, monkeypatch):
     async def scenario():
         async with _client(monkeypatch) as client:
             project = await _prepared_text_project(client, "ИВАН: Раз.\nМАРГО: Два.")
+            # Обязательная подготовка: пересинтез реплики берёт сохранённый текст,
+            # поэтому без анализа он запрещён — как и в интерфейсе.
+            await analyze_project(client, project["id"])
             # Голос есть у обоих, но рендерим только… — проще: не рендерим вовсе.
             empty = await _timeline(client, project["id"])
             assert [segment["has_audio"] for segment in empty["replicas"]] == [False, False]

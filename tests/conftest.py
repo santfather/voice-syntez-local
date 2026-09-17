@@ -136,3 +136,126 @@ def fake_store(monkeypatch, voice):
 
     monkeypatch.setattr(audio_pipeline, "get_store", lambda: Store())
     return voice
+
+
+# --- общий шаг сценариев --------------------------------------------------------
+async def analyze_project(client, project_id: str, **body) -> dict:
+    """Доводит проект до готовности к рендеру — тем же путём, что интерфейс.
+
+    Рендер неподготовленного проекта запрещён (409), поэтому каждый сценарий,
+    доходящий до звука, проходит обязательную подготовку: анализ, а затем review
+    найденных слов. Кандидаты подтверждаются предложенным вариантом — ровно то,
+    что делает пользователь кнопкой «Добавить». Хелпер общий нарочно: если бы
+    каждый тест готовил проект по-своему, они проверяли бы разные пути подготовки,
+    а не один канонический.
+    """
+    state = await _analyze(client, project_id, **body)
+    # Review: неоднозначные слова нельзя разрешать молча, но и оставлять проект
+    # неготовым в сценарии, который проверяет не review, нельзя. Подтверждаем
+    # предложенное и пересчитываем только затронутые реплики.
+    for _ in range(5):
+        if state["status"] != "needs_review" or not state["candidates"]:
+            break
+        touched: list[int] = []
+        for candidate in state["candidates"]:
+            # Сценарии, которые проверяют не review, проходят его «пропуском»:
+            # пропуск ничего не меняет в произношении (правило выключено) и лишь
+            # снимает предложение с показа. Принятие предложения, наоборот,
+            # поменяло бы текст — и тест, сверяющий текст, проверял бы уже другое.
+            response = await client.post(
+                "/api/pronunciation",
+                json={
+                    "source": candidate["word"],
+                    "target": candidate["target"] or candidate["word"],
+                    "enabled": False,
+                    "note": "пропущено в тестовом сценарии",
+                },
+            )
+            assert response.status_code in (200, 201), response.text
+            if candidate["replica_index"] not in touched:
+                touched.append(candidate["replica_index"])
+        state = await _analyze(client, project_id, indexes=touched)
+    assert state["status"] == "ready", state
+    return state
+
+
+async def _analyze(client, project_id: str, **body) -> dict:
+    """Один прогон анализа: состояние проекта и найденные кандидаты."""
+    response = await client.post(f"/api/projects/{project_id}/analyze", json=body or {})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+# --- общие фикстуры двух движков -------------------------------------------------
+# Живут здесь, а не в одном из тестовых модулей: их используют и preview, и
+# сценарии обязательной подготовки, а импортировать фикстуры из чужого тестового
+# модуля — значит связывать тесты между собой.
+class AccentStubEngine(StubEngine):
+    """Заглушка F5: говорит, что понимает «+»-ударения, как настоящий движок."""
+
+    info = EngineInfo(
+        id="stub-accents",
+        label="Заглушка с ударениями",
+        description="Тестовый движок вместо F5-TTS — модель не поднимается.",
+        supports_accents=True,
+    )
+
+
+class _VoiceStore:
+    """Хранилище из нескольких голосов: есть из чего выбирать движок."""
+
+    def __init__(self, *voices: Voice) -> None:
+        self._voices = {voice.id: voice for voice in voices}
+
+    def get(self, voice_id: str) -> Voice | None:
+        return self._voices.get(voice_id)
+
+
+F5_VOICE = "voice-f5"
+XTTS_VOICE = "voice-xtts"
+
+
+@pytest.fixture
+def voices(workspace, monkeypatch):
+    """Два голоса разных движков — по одному на каждую ветку ударений."""
+    import soundfile as sf
+
+    from backend.engines.base import ENGINE_F5, ENGINE_XTTS
+
+    sf.write(workspace / "voices" / "f5.wav", sine(2.0, 180.0), SAMPLE_RATE)
+    sf.write(workspace / "voices" / "xtts.wav", sine(2.0, 240.0), SAMPLE_RATE)
+    f5 = Voice(
+        id=F5_VOICE, name="Ф5", gender="male", ref_text="Привет, это тест",
+        audio_file="f5.wav", engine=ENGINE_F5,
+    )
+    xtts = Voice(
+        id=XTTS_VOICE, name="Икс", gender="female", ref_text="Привет, это тест",
+        audio_file="xtts.wav", engine=ENGINE_XTTS,
+    )
+    store = _VoiceStore(f5, xtts)
+    # Эндпоинт разрешает голос через `main`, синтез — через `audio_pipeline`:
+    # в бою это один и тот же singleton, в тесте подменяем оба, чтобы они не
+    # разошлись и подготовка не оказалась «про другой голос».
+    import backend.main as main_module
+
+    monkeypatch.setattr(main_module, "get_store", lambda: store)
+    monkeypatch.setattr(audio_pipeline, "get_store", lambda: store)
+    return f5, xtts
+
+
+@pytest.fixture
+def fake_accent(monkeypatch):
+    """Предсказуемая «RUAccent»: маркер вместо настоящей модели ударений."""
+
+    def accent(text: str) -> str:
+        return f"[{text}]"
+
+    monkeypatch.setattr(audio_pipeline, "accentuate", accent)
+
+
+@pytest.fixture
+def accent_stub(monkeypatch):
+    """Движок рендера, понимающий ударения (как F5): без него их не проверить."""
+    engine = AccentStubEngine()
+    monkeypatch.setattr(audio_pipeline, "get_engine", lambda engine_id: engine)
+    return engine

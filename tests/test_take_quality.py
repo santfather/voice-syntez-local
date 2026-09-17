@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 import pytest
-from conftest import sine
+from conftest import analyze_project, sine
 from test_projects_api import _client, _create_project, _wait_job
 
 from backend import audio_analysis, config, qa_screening, take_quality
@@ -61,6 +61,7 @@ async def _rendered_project(client) -> tuple[dict, str]:
         json={"speakers": {"ИВАН": {"voice_id": "voice1"}, "МАРГО": {"voice_id": "voice1"}}},
     )
     await client.post(f"/api/projects/{project['id']}/parse", json={})
+    await analyze_project(client, project["id"])
     accepted = await client.post(
         f"/api/projects/{project['id']}/render", json={"output_format": "wav"}
     )

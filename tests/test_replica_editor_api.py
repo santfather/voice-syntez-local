@@ -15,14 +15,14 @@ from pathlib import Path
 import httpx
 import pytest
 import soundfile as sf
+from conftest import STUB_ENGINE_ID, analyze_project, sine
 
 from backend import audio_pipeline, config, main
 from backend.db import connection as db_connection
-from backend.db.migrations import MIGRATIONS, _MIGRATION_1
+from backend.db.migrations import _MIGRATION_1, MIGRATIONS
 from backend.engines.base import ENGINE_XTTS, SAMPLE_RATE
 from backend.job_queue import JobQueue
 from backend.voices_store import Voice
-from conftest import STUB_ENGINE_ID, sine
 
 DIALOGUE = "ИВАН: Первая реплика.\nМАРГО: Вторая реплика.\nИВАН: Третья реплика."
 # Слоты и имена в одном тексте: «(1)» без имени, «МАРГО:», метка «АРТЕМ(2):» и
@@ -105,6 +105,7 @@ async def _project(client, text: str, speakers: dict | None = None) -> dict:
 
 
 async def _render(client, project_id: str) -> dict:
+    await analyze_project(client, project_id)
     accepted = await client.post(f"/api/projects/{project_id}/render", json={})
     assert accepted.status_code == 202, accepted.text
     await _wait_job(client, accepted.json()["job_id"])

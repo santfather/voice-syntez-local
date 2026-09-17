@@ -20,11 +20,11 @@ from __future__ import annotations
 import asyncio
 import random
 
+from conftest import analyze_project
 from test_api import _client, _generate, _wait
 
 from backend import audio_pipeline, config
 from backend.engines.base import ENGINE_INFOS, EngineInfo
-from backend.text_normalization.pronunciation import PronunciationRule
 
 # Произносимая фраза. В диалоге и проекте она приходит с маркером спикера
 # «ИВАН:», который парсер снимает до preprocessing, — на границе движка текст
@@ -107,6 +107,12 @@ async def _run_project(client, stub, source_text: str, *, seed: int = SEED, spea
         f"/api/projects/{project_id}/parse", json={"chunk_strategy": "paragraph"}
     )
     assert parsed.status_code == 200, parsed.text
+    # Обязательная подготовка: проект рендерится по сохранённому тексту, поэтому
+    # без анализа он рендер не запустит. Parity проверяет ровно то, что и должен:
+    # сохранённый анализом текст совпадает с тем, что считается на месте в
+    # сплошном тексте и диалоге.
+    prepared = await analyze_project(client, project_id)
+    assert prepared["status"] == "ready", prepared
 
     mark = len(stub.calls)
     _advance_seed(seed)
@@ -144,15 +150,20 @@ def test_same_text_continuous_vs_dialogue_normalized_text(stub, fake_store, monk
 
 
 def test_same_text_continuous_vs_dialogue_dictionary_text(stub, fake_store, monkeypatch):
-    """Словарь произношения применяется одинаково во всех трёх режимах."""
-    monkeypatch.setattr(
-        audio_pipeline,
-        "active_rules",
-        lambda: [PronunciationRule("SQL", "эскьюэль")],
-    )
+    """Словарь произношения применяется одинаково во всех трёх режимах.
+
+    Правило заводится в настоящем словаре, а не подменой функции: тогда его
+    видят и legacy-пути (они берут включённые правила из хранилища), и анализ
+    проекта (он берёт записи целиком, чтобы помнить отклонённое). Подмена одного
+    из двух источников проверяла бы не то, что нужно.
+    """
 
     async def scenario():
         async with _client(monkeypatch) as (client, _queue):
+            created = await client.post(
+                "/api/pronunciation", json={"source": "SQL", "target": "эскьюэль"}
+            )
+            assert created.status_code in (200, 201), created.text
             continuous = await _run_continuous(client, stub, DICT_PHRASE)
             dialogue = await _run_dialogue(client, stub, f"ИВАН: {DICT_PHRASE}")
             project, _project_id = await _run_project(client, stub, f"ИВАН: {DICT_PHRASE}")
@@ -176,6 +187,11 @@ def test_same_text_continuous_vs_dialogue_final_text(stub, fake_store, monkeypat
         description="Тестовый движок вместо F5-TTS и XTTS — модели не поднимаются.",
         supports_accents=True,
     )
+    # Паспорт заглушки регистрируется в реестре движков: анализ берёт
+    # `supports_accents` из паспорта, чтобы не поднимать модель (§14), и в проекте
+    # это тот же ответ, что у движка (`EngineInfo` — его же паспорт). Реальные
+    # движки там объявлены всегда, заглушка существует только в тестах.
+    monkeypatch.setitem(ENGINE_INFOS, "stub", stub.info)
     monkeypatch.setattr(
         audio_pipeline,
         "accentuate",

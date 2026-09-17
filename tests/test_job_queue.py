@@ -14,7 +14,7 @@ import time
 
 import httpx
 import pytest
-from conftest import StubEngine
+from conftest import StubEngine, analyze_project
 
 from backend import audio_pipeline, config, main
 from backend.audio_pipeline import (
@@ -679,6 +679,7 @@ def test_cancel_does_not_touch_previous_takes_of_project(stub, fake_store, monke
                     json={"speakers": {"ИВАН": {"voice_id": "voice1"}}},
                 )
                 await client.post(f"/api/projects/{project['id']}/parse", json={})
+                await analyze_project(client, project["id"])
 
                 # Первый рендер доводим до конца — у проекта появляются куски.
                 accepted = await client.post(f"/api/projects/{project['id']}/render", json={})

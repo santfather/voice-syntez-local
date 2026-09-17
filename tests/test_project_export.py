@@ -20,7 +20,7 @@ import httpx
 import numpy as np
 import pytest
 import soundfile as sf
-from conftest import sine
+from conftest import analyze_project, sine
 
 from backend import config, main, project_export
 from backend.engines.base import ENGINE_F5, SAMPLE_RATE
@@ -105,6 +105,7 @@ async def _assign(client, project_id: str, voice_id: str) -> dict:
 async def _rendered_project(client, voice_id: str, text: str = DIALOGUE) -> dict:
     project = await _create_project(client, text=text)
     await _assign(client, project["id"], voice_id)
+    await analyze_project(client, project["id"])
     accepted = await client.post(
         f"/api/projects/{project['id']}/render",
         json={"output_format": "wav", "pause_ms": 400},
@@ -230,6 +231,10 @@ def test_export_import_round_trip_restores_project(stub, monkeypatch):
             # рендер запускается и добавляет репликам новые take'ы.
             timeline_data = await _timeline(client, imported["id"])
             assert timeline_data["duration_sec"] > 0
+            # Подготовка после импорта выполняется заново, и это правильно: текст
+            # готовится под словарь и движки **этой** машины, а архив переносит
+            # проект, а не результаты подготовки с другого компьютера.
+            await analyze_project(client, imported["id"])
             accepted = await client.post(
                 f"/api/projects/{imported['id']}/render",
                 json={"output_format": "wav", "pause_ms": 400},

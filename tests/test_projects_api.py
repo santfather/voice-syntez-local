@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import httpx
+from conftest import analyze_project
 
 from backend import config, main
 from backend.job_queue import JobQueue
@@ -158,6 +159,8 @@ def test_render_saves_takes_and_survives_reopen(stub, fake_store, monkeypatch):
                 },
             )
             await client.post(f"/api/projects/{project['id']}/parse", json={})
+            # Рендер возможен только по подготовленному тексту (см. /analyze).
+            await analyze_project(client, project["id"])
 
             accepted = await client.post(
                 f"/api/projects/{project['id']}/render", json={"output_format": "wav"}
@@ -219,6 +222,7 @@ def test_delete_project_removes_take_files(stub, fake_store, monkeypatch):
                 json={"speakers": {"ИВАН": {"voice_id": "voice1"}, "МАРГО": {"voice_id": "voice1"}}},
             )
             await client.post(f"/api/projects/{project['id']}/parse", json={})
+            await analyze_project(client, project["id"])
             accepted = await client.post(f"/api/projects/{project['id']}/render", json={})
             await _wait_job(client, accepted.json()["job_id"])
 

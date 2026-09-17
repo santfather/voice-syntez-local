@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -27,6 +28,7 @@ from . import (
     denoise,
     engine_lifecycle,
     model_manager,
+    project_analysis,
     project_export,
     resource_guard,
     take_quality,
@@ -282,19 +284,37 @@ class ProjectParseRequest(BaseModel):
 
 
 class ReplicaUpdateRequest(BaseModel):
-    """Правка одной реплики: голос и/или отдельные параметры.
+    """Правка одной реплики: текст, голос и/или отдельные параметры.
 
     Различать «поле не пришло» и «пришло null» обязательно: непришедшее значит
     «не трогать», а null — «вернуть наследуемое у спикера» (голос, паузу, ручку).
     Поэтому обработчик смотрит на `exclude_unset`, а не на значения полей.
     """
 
+    # Исходный текст этой реплики. Правка текста устаревает подготовку именно
+    # этой реплики: остальные остаются подготовленными.
+    text: str | None = None
     # Голос этой реплики; null — снова голос спикера.
     voice_id: str | None = None
     # Точечные правки параметров; null у ключа — сброс к значению спикера.
     overrides: dict[str, Any] | None = None
     # Сбросить все правки реплики разом (кнопка «вернуть как у спикера»).
     reset_overrides: bool = False
+
+
+class ProjectAnalyzeRequest(BaseModel):
+    """Обязательная подготовка диалога: разбор (если нужно) и анализ реплик.
+
+    Все поля необязательны. `parse` просит разобрать текст заново (по умолчанию
+    разбор делается только тогда, когда реплик ещё нет). `indexes` — точечная
+    повторная подготовка: после правки одной реплики или подтверждения слова
+    пересчитывать весь большой проект незачем.
+    """
+
+    chunk_strategy: ChunkStrategy | None = None
+    parse: bool = False
+    indexes: list[int] | None = None
+    auto_accent: bool | None = None
 
 
 class ProjectRenderRequest(BaseModel):
@@ -1922,9 +1942,225 @@ async def parse_project(project_id: str, payload: ProjectParseRequest | None = N
     return _project_payload(project)
 
 
+def _not_ready_detail(status: str, error: str | None) -> str:
+    """Объяснение, почему синтез запрещён: состояние и что с этим делать.
+
+    409 без причины («нельзя, и всё») заставлял бы гадать, чего не хватает.
+    Причина устаревания лежит в `analysis_error` и называется здесь дословно.
+    """
+    reason = {
+        config.PROJECT_ANALYSIS_RAW: "текст ещё не подготовлен",
+        config.PROJECT_ANALYSIS_ANALYZING: "анализ идёт",
+        config.PROJECT_ANALYSIS_NEEDS_REVIEW: "найдены слова, требующие подтверждения",
+        config.PROJECT_ANALYSIS_ERROR: "анализ не удался",
+    }.get(status, status)
+    detail = f"Проект не подготовлен к синтезу: {reason}."
+    if error:
+        detail += f" Причина: {error}."
+    if status == config.PROJECT_ANALYSIS_NEEDS_REVIEW:
+        detail += " Подтвердите или отклоните найденные слова в панели предложений."
+    elif status != config.PROJECT_ANALYSIS_ANALYZING:
+        detail += " Запустите анализ диалога."
+    return detail
+
+
+def _rules_for_project(project_id: str):
+    """Правила словаря произношения для проекта — единственная точка слияния.
+
+    Правила берутся **целиком, включая выключенные**: применение само пропускает
+    выключенные (`compile_rules`), а вот проверке «слово уже покрыто» они нужны —
+    это память об отклонённом предложении. Без них отклонённое слово возвращалось
+    бы в панель предложений на каждом анализе.
+
+    Словарь уровня проекта (таблица `project_pronunciation_entries` из миграции 5)
+    встанет сюда **первым** слоем: приоритет «проект → глобальный → автоматика».
+    Слияние обязано жить в одном месте: анализ, preview и рендер должны видеть
+    одни и те же правила, иначе подготовленный текст разойдётся с тем, что уходит
+    в модель.
+    """
+    del project_id  # project-scope появится здесь; пока словарь только глобальный
+    return [
+        PronunciationRule(
+            source=row["source"],
+            target=row["target"],
+            case_sensitive=row["case_sensitive"],
+            whole_word=row["whole_word"],
+            enabled=row["enabled"],
+        )
+        for row in get_pronunciation_store().list_entries()
+    ]
+
+
+def _replica_speaker(project: dict, replica: dict) -> dict | None:
+    """Строка спикера реплики — по ней видно наследуемый голос и его правки."""
+    return next(
+        (item for item in project["speakers"] if item["key"] == replica["speaker"]), None
+    )
+
+
+def _effective_voice(project: dict, replica: dict, voices: dict) -> Voice | None:
+    """Голос реплики тем же путём, что у синтеза: свой голос важнее голоса спикера."""
+    speaker = _replica_speaker(project, replica)
+    voice_id = str(replica.get("voice_id") or (speaker or {}).get("voice_id") or "")
+    return _resolved_voice(voice_id, voices)
+
+
+def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool | None):
+    """Готовит реплики проекта каноническим проходом — без синтеза и моделей.
+
+    Голоса и настройки разрешаются теми же хелперами, что у рендера, правила
+    словаря берутся из единственной точки слияния, а стадии считает
+    `project_analysis.prepare_replica` (та же `preview_text`, что и у панели
+    «Что услышит модель»). Поэтому подготовленный текст не может разойтись с тем,
+    что уйдёт в модель, а модели синтеза здесь не поднимаются вовсе.
+    """
+    speakers = _project_speakers(project)
+    voices: dict = {}
+    rules = _rules_for_project(project["id"])
+    enabled = bool(
+        auto_accent
+        if auto_accent is not None
+        else project["render_settings"].get("auto_accent", True)
+    )
+    wanted = None if indexes is None else {int(index) for index in indexes}
+    preparations = []
+    for row in project["replicas"]:
+        index = int(row["index"])
+        if wanted is not None and index not in wanted:
+            continue
+        replica = Replica(
+            voice=row["speaker"],
+            text=row["text"],
+            line_number=index + 1,
+            overrides=row["overrides"],
+            voice_id=row["voice_override"],
+        )
+        voice = _effective_voice(project, row, voices)
+        speaker = speakers.get(row["speaker"]) or SpeakerSettings()
+        preparations.append(
+            project_analysis.prepare_replica(
+                replica, speaker, voice, index=index, rules=rules, auto_accent=enabled
+            )
+        )
+    return project_analysis.summarize(preparations)
+
+
+@app.post("/api/projects/{project_id}/analyze")
+async def analyze_project(project_id: str, payload: ProjectAnalyzeRequest | None = None) -> dict:
+    """Обязательная подготовка диалога: разбор (если нужно) и анализ реплик.
+
+    Рендер без этого шага запрещён (см. `render_project`): сначала текст должен
+    стать подготовленным, а найденные неоднозначные слова — подтверждёнными или
+    отклонёнными. Разбор делается только когда реплик ещё нет или когда об этом
+    попросили явно, чтобы анализ не переписывал уже разобранный диалог.
+    """
+    payload = payload or ProjectAnalyzeRequest()
+    project = _project_or_404(project_id)
+
+    if payload.parse or not project["replicas"]:
+        try:
+            project = get_projects_store().parse_project(project_id, payload.chunk_strategy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not project["replicas"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Текст не даёт ни одной реплики — вставьте диалог хотя бы из одной фразы",
+        )
+
+    known = {int(row["index"]) for row in project["replicas"]}
+    if payload.indexes is not None:
+        if not payload.indexes:
+            raise HTTPException(status_code=400, detail="Список реплик пуст")
+        unknown = sorted({int(index) for index in payload.indexes} - known)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Нет таких реплик: {', '.join(str(item + 1) for item in unknown)}."
+                f" В проекте {len(known)} реплик",
+            )
+
+    get_projects_store().mark_analysis_started(project_id)
+    started = time.monotonic()
+    try:
+        summary = await asyncio.to_thread(
+            _analyze_project, project, payload.indexes, payload.auto_accent
+        )
+    except Exception as exc:  # состояние проекта важнее текста ошибки
+        get_projects_store().update_project(
+            project_id,
+            analysis_status=config.PROJECT_ANALYSIS_ERROR,
+            analysis_error=f"{type(exc).__name__}: {exc}",
+        )
+        raise HTTPException(status_code=500, detail=f"Анализ не удался: {exc}") from exc
+    summary.seconds = time.monotonic() - started
+    saved = get_projects_store().save_analysis(project_id, summary)
+
+    response = summary.to_dict()
+    response.update(
+        {
+            "project_id": project_id,
+            "analysis_version": saved["analysis_version"],
+            "analysis_error": saved["analysis_error"],
+            "updated_replicas": [item.index for item in summary.replicas],
+            "speakers": _speakers_payload(saved, {}),
+        }
+    )
+    return response
+
+
+@app.get("/api/projects/{project_id}/analysis")
+async def project_analysis_state(project_id: str) -> dict:
+    """Состояние подготовки проекта без пересчёта: что готово, что требует решения.
+
+    Только чтение. Интерфейсу это нужно, чтобы показать статус и объяснить, почему
+    кнопка генерации недоступна, не запуская анализ заново.
+    """
+    project = _project_or_404(project_id)
+    replicas = project["replicas"]
+    candidates = [
+        {**candidate, "replica_index": int(row["index"])}
+        for row in replicas
+        for candidate in (row.get("pronunciation_candidates") or [])
+    ]
+    return {
+        "project_id": project_id,
+        "status": project["analysis_status"],
+        "analysis_version": project["analysis_version"],
+        "analysis_error": project["analysis_error"],
+        "analysis_started_at": project["analysis_started_at"],
+        "analysis_finished_at": project["analysis_finished_at"],
+        "replicas_total": len(replicas),
+        "replicas_done": sum(1 for row in replicas if row["analysis_status"] == "done"),
+        "replicas_pending": sum(1 for row in replicas if row["analysis_status"] == "pending"),
+        "replicas_error": sum(1 for row in replicas if row["analysis_status"] == "error"),
+        "candidates_total": len(candidates),
+        "candidates": candidates,
+        "warnings": [
+            {
+                "replica_index": int(row["index"]),
+                "kind": "accents_unsupported",
+                "text": (
+                    f"Реплика {int(row['index']) + 1}: движок «{row.get('engine') or '—'}» "
+                    "не поддерживает ударения — текст уйдёт без разметки"
+                ),
+            }
+            for row in replicas
+            if row["analysis_status"] == "done"
+            and row.get("auto_accent")
+            and not row.get("supports_accents")
+        ],
+    }
+
+
 @app.post("/api/projects/{project_id}/render", status_code=202)
 async def render_project(project_id: str, payload: ProjectRenderRequest | None = None) -> dict:
-    """Ставит в очередь рендер проекта сохранёнными репликами и голосами."""
+    """Ставит в очередь рендер проекта сохранёнными репликами и голосами.
+
+    Синтез возможен только по подготовленному тексту: сначала анализ, потом звук.
+    Проверка состояния стоит здесь, на сервере, а не только на погашенной кнопке в
+    интерфейсе — иначе прямой вызов API обходил бы обязательную подготовку.
+    """
     payload = payload or ProjectRenderRequest()
     project = _project_or_404(project_id)
     if not project["replicas"]:
@@ -1932,6 +2168,9 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
             status_code=400, detail="В проекте нет реплик — сначала разберите текст"
         )
 
+    # Порядок проверок: сначала то, что пользователь может исправить сразу
+    # («не назначен голос»), и только потом состояние подготовки. Иначе на проекте
+    # без голосов он получил бы «анализ не удался» вместо точной причины.
     speakers = _project_speakers(project)
     missing = sorted(
         key
@@ -1942,7 +2181,18 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
         names = ", ".join(f"«{key}»" for key in missing)
         raise HTTPException(status_code=400, detail=f"Не назначен голос для: {names}")
 
+    status = project["analysis_status"]
+    if status != config.PROJECT_ANALYSIS_READY:
+        raise HTTPException(
+            status_code=409,
+            detail=_not_ready_detail(status, project["analysis_error"]),
+        )
+
     settings, remembered = _resolved_render_settings(project, payload)
+    # Контракт рендера проекта: текст берётся из сохранённой подготовки, а не
+    # считается заново. Пайплайн сверит это сам и откажется синтезировать реплику
+    # без `final_text` (см. `RenderSettings.require_prepared`).
+    settings.require_prepared = True
     get_projects_store().update_project(project_id, render_settings=remembered)
 
     job_payload = JobPayload(
@@ -1954,6 +2204,8 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
                 overrides=replica["overrides"],
                 # Свой голос реплики: NULL в базе — «как у спикера».
                 voice_id=replica["voice_override"],
+                # Ровно тот текст, который пользователь видел и подтверждал.
+                final_text=replica["final_text"],
             )
             for index, replica in enumerate(project["replicas"])
         ],
@@ -1989,6 +2241,9 @@ async def update_replica(project_id: str, index: int, payload: ReplicaUpdateRequ
             voice_id=fields.get("voice_id", UNSET),
             overrides=fields.get("overrides"),
             reset_overrides=bool(fields.get("reset_overrides")),
+            # Правка текста устаревает подготовку именно этой реплики: остальные
+            # остаются подготовленными, и пересчитывать их незачем.
+            text=fields.get("text", UNSET),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Реплика не найдена") from exc
@@ -2008,6 +2263,17 @@ async def regenerate_project_replica(project_id: str, index: int) -> dict:
         raise HTTPException(
             status_code=400, detail=f"Не назначен голос для «{replica['label']}»"
         )
+    # Пересинтез берёт тот же сохранённый текст: если реплику правили и подготовка
+    # устарела, сначала нужен анализ — иначе в модель ушёл бы старый текст.
+    if replica["analysis_status"] != config.REPLICA_ANALYSIS_DONE:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Реплика {index + 1} не подготовлена "
+                f"({replica['analysis_error'] or 'нужен анализ'}). "
+                "Запустите анализ диалога."
+            ),
+        )
     try:
         job = get_queue().submit_project_take(
             project_id=project_id,
@@ -2018,6 +2284,7 @@ async def regenerate_project_replica(project_id: str, index: int) -> dict:
                 line_number=index + 1,
                 overrides=replica["overrides"],
                 voice_id=replica["voice_override"],
+                final_text=replica["final_text"],
             ),
             speakers=_project_speakers(project),
             settings=_replica_render_settings(project),

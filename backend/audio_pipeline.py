@@ -172,6 +172,12 @@ class RenderSettings:
     # расшифровки. Выбор пользователя на задачу, а не свойство установки: цена
     # проверки — синтез плюс отдельный процесс Whisper на каждую попытку.
     qa: QaSettings | None = None
+    # Контракт рендера: текст обязан быть уже подготовленным анализом проекта.
+    # Включено у проектного рендера и выключено у разовых задач (`/api/generate`,
+    # `/api/render-text`), у которых сохранённого анализа нет. Флаг существует
+    # ровно для того, чтобы «посчитать текст на месте» не осталось незаметным
+    # обходом обязательной подготовки (см. `render_dialogue`).
+    require_prepared: bool = False
 
 
 @dataclass
@@ -831,9 +837,18 @@ async def _synthesize_checked(
     """
     # Текст куска готовит `_text_for_engine`: числа и латиница для всех движков,
     # ударения — только для тех, кто понимает «+» (XTTS его прочитала бы вслух).
+    # Но если реплика пришла из проанализированного проекта, текст уже подготовлен
+    # и сохранён (`final_text`) — тогда он берётся как есть: пересчитывать его
+    # значило бы отправить в модель не то, что пользователь видел и подтверждал.
     if should_abort and should_abort():
         raise JobCancelledError(f"Реплика {position}: отменено до синтеза")
-    text = await asyncio.to_thread(_text_for_engine, replica.text, engine, settings.auto_accent)
+    prepared = (replica.final_text or "").strip()
+    if prepared:
+        text = replica.final_text
+    else:
+        text = await asyncio.to_thread(
+            _text_for_engine, replica.text, engine, settings.auto_accent
+        )
     qa = settings.qa
     if qa is None or qa.mode == config.QA_MODE_OFF:
         chunk, seed = await _synthesize_chunk(
@@ -962,6 +977,27 @@ async def render_dialogue(
     if unknown:
         names = ", ".join(f"«{labels[key]}»" for key in unknown)
         raise ValueError(f"Не назначен голос для: {names}")
+
+    # Контракт рендера проекта: текст обязан быть подготовлен заранее. Проверка
+    # стоит до загрузки движков — незачем поднимать модель на полторы минуты ради
+    # запроса, который всё равно не имеет права синтезировать. И до цикла синтеза,
+    # чтобы «посчитать текст на месте» не осталось незаметным обходом: при
+    # `require_prepared` реплика без `final_text` — ошибка, а не повод готовить
+    # текст заново (см. `_synthesize_checked`).
+    if settings.require_prepared:
+        unprepared = [
+            str(index + 1)
+            for index, replica in enumerate(replicas)
+            if not (replica.final_text or "").strip()
+        ]
+        if unprepared:
+            tail = " и другие" if len(unprepared) > 5 else ""
+            raise ValueError(
+                "Текст реплик не подготовлен: реплики "
+                + ", ".join(unprepared[:5])
+                + tail
+                + ". Выполните анализ диалога и подтвердите найденные слова."
+            )
 
     resolved: dict[str, Voice] = {}
     per_replica: dict[int, SpeakerSettings] = {}

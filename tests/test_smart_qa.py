@@ -11,15 +11,15 @@ import asyncio
 
 import numpy as np
 import pytest
+from conftest import analyze_project, sine
+from test_api import _client, _generate, _wait
+from test_audio_pipeline import _answers, _qa_render, _render, _replica, _speaker
+from test_projects_api import _client as _projects_client
+from test_projects_api import _create_project, _wait_job
 
 from backend import audio_pipeline, config, main, qa_screening
 from backend.audio_pipeline import QaSettings, RenderSettings
 from backend.engines.base import SAMPLE_RATE
-from conftest import sine
-from test_api import _client, _generate, _wait
-from test_audio_pipeline import _answers, _qa_render, _replica, _render, _speaker
-from test_projects_api import _client as _projects_client
-from test_projects_api import _create_project, _wait_job
 
 # Текст длиной 42 знака: ожидаемая длительность по нему — около 2.8 c.
 TEXT = "Сегодня хорошая погода, и я рад тебя видеть"
@@ -236,6 +236,7 @@ def test_smart_qa_metadata_is_saved_with_take(stub, fake_store, monkeypatch):
                 },
             )
             await client.post(f"/api/projects/{project['id']}/parse", json={})
+            await analyze_project(client, project["id"])
             accepted = await client.post(
                 f"/api/projects/{project['id']}/render",
                 json={"output_format": "wav", "qa": "smart"},

@@ -19,6 +19,26 @@ from .repositories.replicas import ReplicasRepository
 from .repositories.takes import TakesRepository
 
 
+def _analysis_status_from_rows(rows: list[dict]) -> str:
+    """Состояние проекта по фактическому состоянию его реплик.
+
+    Считается по строкам, а не берётся из итога последнего прогона: анализ бывает
+    точечным (пересчитали одну реплику), и «ready» от одного удачного куска при
+    десятке неподготовленных было бы неправдой. Кандидаты важнее: если у реплики
+    есть неразрешённые слова, состояние `needs_review` — даже когда сама она уже
+    подготовлена.
+    """
+    if not rows:
+        return config.PROJECT_ANALYSIS_RAW
+    if any(row["pronunciation_candidates"] for row in rows):
+        return config.PROJECT_ANALYSIS_NEEDS_REVIEW
+    if all(row["analysis_status"] == config.REPLICA_ANALYSIS_ERROR for row in rows):
+        return config.PROJECT_ANALYSIS_ERROR
+    if all(row["analysis_status"] == config.REPLICA_ANALYSIS_DONE for row in rows):
+        return config.PROJECT_ANALYSIS_READY
+    return config.PROJECT_ANALYSIS_RAW
+
+
 def _now_iso() -> str:
     """Метка времени анализа в том же формате, что у остальных записей базы."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -321,16 +341,19 @@ class ProjectsStore:
                     continue
                 replicas.save_analysis(int(row["id"]), {**preparation.to_dict(), "analysis_version": version})
                 saved += 1
+            # Состояние — по факту записанного, а не по итогу этого прогона:
+            # точечная подготовка одной реплики не делает проект готовым.
+            status = _analysis_status_from_rows(replicas.list_for_project(project_id))
             projects.update(
                 project_id,
-                analysis_status=summary.status,
+                analysis_status=status,
                 analysis_version=version,
                 analysis_error=summary.error,
                 analysis_finished_at=_now_iso(),
             )
         logger.info(
             "Проект %s: анализ версии %s — %s из %s реплик, состояние %s",
-            project_id, version, saved, len(summary.replicas), summary.status,
+            project_id, version, saved, len(summary.replicas), status,
         )
         return self.get_project(project_id)  # type: ignore[return-value]
 

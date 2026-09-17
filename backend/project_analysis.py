@@ -102,6 +102,10 @@ class ReplicaPreparation:
             "voice_id": self.voice_id,
             "needs_review": self.needs_review,
             "error": self.error,
+            # Состояние подготовки реплики едет вместе со стадиями: без него
+            # провалившаяся реплика записалась бы как `done`, и проект с
+            # неудавшимся анализом считался бы готовым к синтезу.
+            "analysis_status": REPLICA_ERROR if self.error else REPLICA_DONE,
         }
 
 
@@ -115,10 +119,39 @@ def supports_accents_for(engine_id: str) -> bool:
     return bool(info.supports_accents) if info else False
 
 
+def _failed_preparation(
+    *, index: int, source_text: str, engine: str, voice_id: str, error: str
+) -> ReplicaPreparation:
+    """Реплика, которую подготовить не удалось: пустые стадии и причина.
+
+    Отдельная функция, потому что «не удалось» — это обычный исход подготовки
+    (нет голоса, упала акцентуация), и он не должен выражаться исключением:
+    одна такая реплика не отменяет анализ остальных.
+    """
+    return ReplicaPreparation(
+        index=index,
+        source_text=source_text,
+        normalized_text="",
+        yo_text="",
+        dictionary_text="",
+        accentized_text="",
+        final_text="",
+        dictionary_matches=[],
+        pronunciation_candidates=[],
+        supports_accents=supports_accents_for(engine),
+        auto_accent=False,
+        effective_engine_params={},
+        engine=engine,
+        voice_id=voice_id,
+        seconds=0.0,
+        error=error,
+    )
+
+
 def prepare_replica(
     replica: Replica,
     speaker: SpeakerSettings,
-    voice: Voice,
+    voice: Voice | None,
     *,
     index: int = 0,
     rules=None,
@@ -128,11 +161,19 @@ def prepare_replica(
     """Готовит одну реплику: нормализация → «ё» → словарь → ударения → `final_text`.
 
     Параметры движка и спикера считаются теми же функциями, что при синтезе
-    (`tuning_for` и `chunk_parameters`), поэтому сохранённые `final_text` и
+    (`tuning_for` и `tuning_parameters`), поэтому сохранённые `final_text` и
     `effective_engine_params` описывают ровно тот кусок, который потом уйдёт в
     модель. Ошибка подготовки не выбрасывается наружу: у реплики есть своё поле
     `error`, и одна неудачная реплика не должна отменять анализ остальных.
     """
+    if voice is None:
+        return _failed_preparation(
+            index=index,
+            source_text=replica.text,
+            engine="",
+            voice_id="",
+            error="не назначен голос: выберите голос спикеру или этой реплике",
+        )
     started = time.monotonic()
     settings = tuning_for(voice, speaker, replica.overrides)
     engine = voice.engine

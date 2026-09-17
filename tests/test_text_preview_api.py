@@ -14,92 +14,19 @@ import asyncio
 import contextlib
 
 import httpx
-import pytest
-import soundfile as sf
-from conftest import StubEngine, sine
 
 from backend import audio_pipeline, config, main
 from backend.accentizer import STATE_FAILED, Accentizer
 from backend.audio_pipeline import RenderSettings, SpeakerSettings
 from backend.dialogue_parser import Replica
 from backend.engines import registry
-from backend.engines.base import ENGINE_F5, ENGINE_XTTS, SAMPLE_RATE, EngineInfo
+from backend.engines.base import ENGINE_F5, ENGINE_XTTS
 from backend.pronunciation import get_store as get_pronunciation_store
-from backend.voices_store import Voice
 
 DIALOGUE = "ИВАН: В 2026 году цена выросла на 5%."
 REPLICA_TEXT = "В 2026 году цена выросла на 5%."
 F5_VOICE = "voice-f5"
 XTTS_VOICE = "voice-xtts"
-
-
-class AccentStubEngine(StubEngine):
-    """Заглушка F5: говорит, что понимает «+»-ударения, как настоящий движок."""
-
-    info = EngineInfo(
-        id="stub-accents",
-        label="Заглушка с ударениями",
-        description="Тестовый движок вместо F5-TTS — модель не поднимается.",
-        supports_accents=True,
-    )
-
-
-class _VoiceStore:
-    """Хранилище из нескольких голосов: preview есть из чего выбирать движок."""
-
-    def __init__(self, *voices: Voice) -> None:
-        self._voices = {voice.id: voice for voice in voices}
-
-    def get(self, voice_id: str) -> Voice | None:
-        return self._voices.get(voice_id)
-
-
-@pytest.fixture
-def voices(workspace, monkeypatch):
-    """Два голоса разных движков — по одному на каждую ветку ударений."""
-    sf.write(workspace / "voices" / "f5.wav", sine(2.0, 180.0), SAMPLE_RATE)
-    sf.write(workspace / "voices" / "xtts.wav", sine(2.0, 240.0), SAMPLE_RATE)
-    f5 = Voice(
-        id=F5_VOICE,
-        name="Ф5",
-        gender="male",
-        ref_text="Привет, это тест",
-        audio_file="f5.wav",
-        engine=ENGINE_F5,
-    )
-    xtts = Voice(
-        id=XTTS_VOICE,
-        name="Икс",
-        gender="female",
-        ref_text="Привет, это тест",
-        audio_file="xtts.wav",
-        engine=ENGINE_XTTS,
-    )
-    store = _VoiceStore(f5, xtts)
-    # Эндпоинт разрешает голос через `main`, синтез — через `audio_pipeline`:
-    # в бою это один и тот же singleton, в тесте подменяем оба, чтобы они не
-    # разошлись и preview не оказался «про другой голос».
-    monkeypatch.setattr(main, "get_store", lambda: store)
-    monkeypatch.setattr(audio_pipeline, "get_store", lambda: store)
-    return f5, xtts
-
-
-@pytest.fixture
-def fake_accent(monkeypatch):
-    """Предсказуемая «RUAccent»: маркер вместо настоящей модели ударений."""
-
-    def accent(text: str) -> str:
-        return f"[{text}]"
-
-    monkeypatch.setattr(audio_pipeline, "accentuate", accent)
-
-
-@pytest.fixture
-def accent_stub(monkeypatch):
-    """Движок рендера, понимающий ударения (как F5): без него их не проверить."""
-    engine = AccentStubEngine()
-    monkeypatch.setattr(audio_pipeline, "get_engine", lambda engine_id: engine)
-    return engine
 
 
 @contextlib.asynccontextmanager

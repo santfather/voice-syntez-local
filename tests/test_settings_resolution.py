@@ -14,6 +14,7 @@ from dataclasses import asdict
 
 import httpx
 import pytest
+from conftest import analyze_project
 
 from backend import config, main
 from backend.audio_pipeline import RenderSettings, SpeakerSettings, render_dialogue
@@ -291,6 +292,7 @@ def test_voice_preset_reaches_new_project(workspace, voice, stub, monkeypatch):
             assert back["speed"]["source"] == SOURCE_VOICE
 
             stub.calls.clear()
+            await analyze_project(client, project["id"])
             accepted = await client.post(f"/api/projects/{project['id']}/render", json={})
             await _wait_job(client, accepted.json()["job_id"])
 
