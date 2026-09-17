@@ -70,6 +70,10 @@ ERROR_WORKER_TIMEOUT = "WORKER_TIMEOUT"
 ERROR_CANCELLED = "CANCELLED"
 ERROR_WATCHDOG = "WATCHDOG"
 ERROR_INTERRUPTED = "INTERRUPTED"
+# Записанное аудио не прошло проверку: пустой, обрезанный или нечитаемый файл
+# (см. `audio_pipeline.validate_audio_file`). Не ошибка движка: причина обычно в
+# диске или в прерванной записи, и совет пользователю другой.
+ERROR_AUDIO = "AUDIO_ERROR"
 
 # Заголовок «человеческого» текста для каждой категории. Формулировки на русском:
 # они уходят в интерфейс как есть (см. job_queue).
@@ -80,6 +84,7 @@ ERROR_TITLES = {
     ERROR_CANCELLED: "Отменено",
     ERROR_WATCHDOG: "Прервано watchdog'ом",
     ERROR_INTERRUPTED: "Прервано перезапуском приложения",
+    ERROR_AUDIO: "Аудио записано некорректно",
 }
 
 # Причина падения по сигналу — для диагностики и сообщения пользователю. Список

@@ -58,8 +58,11 @@ TEMP_PREFIXES = ("tts-export-", "tts-import-", "voice-denoise-", "voice-syntez-"
 # любой живой операции и заведомо меньше «мусора, который копился неделями».
 TEMP_MIN_AGE_SEC = 3600.0
 
-# Файлы, которые `_write_audio` оставляет рядом с целью при конвертации в mp3.
+# Имена, по которым узнаются промежуточные файлы записи: `_write_audio` пишет
+# результат под `<имя>.part` и конвертирует через `<имя>.part.wav` (раньше —
+# `<имя>.tmp.wav`, такие остатки тоже узнаются).
 TEMP_FILE_SUFFIX = ".tmp.wav"
+TEMP_PART_MARKER = ".part"
 
 # Что никогда не удаляется даже в «своей» категории: маркер пустого каталога в
 # репозитории и подкаталоги, которые перечислены отдельными категориями.
@@ -168,8 +171,13 @@ def _output_files() -> list[Path]:
         for entry in _iterdir(config.OUTPUT_DIR)
         if entry.is_file()
         and entry.name not in _KEEP_NAMES
-        and not entry.name.endswith(TEMP_FILE_SUFFIX)
+        and not _is_temp_file(entry.name)
     ]
+
+
+def _is_temp_file(name: str) -> bool:
+    """Промежуточный ли это файл записи — по явному признаку, а не «похоже на временный»."""
+    return name.endswith(TEMP_FILE_SUFFIX) or TEMP_PART_MARKER in name
 
 
 def _files_in(directory: Path) -> list[Path]:
@@ -182,17 +190,17 @@ def _files_in(directory: Path) -> list[Path]:
 
 
 def _tmp_wav_files() -> list[Path]:
-    """Наши промежуточные `*.tmp.wav` в `output/` и в каталогах take'ов проектов.
+    """Наши промежуточные файлы записи в `output/` и в каталогах take'ов проектов.
 
     Каталоги проектов обходятся по одному уровню: take'ы лежат как
-    `output/projects/{id}/*.wav`, и `_write_audio` оставляет `.tmp.wav` рядом с
-    целью именно там. Маска строгая — «всё, что похоже на временный файл», не
-    удаляется, чужой файл трогать нельзя.
+    `output/projects/{id}/*.wav`, и `_write_audio` оставляет `<имя>.part` рядом с
+    целью именно там. Отбор строгий — по явным признакам (`.tmp.wav`, `.part`), а
+    не «всё, что похоже на временный файл»: чужой файл трогать нельзя.
     """
     found = [
         entry
         for entry in _iterdir(config.OUTPUT_DIR)
-        if entry.is_file() and entry.name.endswith(TEMP_FILE_SUFFIX)
+        if entry.is_file() and _is_temp_file(entry.name)
     ]
     projects = config.PROJECTS_OUTPUT_DIR
     if _is_dir(projects):
@@ -202,7 +210,7 @@ def _tmp_wav_files() -> list[Path]:
             found.extend(
                 entry
                 for entry in _iterdir(project_dir)
-                if entry.is_file() and entry.name.endswith(TEMP_FILE_SUFFIX)
+                if entry.is_file() and _is_temp_file(entry.name)
             )
     return found
 
@@ -262,11 +270,12 @@ def _remove(target: str, files: Iterable[Path], dirs: Iterable[Path]) -> tuple[i
     for path in files:
         bytes_ = _file_size(path)
         # Файлы категории `temp_files` живут в двух разных мирах: промежуточные
-        # `.tmp.wav` — рядом с целью в output/, а остатки вроде `voice-syntez-*.wav`
-        # — в системном temp. Разрешение и проверка у них разные.
+        # файлы записи (`.part`, `.tmp.wav`) — рядом с целью в output/, а остатки
+        # вроде `voice-syntez-*.wav` — в системном temp. Разрешение и проверка у
+        # них разные.
         removed = (
             _unlink_in_temp(path)
-            if target == TARGET_TEMP_FILES and not path.name.endswith(TEMP_FILE_SUFFIX)
+            if target == TARGET_TEMP_FILES and not _is_temp_file(path.name)
             else _unlink(path, roots)
         )
         if removed:

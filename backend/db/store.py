@@ -662,6 +662,57 @@ class ProjectsStore:
                 project_id, status=status, job_id=job_id, last_error=error
             )
 
+    # -- восстановление после перезапуска (creash_report) ----------------------
+    def interrupt_stale_state(self) -> dict:
+        """Переводит состояния «идёт» в прерванные: очередь в памяти, её больше нет.
+
+        После перезапуска приложения задача не продолжается, а её статусы в базе
+        остались «rendering»/«analyzing». Оставлять их как есть — значит
+        показывать пользователю вечный синтез, запрещать повторный рендер
+        (проект выглядит занятым) и прятать, что реплика не готова. Поэтому:
+
+        * проект со статусом `rendering` → `draft` с причиной в `last_error`;
+        * реплика со статусом `rendering` → `interrupted`;
+        * анализ со статусом `analyzing` → `raw` с причиной в `analysis_error`.
+
+        Возвращает то, что нужно для диагностики и лога: счётчики и список
+        восстановленных проектов (id, имя, последняя задача).
+        """
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            replicas = ReplicasRepository(connection)
+            stale_projects = projects.list_by_status(config.PROJECT_STATUS_RENDERING)
+            stale_analyses = projects.list_by_status(
+                config.PROJECT_ANALYSIS_ANALYZING, column="analysis_status"
+            )
+            stale_replicas = replicas.list_by_status(config.REPLICA_STATUS_RENDERING)
+            for replica in stale_replicas:
+                replicas.set_status(int(replica["id"]), config.REPLICA_STATUS_INTERRUPTED)
+            for project in stale_projects:
+                projects.update(
+                    project["id"],
+                    status=config.PROJECT_STATUS_DRAFT,
+                    last_error=config.RECOVERY_RENDER_MESSAGE,
+                )
+            for project in stale_analyses:
+                projects.update(
+                    project["id"],
+                    analysis_status=config.PROJECT_ANALYSIS_RAW,
+                    analysis_error=config.RECOVERY_ANALYSIS_MESSAGE,
+                )
+            return {
+                "projects": [
+                    {"id": item["id"], "name": item["name"], "job_id": item["job_id"]}
+                    for item in stale_projects
+                ],
+                "replicas": len(stale_replicas),
+                "replica_indexes": [
+                    {"project_id": item["project_id"], "index": item["index"]}
+                    for item in stale_replicas
+                ],
+                "analyses": len(stale_analyses),
+            }
+
     def project_dir(self, project_id: str) -> Path:
         """Каталог кусков проекта: удаляется вместе с проектом."""
         return config.PROJECTS_OUTPUT_DIR / project_id

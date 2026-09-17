@@ -30,6 +30,7 @@ from . import (
     model_manager,
     project_analysis,
     project_export,
+    recovery,
     resource_guard,
     take_quality,
     timeline,
@@ -421,6 +422,9 @@ async def lifespan(app: FastAPI):
 
     audio_pipeline.cleanup_output()
     init_db()  # база проектов создаётся сама: ручного SQL от пользователя не требуется
+    # Состояния «идёт» не переживают перезапуск: очередь живёт в памяти. Без этого
+    # шага проект навсегда остался бы `rendering`, а реплика — `rendering`.
+    recovery.recover_after_restart()
     await get_queue().start()
     resource_guard.snapshot()  # прогрев счётчика CPU: первый вызов cpu_percent всегда 0.0
     guard_task = asyncio.create_task(

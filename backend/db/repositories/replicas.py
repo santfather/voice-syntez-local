@@ -9,6 +9,7 @@ from . import dumps, loads
 def row_to_replica(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
+        "project_id": row["project_id"],
         "index": row["idx"],
         "text": row["text"],
         # `source_text` — то же самое, что `text`: отдельной колонки нет, чтобы не
@@ -62,6 +63,22 @@ class ReplicasRepository:
             "SELECT * FROM replicas WHERE project_id = ? AND idx = ?", (project_id, index)
         ).fetchone()
         return None if row is None else row_to_replica(row)
+
+    def list_by_status(self, *statuses: str) -> list[dict]:
+        """Реплики в указанных статусах — по всем проектам.
+
+        Нужно восстановлению после перезапуска: статусы «идёт» (`rendering`) не
+        могут пережить смерть процесса, и их надо найти одним запросом, а не
+        обходить проекты по одному.
+        """
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"SELECT * FROM replicas WHERE status IN ({placeholders}) ORDER BY project_id, idx",
+            statuses,
+        ).fetchall()
+        return [row_to_replica(row) for row in rows]
 
     def sync_voices(self, project_id: str, speakers: dict[str, dict]) -> list[int]:
         """Разносит назначенный голос спикера по его репликам.

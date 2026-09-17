@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import os
 import random
 import tempfile
 import time
@@ -19,7 +20,7 @@ from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
 from .engines.registry import get_engine
-from .engines.worker_protocol import text_fingerprint
+from .engines.worker_protocol import ERROR_AUDIO, text_fingerprint
 from .pronunciation import active_rules
 from .settings_resolution import (
     COMMON_FIELDS,
@@ -280,6 +281,24 @@ class ChunkVariant:
 
 class ChunkTimeoutError(RuntimeError):
     """Синтез одного куска не уложился в TTS_CHUNK_TIMEOUT_SEC — похоже на зависание."""
+
+
+# Расширение недописанного аудио: `<имя>.part` рядом с целевым файлом. Имя
+# содержит `.part`, поэтому остатки от прошлых запусков находятся одним правилом
+# (см. `cleanup_partials` и `cache_cleanup`).
+PARTIAL_SUFFIX = ".part"
+
+
+class AudioFileError(RuntimeError):
+    """Записанное аудио не прошло проверку: пустой, обрезанный или нечитаемый файл.
+
+    Отдельный класс, а не общий `RuntimeError`: в очереди по нему выставляется
+    свой тип ошибки (`AUDIO_ERROR`), и пользователь видит «файл записан
+    некорректно», а не «движок синтеза упал» — это разные причины и разные
+    советы (проверить место на диске против повторить синтез).
+    """
+
+    error_type = ERROR_AUDIO
 
 
 # Сколько ждать подтверждения, что зависший воркер убит. Короткий шаг: ответ
@@ -1491,27 +1510,127 @@ def _read_audio(path: Path, output_format: str) -> np.ndarray:
 
 
 def _write_audio(target: Path, audio: np.ndarray, output_format: str) -> None:
+    """Пишет аудио атомарно: временный файл → проверка → переименование.
+
+    Прямая запись в целевой файл оставляла бы «половину» при падении процесса или
+    нехватке места, и эта половина выглядела бы готовым take'ом: по имени файла
+    недописанное от целого не отличить, а плеер на нём либо молчит, либо падает.
+    Поэтому результат сначала пишется рядом под именем `<имя>.part`, проверяется
+    на читаемость и ненулевую длительность (см. `validate_audio_file`) и только
+    потом занимает своё имя: `os.replace` в пределах каталога атомарен.
+    """
     import soundfile as sf
 
     output_format = (output_format or "wav").lower()
-    if output_format == "wav":
-        sf.write(target, audio, SAMPLE_RATE)
-        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + PARTIAL_SUFFIX)
+    try:
+        if output_format == "wav":
+            # Формат задаётся явно: по расширению `.part` soundfile его не узнает.
+            sf.write(partial, audio, SAMPLE_RATE, format="WAV")
+            validate_audio_file(partial, expect_sample_rate=SAMPLE_RATE)
+        else:
+            tmp_wav = target.with_name(target.name + PARTIAL_SUFFIX + ".wav")
+            try:
+                sf.write(tmp_wav, audio, SAMPLE_RATE, format="WAV")
+                validate_audio_file(tmp_wav, expect_sample_rate=SAMPLE_RATE)
+                from pydub import AudioSegment
 
-    tmp_wav = target.with_suffix(".tmp.wav")
-    sf.write(tmp_wav, audio, SAMPLE_RATE)
+                AudioSegment.from_wav(tmp_wav).export(
+                    partial, format=output_format, bitrate="192k"
+                )
+            finally:
+                tmp_wav.unlink(missing_ok=True)
+            # Частота у сжатого формата своя (mp3 может ресемплировать) — здесь
+            # проверяется читаемость и непустая длительность, а не 24 кГц.
+            validate_audio_file(partial, expect_sample_rate=None)
+        os.replace(partial, target)
+    except BaseException:
+        # Недописанное не оставляем: иначе оно копится в каталогах и путается с
+        # готовыми файлами (остатки от прошлых запусков убирает `cleanup_partials`).
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def validate_audio_file(path: Path, *, expect_sample_rate: int | None = SAMPLE_RATE) -> dict:
+    """Проверяет, что файл — читаемое аудио ненулевой длительности.
+
+    «Файл существует» и «файл слушается» — разные вещи: нулевой или обрезанный
+    WAV появляется при нехватке места и падении процесса, и записывать такой
+    результат готовым take'ом нельзя. Возвращает метаданные (частота, кадры,
+    длительность) — они же уходят в диагностику; ошибка — `AudioFileError`.
+    """
+    if not path.exists():
+        raise AudioFileError(f"файл не создан: {path.name}")
+    if (path.suffix or "").lower() == ".wav":
+        import soundfile as sf
+
+        try:
+            info = sf.info(path)
+        except Exception as exc:  # причина не важна: любая значит «не читается»
+            raise AudioFileError(f"файл не читается как аудио: {path.name} ({exc})") from exc
+        if info.frames <= 0:
+            raise AudioFileError(f"в файле нет звука: {path.name}")
+        if expect_sample_rate is not None and info.samplerate != expect_sample_rate:
+            raise AudioFileError(
+                f"частота дискретизации {info.samplerate} Гц вместо {expect_sample_rate}: {path.name}"
+            )
+        # Метаданные не доказывают, что файл читается: проверяется декодирование
+        # первого и последнего кадра. Это два обращения к диску вместо чтения
+        # всего трека (он бывает в сотни мегабайт) и ловит файлы, у которых
+        # заголовок обещает данные, которых в файле нет.
+        try:
+            with sf.SoundFile(path) as handle:
+                handle.seek(0)
+                handle.read(1)
+                handle.seek(max(0, int(info.frames) - 1))
+                tail = handle.read(1)
+        except Exception as exc:
+            raise AudioFileError(f"файл обрезан или повреждён: {path.name} ({exc})") from exc
+        if np.asarray(tail).size == 0:
+            # Заголовок обещал кадры, которых в файле нет: так выглядит обрыв
+            # записи, если файл успел получить длину до данных.
+            raise AudioFileError(f"файл обрезан: в нём нет последнего кадра ({path.name})")
+        return {
+            "sample_rate": info.samplerate,
+            "frames": int(info.frames),
+            "duration_sec": round(info.frames / info.samplerate, 4),
+            "format": str(info.format),
+        }
+
     try:
         from pydub import AudioSegment
 
-        AudioSegment.from_wav(tmp_wav).export(target, format=output_format, bitrate="192k")
-    finally:
-        tmp_wav.unlink(missing_ok=True)
+        segment = AudioSegment.from_file(path)
+    except Exception as exc:  # см. выше: причина не важна
+        raise AudioFileError(f"файл не читается как аудио: {path.name} ({exc})") from exc
+    if len(segment) <= 0:
+        raise AudioFileError(f"в файле нет звука: {path.name}")
+    if expect_sample_rate is not None and segment.frame_rate != expect_sample_rate:
+        raise AudioFileError(
+            f"частота дискретизации {segment.frame_rate} Гц вместо {expect_sample_rate}: {path.name}"
+        )
+    return {
+        "sample_rate": segment.frame_rate,
+        "frames": len(segment),
+        "duration_sec": round(len(segment) / 1000, 4),
+        "format": path.suffix.lstrip(".").lower() or "unknown",
+    }
 
 
 def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
+    """Пишет готовый файл задачи и проверяет его перед объявлением готовности.
+
+    Проверка здесь дублирует ту, что уже сделана в `_write_audio` (иначе файл не
+    получил бы своё имя), и стоит намеренно: контракт «DONE значит файл звучит»
+    должен проверяться на итоговом имени, а не выводиться из внутренностей
+    записи — цена проверки одна операция чтения метаданных.
+    """
     output_format = (output_format or "wav").lower()
     target = config.OUTPUT_DIR / f"{job_id}.{output_format}"
+    expect = SAMPLE_RATE if output_format == "wav" else None
     _write_audio(target, audio, output_format)
+    validate_audio_file(target, expect_sample_rate=expect)
     return target
 
 
@@ -1538,4 +1657,47 @@ def cleanup_output(ttl_hours: float = config.OUTPUT_TTL_HOURS) -> int:
             logger.warning("Не удалось удалить %s: %s", path, exc)
     if removed:
         logger.info("Очистил %s старых файлов из output/", removed)
+    return removed
+
+
+def partial_files() -> list[Path]:
+    """Недописанные аудиофайлы (`*.part`, `*.part.wav`) во всех каталогах вывода.
+
+    Каталоги кусков и сравнений вложены в `output/`, поэтому обход идёт от корня,
+    а повторы (если каталог задан отдельно, вне `output/`) убираются по
+    разрешённому пути: один и тот же файл не должен попасть в отчёт дважды.
+    """
+    roots = dict.fromkeys(
+        root.resolve() for root in (config.OUTPUT_DIR, config.PROJECTS_OUTPUT_DIR, config.BENCHMARKS_DIR)
+        if root.exists()
+    )
+    found: dict[Path, Path] = {}
+    for root in roots:
+        # Отдельно заданный вложенный каталог уже обойдён вместе с `output/`.
+        if any(root != other and other in root.parents for other in roots):
+            continue
+        for path in root.rglob(f"*{PARTIAL_SUFFIX}*"):
+            if path.is_file() and PARTIAL_SUFFIX in path.name:
+                found.setdefault(path.resolve(), path)
+    return list(found.values())
+
+
+def cleanup_partials() -> int:
+    """Удаляет недописанные аудиофайлы после перезапуска приложения.
+
+    Запись идёт через `<имя>.part` (см. `_write_audio`) и рядом лежит ровно до
+    `os.replace`. Если процесс упал посреди записи, файл остаётся, и его никто
+    больше не тронет: целевого имени у него нет, в базу он не попал, а по имени
+    он не отличается от «просто странного» файла. Поэтому остатки убираются при
+    старте — по явному признаку `.part`, а не по «похоже на временный».
+    """
+    removed = 0
+    for path in partial_files():
+        try:
+            size_mb = path.stat().st_size / (1024 * 1024)
+            path.unlink()
+            removed += 1
+            logger.info("Удалён недописанный файл %s (%.1f МБ)", path.name, size_mb)
+        except OSError as exc:
+            logger.warning("Не удалось удалить недописанный %s: %s", path, exc)
     return removed

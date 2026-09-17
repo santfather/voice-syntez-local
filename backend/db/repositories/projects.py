@@ -93,6 +93,22 @@ class ProjectsRepository:
             return None
         return _row_to_project(row, int(row["replicas_count"]))
 
+    def list_by_status(self, status: str, *, column: str = "status") -> list[dict]:
+        """Проекты в заданном состоянии — по колонке статуса рендера или анализа.
+
+        `column` ограничен двумя известными именами: подставлять сюда произвольную
+        строку из запроса нельзя, а два состояния, которые нужно восстанавливать
+        после перезапуска (`rendering` и `analyzing`), различаются именно колонкой.
+        """
+        if column not in ("status", "analysis_status"):
+            raise ValueError(f"Неизвестная колонка состояния: {column}")
+        rows = self._conn.execute(
+            "SELECT p.*, (SELECT COUNT(*) FROM replicas r WHERE r.project_id = p.id)"
+            f" AS replicas_count FROM projects p WHERE p.{column} = ? ORDER BY p.updated_at DESC",
+            (status,),
+        ).fetchall()
+        return [_row_to_project(row, int(row["replicas_count"])) for row in rows]
+
     def update(self, project_id: str, **fields) -> dict | None:
         """Меняет переданные поля проекта; незнакомые ключи отбрасываются.
 
