@@ -255,8 +255,13 @@
               placeholder="АРТЕМ(1): Привет! МАРГО(2): И тебе привет. Как дела? (3) — спросила девушка."></textarea>
             <div class="row" style="margin-top: 12px">
               <button id="btn-apply-source" class="primary">Применить и разобрать</button>
+              <!-- Файл ведёт в тот же source_text, что и вставленный текст: своего
+                   разбора для загруженного файла нет и быть не должно. -->
+              <button id="dialogue-drop" class="ghost" type="button">Загрузить .txt или .md</button>
+              <input type="file" accept=".txt,.md,text/plain,text/markdown" hidden id="dialogue-file" />
               <span class="muted" id="source-state"></span>
             </div>
+            <p class="hint muted" id="dialogue-file-note" hidden></p>
             <p class="hint muted">
               <b>Голос задаётся маркером <code>(N)</code></b> — номером слота, которому в панели справа
               назначен голос. Маркер работает в любом месте текста и переключает голос для всего,

@@ -4074,6 +4074,65 @@ function loadTextFile(file) {
   reader.readAsText(file, 'utf-8');
 }
 
+const DIALOGUE_FILE_SUFFIXES = ['.txt', '.md'];
+// Ограничение то же, что у сплошного текста: сервер откажет в тексте длиннее
+// MAX_TEXT_CHARS, и лучше сказать об этом до чтения файла, а не после запроса.
+const DIALOGUE_FILE_MAX_BYTES = 2 * 1024 * 1024;
+
+function loadDialogueFile(file) {
+  if (!file) return;
+  const note = $('dialogue-file-note');
+  const name = String(file.name || '').toLowerCase();
+  const suffix = DIALOGUE_FILE_SUFFIXES.find((item) => name.endsWith(item));
+  if (!suffix) {
+    note.hidden = false;
+    showAlert($('parse-error'), `Файл ${file.name}: поддерживаются .txt и .md`);
+    return;
+  }
+  if (file.size === 0) {
+    note.hidden = false;
+    showAlert($('parse-error'), `Файл ${file.name} пуст — вставьте диалог вручную`);
+    return;
+  }
+  if (file.size > DIALOGUE_FILE_MAX_BYTES) {
+    note.hidden = false;
+    showAlert(
+      $('parse-error'),
+      `Файл ${file.name} больше ${Math.round(DIALOGUE_FILE_MAX_BYTES / 1024 / 1024)} МБ — разбейте его на части`
+    );
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = String(reader.result || '');
+    if (!text.trim()) {
+      showAlert($('parse-error'), `В файле ${file.name} нет текста`);
+      return;
+    }
+    if (text.includes('\uFFFD')) {
+      // Браузер заменяет нечитаемые байты на «�», а не падает: молча
+      // отправить такой текст в модель значит получить мусор в аудио.
+      showAlert(
+        $('parse-error'),
+        `Файл ${file.name} не в UTF-8 — пересохраните его в UTF-8 и попробуйте снова`
+      );
+      return;
+    }
+    showAlert($('parse-error'), '');
+    $('dialogue').value = text;
+    // Текст считается изменённым: разбор и анализ запускает пользователь, и это
+    // тот же путь, что для вставленного текста.
+    markSourceDirty();
+    note.hidden = false;
+    note.textContent = `Загружен файл ${file.name}: ${text.trim().length} символов. Нажмите «Применить и разобрать», затем «Анализировать диалог».`;
+    setSourceState();
+  };
+  reader.onerror = () => showAlert($('parse-error'), `Не удалось прочитать файл ${file.name}`);
+  // Испорченная кодировка не должна превращаться в мусор в модели: decode с
+  // фатальной ошибкой лучше тихой подмены символов.
+  reader.readAsText(file, 'utf-8');
+}
+
 function setTextProgress(ratio) {
   $('text-progress-bar').style.width = `${Math.round(ratio * 100)}%`;
 }
@@ -4415,6 +4474,19 @@ function bindEvents() {
   $('dialogue').addEventListener('input', markSourceDirty);
   $('btn-apply-source').addEventListener('click', applySource);
   $('btn-analyze').addEventListener('click', analyzeDialogue);
+  const dialogueFile = $('dialogue-file');
+  $('dialogue-drop').addEventListener('click', () => dialogueFile.click());
+  dialogueFile.addEventListener('change', () => {
+    loadDialogueFile(dialogueFile.files[0]);
+    dialogueFile.value = ''; // повторный выбор того же файла должен срабатывать
+  });
+  $('source-view').addEventListener('dragover', (event) => {
+    event.preventDefault();
+  });
+  $('source-view').addEventListener('drop', (event) => {
+    event.preventDefault();
+    loadDialogueFile(event.dataTransfer.files[0]);
+  });
   bindReplicaCards();
   $('review-list').addEventListener('click', (event) => {
     const button = event.target.closest('[data-review]');

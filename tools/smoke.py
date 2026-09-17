@@ -48,6 +48,7 @@ PLAN = (
     "создать проект",
     "добавить два голоса (F5 и XTTS)",
     "разобрать диалог со смешанными спикерами и назначить голоса",
+    "подготовить диалог (анализ и review)",
     "рендер F5 + XTTS",
     "Smart QA (рендер с qa=smart)",
     "перегенерация реплики",
@@ -201,7 +202,13 @@ def pick_voices(api: Api, f5_id: str | None, xtts_id: str | None) -> dict[str, s
         )
     if not f5.get("has_audio") or not xtts.get("has_audio"):
         raise SmokeError("у выбранных голосов нет файла референса — пересоздайте их в дашборде")
-    return {"f5": f5["id"], "xtts": xtts["id"], "f5_name": f5["name"], "xtts_name": xtts["name"]}
+    return {
+        "f5": f5["id"],
+        "xtts": xtts["id"],
+        "xtts_engine": xtts.get("engine") or "xtts",
+        "f5_name": f5["name"],
+        "xtts_name": xtts["name"],
+    }
 
 
 def wait_for_job(api: Api, job_id: str, timeout: float, label: str) -> dict:
@@ -231,6 +238,48 @@ def wait_for_server(api: Api, timeout: float) -> dict:
             return data
         time.sleep(1.0)
     raise SmokeError(f"сервер не ответил за {timeout:.0f} с после перезапуска")
+
+
+def prepare_project(api: Api, project_id: str) -> dict:
+    """Обязательная подготовка диалога: анализ, затем review найденных слов.
+
+    Без неё рендер запрещён (409) — и это правильно: синтез идёт по сохранённому
+    тексту. Кандидаты принимаются в словарь **проекта**: проверка идёт на живом
+    сервере, и трогать общий словарь пользователя ради неё нельзя.
+    """
+    state = api.json("POST", f"/api/projects/{project_id}/analyze", {})
+    for _ in range(5):
+        candidates = state.get("candidates") or []
+        if state.get("status") != "needs_review" or not candidates:
+            break
+        for candidate in candidates:
+            api.json(
+                "POST",
+                f"/api/projects/{project_id}/pronunciation/review",
+                {
+                    "source": candidate["word"],
+                    "target": candidate["target"] or candidate["word"],
+                    "scope": "project",
+                    "enabled": bool((candidate.get("target") or "").strip()),
+                    "replica_index": candidate["replica_index"],
+                },
+            )
+        state = await_state(api, project_id)
+    state = await_state(api, project_id)
+    if state.get("status") != "ready":
+        raise SmokeError(
+            f"подготовка не дошла до ready: {state.get('status')} ({state.get('analysis_error')})"
+        )
+    return state
+
+
+def await_state(api: Api, project_id: str) -> dict:
+    """Состояние подготовки из `/analysis`: у отчёта анализа поля счётчиков другие.
+
+    Читать счётчики только из одного ответа — верный способ разойтись в подписях:
+    `analyze` отдаёт `replicas_analyzed`, а состояние проекта — `replicas_done`.
+    """
+    return api.json("GET", f"/api/projects/{project_id}/analysis")
 
 
 def render_and_wait(api: Api, project_id: str, qa: str, timeout: float, label: str) -> dict:
@@ -275,20 +324,35 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
         }
         project = api.json("PATCH", f"/api/projects/{project_id}", {"speakers": assignment})
         engines = sorted({replica["engine"] for replica in project["replicas"]})
-        if engines != ["f5", "xtts"]:
-            raise SmokeError(f"в проекте ожидались движки ['f5', 'xtts'], получено {engines}")
+        # Смешанный диалог — это F5 плюс XTTS-семейство: у второго движка два
+        # варианта (базовая модель и русский файнтюн), и оба годятся. Требовать
+        # ровно «xtts» значило бы падать на рабочей конфигурации пользователя.
+        second = [item for item in engines if item in ("xtts", "xtts-banana")]
+        if "f5" not in engines or len(second) != 1 or len(engines) != 2:
+            raise SmokeError(
+                f"в проекте ожидались два движка: f5 и один из xtts/xtts-banana, получено {engines}"
+            )
         report.add(PLAN[2], "PASS", f"спикеров {len(speakers)}, реплик {len(project['replicas'])}, движки {engines}")
+
+        # 3b. Обязательная подготовка: анализ и review найденных слов. Рендер без
+        # неё сервер не примет, поэтому шаг стоит до первого синтеза.
+        state = prepare_project(api, project_id)
+        report.add(
+            PLAN[3],
+            "PASS",
+            f"состояние {state['status']}, подготовлено {state['replicas_done']}/{state['replicas_total']}",
+        )
 
         # 4. Смешанный рендер F5 + XTTS.
         project = render_and_wait(api, project_id, "off", args.timeout, "рендер")
         _require_takes(project, "рендер")
-        report.add(PLAN[3], "PASS", f"{len(project['replicas'])} реплик с take'ами")
+        report.add(PLAN[4], "PASS", f"{len(project['replicas'])} реплик с take'ами")
 
         # 5. Smart QA тем же текстом.
         project = render_and_wait(api, project_id, "smart", args.timeout, "smart qa")
         _require_takes(project, "smart qa")
         modes = sorted({(replica.get("qa") or {}).get("mode", "—") for replica in project["replicas"]})
-        report.add(PLAN[4], "PASS", f"qa режимы: {modes}")
+        report.add(PLAN[5], "PASS", f"qa режимы: {modes}")
 
         # 6. Перегенерация первой реплики: появляется второй take. Задача у
         # перегенерации своя — проект её статусом не отмечает, поэтому ждём
@@ -304,7 +368,7 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
                 f"после перегенерации ожидался новый take: было {len(takes_before)}, "
                 f"стало {len(replica['takes'])}"
             )
-        report.add(PLAN[5], "PASS", f"take'ов у реплики 0: {len(takes_before)} → {len(replica['takes'])}")
+        report.add(PLAN[6], "PASS", f"take'ов у реплики 0: {len(takes_before)} → {len(replica['takes'])}")
 
         # 7. Возврат старого take — без синтеза.
         current_id = replica["selected_take_id"]
@@ -314,11 +378,11 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
         )
         if selected["replica"]["selected_take_id"] != old_take_id:
             raise SmokeError("выбор старого take не применился")
-        report.add(PLAN[6], "PASS", f"активный take снова {old_take_id}")
+        report.add(PLAN[7], "PASS", f"активный take снова {old_take_id}")
 
         # 8. Перезапуск backend: его делает человек, инструмент только ждёт.
         if args.no_restart:
-            report.add(PLAN[7], "SKIP", "пропущено по --no-restart")
+            report.add(PLAN[8], "SKIP", "пропущено по --no-restart")
         else:
             print(
                 "\n  Перезапустите backend вручную (Ctrl+C и снова ./run.sh или "
@@ -332,47 +396,51 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
                     "перезапуск требует интерактивного терминала; используйте --no-restart"
                 ) from exc
             wait_for_server(api, args.timeout)
-            report.add(PLAN[7], "PASS", "сервер снова отвечает")
+            report.add(PLAN[8], "PASS", "сервер снова отвечает")
 
         # 9. Проект пережил перезапуск.
         reopened = api.json("GET", f"/api/projects/{project_id}")
         if reopened["id"] != project_id or not reopened["replicas"]:
             raise SmokeError("проект не восстановился после перезапуска")
         _require_takes(reopened, "повторное открытие")
-        report.add(PLAN[8], "PASS", f"реплик {len(reopened['replicas'])}, take'ы на месте")
+        report.add(PLAN[9], "PASS", f"реплик {len(reopened['replicas'])}, take'ы на месте")
 
         # 10-12. Экспорт: WAV, SRT и архив проекта.
         wav = api.download("GET", f"/api/projects/{project_id}/export/audio?format=wav")
         (workdir / "smoke.wav").write_bytes(wav)
         if len(wav) < 44:
             raise SmokeError(f"WAV подозрительно мал: {len(wav)} байт")
-        report.add(PLAN[9], "PASS", f"{len(wav)} байт → {workdir / 'smoke.wav'}")
+        report.add(PLAN[10], "PASS", f"{len(wav)} байт → {workdir / 'smoke.wav'}")
 
         srt = api.download("GET", f"/api/projects/{project_id}/export/subtitles?format=srt")
         (workdir / "smoke.srt").write_bytes(srt)
         text = srt.decode("utf-8", errors="replace")
         if "-->" not in text:
             raise SmokeError("в SRT нет таймстемпов '-->'")
-        report.add(PLAN[10], "PASS", f"таймстемпов {text.count('-->')}")
+        report.add(PLAN[11], "PASS", f"таймстемпов {text.count('-->')}")
 
         archive = api.download("POST", f"/api/projects/{project_id}/export")
         archive_path = workdir / "smoke.ttsproject"
         archive_path.write_bytes(archive)
         if not archive.startswith(b"PK"):
             raise SmokeError("архив проекта не похож на zip")
-        report.add(PLAN[11], "PASS", f"{len(archive)} байт → {archive_path}")
+        report.add(PLAN[12], "PASS", f"{len(archive)} байт → {archive_path}")
 
         # 13. Импорт архива — новый проект, исходный не трогается.
         imported = api.upload("/api/projects/import", "file", "smoke.ttsproject", archive)
         imported_id = imported["id"]
+        # Импортированный проект приходит без подготовки — и это правильно: текст
+        # готовится под словарь и движки **этой** машины, а архив переносит проект,
+        # а не результаты чужой подготовки.
+        prepare_project(api, imported_id)
         if imported_id == project_id:
             raise SmokeError("импорт должен создавать новый проект")
-        report.add(PLAN[12], "PASS", f"новый проект {imported_id}")
+        report.add(PLAN[13], "PASS", f"новый проект {imported_id}")
 
         # 14. Повторный рендер уже импортированного проекта.
         imported = render_and_wait(api, imported_id, "off", args.timeout, "повторный рендер")
         _require_takes(imported, "повторный рендер")
-        report.add(PLAN[13], "PASS", f"{len(imported['replicas'])} реплик с take'ами")
+        report.add(PLAN[14], "PASS", f"{len(imported['replicas'])} реплик с take'ами")
     except SmokeError as exc:
         report.add("сценарий", "FAIL", str(exc))
     finally:
