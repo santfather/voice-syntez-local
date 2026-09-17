@@ -26,6 +26,9 @@ const state = {
   benchmark: {},       // voice_id -> состояние панели «сравнить движки»
   models: null,        // последний ответ /api/models: {models, disk}
   modelsTimer: null,   // опрос прогресса скачивания; null — ни одна модель не качается
+  cache: null,         // последний ответ /api/cache: размеры по трём категориям
+  cacheChecked: {},    // target -> отмечен ли чекбокс (сохраняется при перерисовке)
+  cacheBusy: false,    // очистка в полёте — кнопка заблокирована
   textEngineParams: {}, // ручки движка в режиме «Сплошной текст»
   textEngineVoice: '',  // голос, к которому относятся эти ручки
   modelReady: false,
@@ -333,6 +336,7 @@ function switchTab(name) {
   // а обход каталогов с гигабайтными файлами на старте дашборда незачем.
   if (name === 'models') {
     loadModels().catch((error) => showAlert($('models-error'), error.message));
+    loadCache().catch((error) => showAlert($('cache-error'), error.message));
   } else {
     stopModelsPolling();
   }
@@ -575,7 +579,157 @@ function bindModelsEvents() {
   });
 }
 
-// --- словарь произношения -----------------------------------------------------
+// --- очистка кеша приложения --------------------------------------------------
+// Секция рядом с менеджером моделей, но о своём: три категории транзитных файлов
+// самого дашборда. Веса моделей и кеш HF здесь намеренно отсутствуют — их удаление
+// остаётся отдельным осознанным потоком в списке выше. Пути категорий жёстко заданы
+// на бэкенде, поэтому форма не может попросить больше, чем описано в подписях.
+const CACHE_CATEGORIES = [
+  {
+    id: 'output',
+    label: 'Готовые файлы задач',
+    hint: 'output/ — то же, что чистит TTL, но сейчас',
+  },
+  {
+    id: 'benchmarks',
+    label: 'Сравнение движков',
+    hint: 'output/benchmarks/ — под TTL не попадает вовсе',
+  },
+  {
+    id: 'temp_files',
+    label: 'Временные файлы',
+    hint: 'промежуточные .tmp.wav и остатки экспорта/импорта',
+  },
+];
+
+const CACHE_LABELS = Object.fromEntries(CACHE_CATEGORIES.map((item) => [item.id, item.label]));
+
+function cacheSize(category) {
+  const data = state.cache;
+  if (!data) return null;
+  if (category === 'temp_files') return { mb: data.temp_files_mb, files: data.temp_files_count };
+  return { mb: data[`${category}_mb`], files: null };
+}
+
+function pluralFiles(count) {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) return 'файл';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return 'файла';
+  return 'файлов';
+}
+
+function renderCache() {
+  const container = $('cache-list');
+  if (!container) return;
+  const data = state.cache;
+  if (!data) {
+    container.innerHTML = '<p class="muted">Считаю занятое место…</p>';
+    return;
+  }
+  let totalFiles = 0;
+  let totalMb = 0;
+  const rows = CACHE_CATEGORIES.map((category) => {
+    const size = cacheSize(category.id);
+    const checked = state.cacheChecked[category.id] ? ' checked' : '';
+    const suffix = size.files === null
+      ? ''
+      : ` · ${size.files} ${pluralFiles(size.files)}`;
+    if (size.mb > 0) {
+      totalMb += size.mb;
+      if (size.files !== null) totalFiles += size.files;
+    }
+    return `<label class="toggle cache-row">
+      <input type="checkbox" data-cache-target="${category.id}"${checked}${state.cacheBusy ? ' disabled' : ''} />
+      <span>${esc(category.label)}<br /><small class="muted">${esc(category.hint)}</small></span>
+      <b class="muted">${size.mb > 0 ? `${size.mb.toFixed(1)} МБ${suffix}` : 'пусто'}</b>
+    </label>`;
+  }).join('');
+  const empty = totalMb <= 0
+    ? '<p class="muted">Очищать нечего: все три категории пусты.</p>'
+    : '';
+  container.innerHTML = rows + empty;
+  updateCacheHint(totalFiles);
+}
+
+function updateCacheHint(totalFiles) {
+  const hint = $('cache-hint');
+  const button = $('btn-clear-cache');
+  if (!hint || !button) return;
+  const count = CACHE_CATEGORIES.filter((item) => state.cacheChecked[item.id]).length;
+  button.disabled = state.cacheBusy || count === 0;
+  if (state.cacheBusy) {
+    hint.textContent = 'Освобождаю выбранное…';
+    return;
+  }
+  if (count === 0) {
+    hint.textContent = 'Ничего не отмечено: выберите хотя бы одну категорию — '
+      + 'очистка работает только по явному выбору.';
+    return;
+  }
+  const words = totalFiles === 1 ? 'файл' : 'файлов';
+  hint.textContent = `Отмечено категорий: ${count}`
+    + (totalFiles > 0 ? ` · всего в них ${totalFiles} ${words}` : '');
+}
+
+async function loadCache() {
+  state.cache = await api('/api/cache');
+  showAlert($('cache-error'), '');
+  renderCache();
+}
+
+async function clearCache() {
+  const targets = CACHE_CATEGORIES
+    .map((item) => item.id)
+    .filter((id) => state.cacheChecked[id]);
+  if (!targets.length) {
+    showAlert($('cache-error'), 'Ничего не выбрано: отметьте хотя бы одну категорию очистки.');
+    renderCache();
+    return;
+  }
+  state.cacheBusy = true;
+  renderCache();
+  try {
+    const result = await api('/api/cache/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targets }),
+    });
+    const parts = targets
+      .map((target) => `${CACHE_LABELS[target]}: ${(result.freed_mb[target] || 0).toFixed(2)} МБ, `
+        + `${result.freed_files[target] || 0} ${pluralFiles(result.freed_files[target] || 0)}`)
+      .join(' · ');
+    showAlert($('cache-note'), `Освобождено ${result.total_mb.toFixed(2)} МБ (${parts}).`, 'info');
+    showAlert($('cache-error'), '');
+  } catch (error) {
+    showAlert($('cache-error'), error.message);
+  } finally {
+    state.cacheBusy = false;
+    // Размеры перечитываются после любой попытки: интерфейс не должен показывать
+    // «занято», если файлы уже удалены.
+    await loadCache().catch((error) => showAlert($('cache-error'), error.message));
+  }
+}
+
+function bindCacheEvents() {
+  const list = $('cache-list');
+  if (list) {
+    list.addEventListener('change', (event) => {
+      const box = event.target.closest('[data-cache-target]');
+      if (!box) return;
+      state.cacheChecked[box.dataset.cacheTarget] = box.checked;
+      updateCacheHint();
+    });
+  }
+  const clear = $('btn-clear-cache');
+  if (clear) clear.addEventListener('click', () => {
+    clearCache().catch((error) => showAlert($('cache-error'), error.message));
+  });
+  const reload = $('btn-reload-cache');
+  if (reload) reload.addEventListener('click', () => {
+    loadCache().catch((error) => showAlert($('cache-error'), error.message));
+  });
+}
 // Словарь глобальный: правило, добавленное здесь, применяется во всех проектах.
 // Проверка текста идёт тем же эндпоинтом, что и стадии синтеза, поэтому фронт не
 // повторяет порядок шагов и не может показать одно, а отправить в модель другое.
@@ -3953,6 +4107,7 @@ function bindEvents() {
   $('btn-save-voice').addEventListener('click', createVoice);
   $('btn-recognize-voice').addEventListener('click', recognizeRefText);
   bindModelsEvents();
+  bindCacheEvents();
 
   $('pause').addEventListener('input', (e) => { $('pause-value').textContent = `${e.target.value} мс`; });
   // Смена стратегии меняет состав реплик: без повторного разбора карточки

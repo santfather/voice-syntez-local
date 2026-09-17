@@ -846,6 +846,41 @@
       </section>
     </div>
   </div>
+
+  <section class="panel" style="margin-top: 18px">
+    <div class="panel-title">
+      <span class="number">03</span>
+      <div>
+        <h2>ОЧИСТКА КЕША ПРИЛОЖЕНИЯ</h2>
+        <p>
+          Транзитные файлы самого дашборда — не дожидаясь TTL. Веса моделей и кеш
+          huggingface_hub сюда не входят: для них выше есть отдельная кнопка «Удалить».
+        </p>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="alert error" id="cache-error"></div>
+      <div class="alert info" id="cache-note" hidden></div>
+      <div id="cache-list">
+        <p class="muted">Считаю занятое место…</p>
+      </div>
+      <div class="row" style="margin-top: 12px">
+        <button class="primary" id="btn-clear-cache">Очистить выбранное</button>
+        <button class="tiny ghost" id="btn-reload-cache">Обновить</button>
+      </div>
+      <p class="hint muted" id="cache-hint">
+        Отметьте категории, которые нужно освободить. Пока ничего не выбрано, кнопка
+        очистки не делает ничего — нужен явный выбор.
+      </p>
+      <p class="hint muted">
+        Осознанно <b>не</b> попадают в очистку: база проектов и словарь произношения
+        (<code>data/</code>), референсы голосов (<code>voices/</code>), веса моделей
+        (<code>models/</code> и кеш <code>huggingface_hub</code>) и take'ы проектов
+        (<code>output/projects/</code>). После очистки ссылки на удалённые готовые файлы
+        перестают работать — их придётся синтезировать заново.
+      </p>
+    </div>
+  </section>
 </div>
 </main>
 

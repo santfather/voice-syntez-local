@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import socket
@@ -11,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
@@ -21,6 +22,7 @@ from . import (
     audio_analysis,
     audio_pipeline,
     benchmark,
+    cache_cleanup,
     config,
     denoise,
     engine_lifecycle,
@@ -638,6 +640,108 @@ async def delete_model(model_id: str) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# --- очистка кеша приложения --------------------------------------------------
+# Три категории и только они: транзитные файлы в корне output/, результаты
+# сравнения движков и опознаваемые временные файлы пайплайна. Веса моделей и кеш
+# huggingface_hub сюда не входят и входить не могут: их удаление — отдельный
+# осознанный поток во вкладке «Модели» (`DELETE /api/models/{id}`). Роуты ничего
+# не синтезируют, не поднимают модели и не ходят в сеть: это диск, а не инференс.
+#
+# Тело `POST` — `{"targets": ["output", "benchmarks", "temp_files"]}`; «голый
+# список» принимается для совместимости с наброском эндпоинта в постановке.
+# Пустой выбор — ошибка, а не «очистить всё»: форма обязана назвать категории.
+def parse_cache_targets(raw: Any) -> list[str]:
+    """Принимает объект `{"targets": [...]}` и «голый список» — и валидирует.
+
+    Голый список поддержан потому, что именно так эндпоинт набросан в постановке;
+    основной контракт — объект. Неизвестная категория и пустой выбор — 400 с
+    понятным текстом: молча вернуть ноль значило бы соврать пользователю.
+    """
+    if isinstance(raw, list):
+        targets = raw
+    elif isinstance(raw, dict):
+        targets = raw.get("targets", [])
+        if not isinstance(targets, list):
+            raise HTTPException(
+                status_code=400,
+                detail="Поле «targets» должно быть списком категорий очистки.",
+            )
+    elif raw is None:
+        targets = []
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail='Ожидается объект {"targets": [...]} или список категорий очистки.',
+        )
+    if not all(isinstance(target, str) for target in targets):
+        raise HTTPException(status_code=400, detail="Категории очистки должны быть строками.")
+    # Дубли схлопываются, порядок объявления категорий сохраняется: отчёт
+    # `freed_mb` читается человеком, и произвольный порядок в нём лишний.
+    selected = [target for target in cache_cleanup.TARGETS if target in set(targets)]
+    unknown = sorted(set(targets) - set(cache_cleanup.TARGETS))
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестная категория очистки: {', '.join(unknown)}. Доступны: "
+            + ", ".join(cache_cleanup.TARGETS),
+        )
+    if not selected:
+        raise HTTPException(
+            status_code=400,
+            detail="Не выбрано ни одной категории очистки. Доступны: "
+            + ", ".join(cache_cleanup.TARGETS),
+        )
+    return selected
+
+
+@app.get("/api/cache")
+async def get_cache() -> dict:
+    """Сколько занимает каждая категория — то, что показывает форма очистки.
+
+    Ничего не удаляет и не блокирует: обход каталогов уводится в поток, чтобы
+    цикл событий не ждал диск.
+    """
+    return await asyncio.to_thread(cache_cleanup.inventory)
+
+
+@app.post("/api/cache/clear")
+async def clear_cache(request: Request) -> dict:
+    """Освобождает выбранные категории и отчитывается по каждой.
+
+    Тело читается вручную, а не моделью Pydantic: контракт допускает и объект
+    `{"targets": [...]}`, и «голый список» из наброска в постановке, а
+    аннотированный параметр FastAPI принял бы только одну из этих форм.
+    Категория `benchmarks` дополнительно сбрасывает реестр запусков сравнения:
+    без этого интерфейс показывал бы строки со ссылками на удалённые файлы.
+    """
+    raw = await _read_json_body(request)
+    targets = parse_cache_targets(raw)
+    try:
+        return await asyncio.to_thread(cache_cleanup.clear, targets)
+    except ValueError as exc:
+        # Неизвестную категорию отсекает валидация выше; сюда попадает только
+        # расхождение между списком роута и модулем — это 400, а не 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _read_json_body(request: Request) -> Any:
+    """Тело запроса как JSON; пустое и нечитаемое тело — понятные 400.
+
+    Пустое тело — это не «выбрано всё»: форма обязана явно перечислить
+    категории, иначе очистка срабатывала бы от случайного запроса.
+    """
+    body = await request.body()
+    if not body.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Тело запроса пустое: перечислите категории очистки в поле «targets».",
+        )
+    try:
+        return json.loads(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Тело запроса не является JSON.") from exc
+
+
 @app.post("/api/parse")
 async def parse(payload: ParseRequest) -> dict:
     try:
@@ -757,7 +861,12 @@ async def transcribe_voice(file: UploadFile = File(...)) -> dict:
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Пустой файл аудио")
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+    # Префикс — часть контракта с очисткой кеша (`backend/cache_cleanup.py`):
+    # свои остатки она узнаёт по явному имени, а не по «похоже на временный
+    # файл». Сбой процесса между созданием и удалением оставит опознаваемый файл.
+    with tempfile.NamedTemporaryFile(
+        suffix=suffix, prefix="voice-syntez-", delete=False
+    ) as tmp:
         tmp.write(audio_bytes)
         tmp_path = Path(tmp.name)
     try:

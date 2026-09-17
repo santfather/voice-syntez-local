@@ -758,7 +758,13 @@ async def _transcribe_chunk(chunk: np.ndarray) -> str:
     """
 
     def run() -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+        # Префикс — часть контракта с очисткой кеша: `cache_cleanup` узнаёт свои
+        # остатки по явному имени (`voice-syntez-`), а не по маске «похоже на
+        # временный файл». Процесс может упасть между созданием и удалением, и
+        # тогда этот файл останется на диске — опознаваемым.
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav", prefix="voice-syntez-", delete=False
+        ) as handle:
             path = Path(handle.name)
         try:
             _write_audio(path, chunk, "wav")

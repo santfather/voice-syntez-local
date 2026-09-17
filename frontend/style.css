@@ -552,6 +552,21 @@ details.advanced > summary::-webkit-details-marker { display: none; }
 /* Зелёный тег «установлена»: у тегов уже есть янтарный вариант (.tag.warn). */
 .tag.ok { border-color: #3f6b2a; color: var(--lime); }
 
+/* Очистка кеша приложения: строка категории — как .disk-row, но с чекбоксом.
+   Размер прижат вправо, поэтому подпись занимает всё свободное место. */
+.cache-row {
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid #25242c;
+}
+.cache-row:last-of-type { border-bottom: 0; }
+.cache-row span { flex: 1 1 auto; }
+.cache-row small { font-size: 10px; }
+.cache-row b { flex: 0 0 auto; font: 10px var(--mono); }
+.cache-row input:disabled { cursor: default; opacity: 0.5; }
+
 /* Запись голоса: эталонную фразу нужно читать, поэтому она набрана как цитата */
 .ref-phrase {
   margin: 0 0 12px;
