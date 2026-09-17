@@ -195,6 +195,7 @@ def build_suggestions(
     *,
     rules=None,
     accentized: str | None = None,
+    stages=None,
     supports_accents: bool = True,
     auto_accent: bool = True,
     limit: int = DEFAULT_LIMIT,
@@ -205,14 +206,20 @@ def build_suggestions(
     Текст проходит те же стадии, что и preview (нормализация → «ё» → словарь →
     акцентуация), поэтому кандидаты ищутся по тому, что уйдёт в модель, а не по
     сырому исходнику. Ничего не пишется в базу и не синтезируется.
+
+    `stages` — уже посчитанные стадии того же текста. Анализ проекта считает их
+    один раз на реплику и передаёт сюда: без этого акцентуация (самая дорогая
+    часть подготовки) выполнялась бы дважды на каждую реплику, а на диалоге из
+    сотни реплик это удвоение слышно по времени отклика.
     """
     clean = (text or "").strip()
     if not clean:
         return Suggestions(candidates=[], considered=0)
 
-    stages = preview_text(
-        clean, supports_accents=supports_accents, auto_accent=auto_accent, rules=rules
-    )
+    if stages is None:
+        stages = preview_text(
+            clean, supports_accents=supports_accents, auto_accent=auto_accent, rules=rules
+        )
     working = stages.dictionary
     accented = stages.accentized if accentized is None else accentized
 
@@ -391,6 +398,7 @@ def suggest(
     *,
     rules=None,
     accentized: str | None = None,
+    stages=None,
     limit: int = DEFAULT_LIMIT,
     supports_accents: bool = True,
     auto_accent: bool = True,
@@ -401,6 +409,7 @@ def suggest(
         text,
         rules=rules,
         accentized=accentized,
+        stages=stages,
         supports_accents=supports_accents,
         auto_accent=auto_accent,
         limit=limit,
