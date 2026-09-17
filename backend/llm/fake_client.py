@@ -38,8 +38,10 @@ class FakeOllamaClient:
     """Ollama без Ollama: ответы задаются заранее или берутся из кейса.
 
     `responder(case)` получает payload кейса и возвращает текст ответа. По
-    умолчанию отвечает «идеально» — gold-аннотациями, если они переданы в
-    `gold_by_replica`, иначе пустым списком (валидный ответ «проблем нет»).
+    умолчанию отвечает «идеально»: gold-аннотациями из `gold_by_replica` (по
+    числовому id реплики) или из самого payload кейса, если он их содержит. Так
+    `--dry-run` получает верхнюю границу метрик, а gold в prompt настоящего
+    прогона не попадает: runner кладёт его только в подставной клиент.
     """
 
     def __init__(
@@ -49,6 +51,7 @@ class FakeOllamaClient:
         version: str = "0.34.0-fake",
         responder: Callable[[dict], str] | None = None,
         responses_by_model: dict[str, str] | None = None,
+        gold_by_replica: dict[int, list[dict]] | None = None,
         available: bool = True,
         error: str = "",
         latency_sec: float = 0.0,
@@ -56,6 +59,7 @@ class FakeOllamaClient:
         unload_works: bool = True,
     ) -> None:
         self._responses = dict(responses_by_model or {})
+        self._gold = dict(gold_by_replica or {})
         if models is not None:
             self._models = list(models)
         elif self._responses:
@@ -173,7 +177,7 @@ class FakeOllamaClient:
         preset = self._responses.get(model)
         if preset is not None:
             return _shape_response(preset, case)
-        gold = case.get("expected") or []
+        gold = case.get("expected") or self._gold.get(int(case.get("replica_id") or -1), [])
         return json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,

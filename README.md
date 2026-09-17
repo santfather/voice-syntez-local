@@ -1811,13 +1811,33 @@ Gold-корпус (фаза 2 из 7) лежит в `benchmarks/russian_linguist
 попытка вернуть `final_text` или `normalized` отвергает ответ целиком
 (`unknown_field`), потому что «свободный rewrite» не должен возвращаться через чёрный ход.
 
+Память и очередь моделей (фаза 4 из 7):
+
+- `backend/llm/memory_policy.py` — четыре состояния с порогами из постановки
+  (`LLM_MEMORY_NORMAL_MAX_PERCENT` 70, `LLM_MEMORY_WARNING_PERCENT` 75,
+  `LLM_MEMORY_CRITICAL_PERCENT` 82, `LLM_MEMORY_HARD_STOP_PERCENT` 88), абсолютный
+  резерв 3.5–4 GB под macOS и приоритет `memory pressure` над процентом: жёлтое давление
+  при 40 % всё равно запрещает новую тяжёлую задачу. WARNING — «новую тяжёлую задачу не
+  запускать», CRITICAL добавляет выгрузку неиспользуемых моделей, HARD STOP не запускает
+  ничего. Непрочитанные датчики политику не применяют, но флаг `sensor_ok: false` остаётся
+  в отчёте — сломанная метрика не доказательство нехватки памяти;
+- `HeavyGate` — одновременно выполняется не более одной тяжёлой задачи (LLM, синтез,
+  Whisper); внешняя занятость (очередь TTS) подключается через `external_busy`. Конкурентный
+  запуск не «подождать и попробовать», а отказ с причиной в отчёте;
+- `backend/llm/runner.py` — строго последовательный прогон: перед моделью выгружаются
+  остальные, после модель выгружается с проверкой по `/api/ps`, решение о памяти
+  принимается **до** запуска. Сырые ответы дописываются в `raw.jsonl` сразу, метрики лежат
+  в отдельном `metrics.json`, паспорт прогона — в `run.json`: `--resume` продолжает с места
+  остановки и не задваивает кейсы, а метрики при этом считаются по всему прогону. В prompt
+  настоящего прогона gold не попадает — его получает только подставной клиент `--dry-run`.
+
 Проверка Ollama и моделей:
 
 ```bash
 ollama --version           # демон и CLI
 ollama list                # что уже скачано
 ./venv/bin/python tools/build_llm_dataset.py --check   # корпус: spans и категории
-./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py tests/test_llm_benchmark_metrics.py -q
+./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py tests/test_llm_benchmark_metrics.py tests/test_llm_benchmark_memory.py tests/test_llm_benchmark_runner.py -q
 ```
 
 ## API
