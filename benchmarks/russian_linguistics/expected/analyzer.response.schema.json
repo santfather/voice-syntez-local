@@ -1,0 +1,118 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "replica_id": {
+      "type": "integer"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "span_start": {
+            "type": "integer"
+          },
+          "span_end": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "homograph",
+              "yo",
+              "stress",
+              "pronunciation",
+              "proper_name",
+              "toponym",
+              "abbreviation",
+              "number",
+              "foreign",
+              "term",
+              "punctuation",
+              "ambiguous"
+            ]
+          },
+          "meaning": {
+            "type": "string"
+          },
+          "suggested_form": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "needs_review": {
+            "type": "boolean"
+          },
+          "reason_code": {
+            "type": "string",
+            "enum": [
+              "CONTEXT_DISAMBIGUATION",
+              "YO_REQUIRED",
+              "YO_UNSURE",
+              "UNKNOWN_WORD",
+              "PROPER_NAME",
+              "ABBREVIATION",
+              "NUMBER_FORM",
+              "FOREIGN_WORD",
+              "TERM",
+              "NO_ISSUE"
+            ]
+          }
+        },
+        "required": [
+          "span_start",
+          "span_end",
+          "source",
+          "type",
+          "needs_review"
+        ]
+      }
+    },
+    "utterance": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": [
+            "NORMAL",
+            "SHORT_REPLY",
+            "QUESTION",
+            "CONFIRMATION",
+            "NEGATION",
+            "SURPRISE",
+            "CONTEXT_DEPENDENT"
+          ]
+        },
+        "context_dependency": {
+          "type": "string",
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+          ]
+        },
+        "relevant_replica_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      },
+      "required": [
+        "class"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "replica_id",
+    "items"
+  ]
+}

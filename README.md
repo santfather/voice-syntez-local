@@ -1766,12 +1766,34 @@ WER отвечает не на каждый вопрос: кусок может 
 - `backend/llm/fake_client.py` — подставной клиент для тестов и `--dry-run`: настоящие
   модели в обычном `pytest` не поднимаются.
 
+Gold-корпус (фаза 2 из 7) лежит в `benchmarks/russian_linguistics/`:
+
+- `dataset.v1.jsonl` — **339 кейсов** по 12 категориям: `homograph` 40, `yo` 40,
+  `morphology` 24, `name` 30, `toponym` 25, `abbreviation` 30, `number` 30, `latin` 25,
+  `term` 20, `dialogue_context` 25, `short_replica` 20, `no_issue` 30. Разметка написана
+  руками (таблицами в `tools/build_llm_dataset.py`) и **никогда не порождается tested-моделью**:
+  иначе benchmark измерял бы согласие модели с самой собой, а не качество;
+- границы каждого span считает генератор при сборке, поэтому `source` всегда посимвольно
+  совпадает с текстом; `tools/build_llm_dataset.py --check` падает, если это перестало быть
+  правдой, а `expected/summary.json` хранит сводку по категориям;
+- негативные пробы (70) нужны для false positive rate: 30 в `no_issue` плюс намеренные
+  «здесь `ё` не нужно» и «короткая реплика — правок нет» внутри своих категорий. Признак
+  негатива — явный флаг `expect_no_issue`, а не пустой `expected` (иначе забытая разметка
+  неотличима от пробы);
+- 28 кейсов помечены `ambiguous`: у редких фамилий, топонимов и опечаток-терминов
+  произношение не выводится из контекста, и gold требует `needs_review` вместо
+  уверенной правки. Спорные кейсы вынесены в `expected/summary.json` для ревью
+  человеком **до** полного прогона;
+- короткие реплики (`short_replica`) хранят контекст, но не правки: ожидаемый ответ —
+  класс реплики (`CONFIRMATION`, `NEGATION`, `QUESTION`, …), а не переписанный текст.
+
 Проверка Ollama и моделей:
 
 ```bash
 ollama --version           # демон и CLI
 ollama list                # что уже скачано
-./venv/bin/python -m pytest tests/test_llm_benchmark_infra.py -q
+./venv/bin/python tools/build_llm_dataset.py --check   # корпус: spans и категории
+./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py -q
 ```
 
 ## API

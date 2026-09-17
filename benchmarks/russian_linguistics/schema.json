@@ -1,0 +1,96 @@
+{
+  "type": "object",
+  "required": [
+    "id",
+    "category",
+    "target_text",
+    "expected"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "category": {
+      "type": "string"
+    },
+    "target_text": {
+      "type": "string"
+    },
+    "context_before": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "context_after": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "expected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "span_start",
+          "span_end",
+          "source",
+          "type"
+        ],
+        "properties": {
+          "span_start": {
+            "type": "integer"
+          },
+          "span_end": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "homograph",
+              "yo",
+              "stress",
+              "pronunciation",
+              "proper_name",
+              "toponym",
+              "abbreviation",
+              "number",
+              "foreign",
+              "term",
+              "punctuation",
+              "ambiguous"
+            ]
+          },
+          "meaning": {
+            "type": "string"
+          },
+          "suggested_form": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "needs_review": {
+            "type": "boolean"
+          },
+          "reason_code": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ambiguous": {
+      "type": "boolean"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "language": {
+      "type": "string"
+    }
+  }
+}

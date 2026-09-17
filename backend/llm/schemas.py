@@ -381,6 +381,10 @@ class DatasetCase:
     context_before: tuple[str, ...] = ()
     context_after: tuple[str, ...] = ()
     ambiguous: bool = False
+    # Внутри категории тоже бывают негативные кейсы: например, «ё» здесь не нужно.
+    # Явный флаг вместо догадки по пустому `expected` — иначе валидатор не отличит
+    # намеренную негативную пробу от забытой разметки.
+    expect_no_issue: bool = False
     notes: str = ""
     language: str = "ru"
 
@@ -403,6 +407,7 @@ class DatasetCase:
             "context_after": list(self.context_after),
             "expected": [item.to_dict() for item in self.expected],
             "ambiguous": bool(self.ambiguous),
+            "expect_no_issue": bool(self.expect_no_issue),
             "notes": self.notes,
             "language": self.language,
         }
@@ -419,6 +424,7 @@ class DatasetCase:
             context_before=tuple(str(item) for item in (raw.get("context_before") or [])),
             context_after=tuple(str(item) for item in (raw.get("context_after") or [])),
             ambiguous=bool(raw.get("ambiguous", False)),
+            expect_no_issue=bool(raw.get("expect_no_issue", False)),
             notes=str(raw.get("notes") or ""),
             language=str(raw.get("language") or "ru"),
         )
@@ -456,8 +462,9 @@ class DatasetCase:
             seen.add((item.span_start, item.span_end))
         if self.category == CATEGORY_NEGATIVE and self.expected:
             problems.append("негативный кейс с ожидаемыми аннотациями")
-        if self.category != CATEGORY_NEGATIVE and not self.expected and not self.ambiguous:
-            problems.append("нет ожидаемых аннотаций и нет пометки ambiguous")
+        if not self.expected and not self.ambiguous and not self.expect_no_issue \
+                and self.category != CATEGORY_NEGATIVE:
+            problems.append("нет ожидаемых аннотаций и нет пометки ambiguous/expect_no_issue")
         return problems
 
     @property
