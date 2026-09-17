@@ -256,7 +256,7 @@ def test_prompt_version_is_saved(tmp_path):
     """Версия prompt'а сохраняется: без неё старые числа невоспроизводимы."""
     runner = _runner(tmp_path, client=RecordingClient(models=MODELS))
     report = runner.run(["qwen3:4b"])
-    assert report["prompt_version"] == runner.prompt.version == "1"
+    assert report["prompt_version"] == runner.prompt.version
     assert report["schema_version"] == s.SCHEMA_VERSION
     assert report["dataset_version"] == "1"
     metadata = json.loads(
@@ -411,3 +411,98 @@ def test_benchmark_dry_run_full_corpus_is_a_clean_upper_bound(tmp_path):
             assert values["issue_recall"] == 1.0, category
         if values["negative_cases"]:
             assert values["false_positive_rate"] == 0.0, category
+
+
+def test_benchmark_response_format_json_is_default_and_schema_is_available(tmp_path):
+    """Режим схемы — часть условий прогона, и он попадает в паспорт.
+
+    `json` — схема уходит текстом в prompt, а `format="json"` гарантирует валидный
+    JSON. `schema` — та же схема уходит грамматикой Ollama. Это разные условия
+    эксперимента, поэтому режим сохраняется в метаданных, и прогоны нельзя
+    сравнивать, не зная режима.
+    """
+    client = _perfect_client(_cases(2))
+    runner = _runner(tmp_path / "json", client=client)
+    runner.run(["qwen3:4b"], limit=1)
+    assert runner.response_format == runner_mod.RESPONSE_FORMAT_JSON
+    assert client.calls[0]["schema"] is None
+    system_text = client.calls[0]["messages"][0]["content"]
+    assert '"span_start"' in system_text
+    metadata = json.loads(
+        (tmp_path / "json" / "qwen3-4b" / "run.json").read_text(encoding="utf-8")
+    )
+    assert metadata["options"]["response_format"] == "json"
+
+    grammar_client = _perfect_client(_cases(2))
+    grammar_runner = _runner(
+        tmp_path / "schema", client=grammar_client, response_format="schema"
+    )
+    grammar_runner.run(["qwen3:4b"], limit=1)
+    assert grammar_client.calls[0]["schema"] == s.analysis_json_schema()
+    grammar_metadata = json.loads(
+        (tmp_path / "schema" / "qwen3-4b" / "run.json").read_text(encoding="utf-8")
+    )
+    assert grammar_metadata["options"]["response_format"] == "schema"
+
+
+def test_benchmark_rejects_unknown_response_format(tmp_path):
+    with pytest.raises(runner_mod.BenchmarkError, match="режим схемы"):
+        _runner(tmp_path, client=_perfect_client(_cases(1)), response_format="магия")
+
+
+def test_benchmark_waits_for_memory_release_between_models(tmp_path):
+    """После выгрузки runner ждёт возврата памяти, но не бесконечно.
+
+    `/api/ps` пуст раньше, чем macOS отдаёт страницы: без ожидания вторая модель
+    блокируется остатками первой, и последовательный прогон останавливается сам.
+    """
+    samples = [
+        {"system_percent": 60.0, "available_gb": 9.0, "pressure": "green"},  # старт
+        {"system_percent": 62.0, "available_gb": 4.0, "pressure": "green"},  # после модели
+        {"system_percent": 60.0, "available_gb": 5.0, "pressure": "green"},  # ещё не вернулось
+        {"system_percent": 55.0, "available_gb": 9.5, "pressure": "green"},  # вернулось
+        {"system_percent": 55.0, "available_gb": 9.5, "pressure": "green"},
+    ]
+    state = {"index": 0}
+
+    def sensor():
+        index = min(state["index"], len(samples) - 1)
+        state["index"] += 1
+        return samples[index]
+
+    slept: list[float] = []
+    runner = runner_mod.BenchmarkRunner(
+        client=_perfect_client(_cases(1)),
+        cases=_cases(1),
+        output_dir=tmp_path,
+        sensor=sensor,
+        on_progress=lambda message: None,
+        sleep=slept.append,
+        clock=lambda: len(slept) * runner_mod.RELEASE_POLL_SEC,
+    )
+    report = runner.run(["qwen3:4b"])
+    release = report["models"]["qwen3:4b"]["memory"]["release"]
+    assert release["recovered"] is True
+    assert release["waited_sec"] > 0
+    assert slept, "runner обязан подождать, а не начинать следующую модель сразу"
+    assert report["models"]["qwen3:4b"]["status"] == "ok"
+
+
+def test_benchmark_release_wait_is_bounded(tmp_path):
+    """Если память не вернулась, ожидание заканчивается и это видно в отчёте."""
+    slept: list[float] = []
+    runner = runner_mod.BenchmarkRunner(
+        client=_perfect_client(_cases(1)),
+        cases=_cases(1),
+        output_dir=tmp_path,
+        # Модель (5.0 GB) помещается, но не оставляет резерв 3.5 GB: это WARNING,
+        # а не CRITICAL — и всё равно запрет запуска.
+        sensor=lambda: {"system_percent": 72.0, "available_gb": 6.0, "pressure": "green"},
+        on_progress=lambda message: None,
+        sleep=slept.append,
+        clock=lambda: len(slept) * runner_mod.RELEASE_POLL_SEC,
+    )
+    # Память не вернулась — модель стартовать нельзя, и это отказ, а не зависание.
+    report = runner.run(["qwen3:4b"])
+    assert report["models"]["qwen3:4b"]["status"] == "blocked"
+    assert report["models"]["qwen3:4b"]["metrics"]["memory"]["level"] == "WARNING"

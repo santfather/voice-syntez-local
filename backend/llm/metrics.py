@@ -53,6 +53,7 @@ HIGHER_IS_BETTER: dict[str, bool] = {
     "false_positive_rate": False,
     "needs_review_precision": True,
     "span_accuracy": True,
+    "recovered_annotations": True,
     "valid_json_rate": True,
     "schema_valid_rate": True,
     "source_preservation_rate": True,
@@ -137,7 +138,15 @@ class Prediction:
 
     @property
     def items(self) -> tuple[s.Annotation, ...]:
-        return self.analysis.items if self.analysis is not None else ()
+        if self.analysis is not None:
+            return self.analysis.items
+        if self.target_text is None:
+            return ()
+        return recover_items(self.json_object, self.target_text)
+
+    # Целевой текст нужен, чтобы проверить аннотации отвергнутого ответа поштучно:
+    # сам ответ кейса в Prediction не хранится.
+    target_text: str | None = None
 
     def extra_fields(self) -> tuple[str, ...]:
         """Лишние поля ответа — в том числе поля с переписанным текстом."""
@@ -161,6 +170,9 @@ class CaseScore:
     source_preserved: bool = True
     gold_items: int = 0
     pred_items: int = 0
+    # Аннотации из отвергнутого ответа, прошедшие проверку по отдельности: видно,
+    # что модель нашла, даже если ответ целиком не применён.
+    recovered_items: int = 0
     matched: int = 0
     exact_spans: int = 0
     gold_has_issue: bool = False
@@ -179,6 +191,50 @@ class CaseScore:
     @property
     def utterance_ok(self) -> bool:
         return bool(self.utterance_expected) and self.utterance_expected == self.utterance_got
+
+
+def recover_items(payload: Mapping[str, object] | None, target_text: str) -> tuple[s.Annotation, ...]:
+    """Достаёт из ответа аннотации, которые по отдельности корректны.
+
+    Ответ с одной битой аннотацией применяться не может: `parse_analysis` его
+    целиком отвергает, и это правильно (правка пользовательского текста без
+    основания недопустима). Но для **измерения** качества такая строгость
+    обнуляла бы всю картину: одна опечатка в span'е выглядела бы как «модель
+    ничего не нашла». Поэтому здесь аннотации проверяются поштучно — границы,
+    source, известный тип, диапазон уверенности, — а неверные просто отбрасываются.
+    Критическая ошибка за битый ответ при этом остаётся: строгость и измерение
+    отвечают на разные вопросы.
+    """
+    if not payload:
+        return ()
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return ()
+    recovered: list[s.Annotation] = []
+    seen: list[tuple[int, int]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        item = s.Annotation.from_dict(raw)
+        if item.type not in s.ANNOTATION_TYPES:
+            continue
+        if not item.source:
+            continue
+        if not (s.CONFIDENCE_MIN <= item.confidence <= s.CONFIDENCE_MAX):
+            continue
+        if item.span_start < 0 or item.span_end > len(target_text):
+            continue
+        if item.span_end <= item.span_start:
+            continue
+        if target_text[item.span_start : item.span_end] != item.source:
+            continue
+        if any(
+            max(start, item.span_start) < min(end, item.span_end) for start, end in seen
+        ):
+            continue
+        seen.append((item.span_start, item.span_end))
+        recovered.append(item)
+    return tuple(recovered)
 
 
 def same_type(left: str, right: str) -> bool:
@@ -269,6 +325,8 @@ def score_case(case: s.DatasetCase, prediction: Prediction) -> CaseScore:
         pred_has_issue=bool(prediction.items),
         utterance_expected=case.expected_utterance,
     )
+    if prediction.analysis is None:
+        score.recovered_items = len(prediction.items)
     critical: list[str] = []
     # Изменение текста вне разрешённого span: либо лишнее поле с текстом, либо
     # `source`, не совпавший с текстом в указанных границах.
@@ -436,6 +494,7 @@ def aggregate(scores: Sequence[CaseScore]) -> dict:
         "gold_annotations": gold_annotations,
         "predicted_annotations": predicted_annotations,
         "matched_annotations": sum(score.matched for score in scores),
+        "recovered_annotations": sum(score.recovered_items for score in scores),
         "homograph_accuracy": _ratio(
             sum(1 for score in homograph_scores if score.homograph_ok), len(homograph_scores)
         ),

@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.llm import metrics as metrics_mod
+from backend.llm import runner as runner_mod
 from backend.llm import schemas as s
 from backend.llm import versioning
 from backend.llm.ollama_client import OllamaClient, OllamaUnavailableError
@@ -95,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="без моделей и сети: подставной клиент отвечает gold-аннотациями",
+    )
+    parser.add_argument(
+        "--response-format",
+        choices=list(runner_mod.RESPONSE_FORMATS),
+        default=runner_mod.RESPONSE_FORMAT_JSON,
+        help="как передавать схему ответа: текстом в prompt (json) или грамматикой Ollama (schema)",
     )
     parser.add_argument("--num-ctx", type=int, default=8192, help="размер контекста")
     parser.add_argument("--temperature", type=float, default=0.0, help="temperature")
@@ -172,6 +179,7 @@ def run_benchmark(args: argparse.Namespace, *, client=None) -> int:
         cases=cases,
         output_dir=output_dir,
         options=options,
+        response_format=args.response_format,
         check_memory=not args.dry_run,
         dataset_version=versioning.BENCHMARK_VERSION,
         on_progress=progress,

@@ -63,6 +63,7 @@ def _respond(
     return m.Prediction(
         case_id=case.id,
         category=case.category,
+        target_text=case.target_text,
         raw_text=raw,
         analysis=analysis,
         errors=tuple(errors),
@@ -354,6 +355,36 @@ def test_metrics_issue_and_utterance_and_categories():
     assert report["categories"][s.CATEGORY_SHORT]["utterance_accuracy"] == 0.0
     report = m.score_run([yo_case, short], [correct_yo, _respond(short, utterance="CONFIRMATION")])
     assert report["metrics"]["utterance_accuracy"] == 1.0
+
+
+def test_metrics_recovers_valid_items_from_rejected_answer():
+    """Одна битая аннотация: ответ отвергнут, но найденное измеряется.
+
+    Строгость применения и измерение качества — разные вопросы: в продакшене такой
+    ответ не применяется целиком (правка текста без основания недопустима), но
+    benchmark обязан увидеть, что модель нашла правильное место, иначе одна
+    опечатка в span'е выглядит как «ничего не найдено».
+    """
+    text = "Мы гуляли вокруг старого замка на холме."
+    case = _castle_case()
+    good = _item(text, "замка", s.TYPE_HOMOGRAPH, meaning="строение, крепость", confidence=0.9)
+    broken = good.to_dict() | {"span_start": 0, "span_end": 5, "source": "замка"}
+    prediction = _respond(case, raw=json.dumps({
+        "schema_version": s.SCHEMA_VERSION,
+        "replica_id": case.replica_id,
+        "items": [good.to_dict(), broken],
+    }, ensure_ascii=False))
+    score = m.score_case(case, prediction)
+    assert score.schema_valid is False
+    assert m.CRITICAL_SOURCE_MISMATCH in score.critical
+    assert score.recovered_items == 1
+    assert score.matched == 1
+    assert score.homograph_ok is True
+    report = m.score_run([case], [prediction])
+    assert report["metrics"]["issue_recall"] == 1.0
+    assert report["metrics"]["recovered_annotations"] == 1
+    assert report["metrics"]["schema_valid_rate"] == 0.0
+    assert report["metrics"]["critical_error_rate"] == 1.0
 
 
 def test_metrics_undefined_per_category_is_dash_not_zero():

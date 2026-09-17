@@ -144,3 +144,24 @@ def test_heavy_gate_consults_external_state_and_validates_kind():
     assert "не удалось" in broken.busy()
     with pytest.raises(ValueError, match="неизвестный вид"):
         p.HeavyGate().try_acquire("тренировка")
+
+
+def test_memory_critical_does_not_abort_running_job_but_hard_stop_does():
+    """CRITICAL запрещает новую работу, но идущую не убивает — это делает HARD STOP.
+
+    Постановка (§11.2) различает «остановить dispatch новых задач» (CRITICAL) и
+    «текущую безопасно завершить/прервать» (HARD STOP). Если прерывать прогон по
+    проценту CRITICAL, замер посередине модели даёт обрезанные данные вместо
+    результата, хотя абсолютный резерв цел.
+    """
+    critical = _decide(84.0, 9.0)
+    assert critical.level == p.LEVEL_CRITICAL
+    assert critical.allow_llm_start is False
+    assert critical.must_abort_running is False
+
+    hard_stop = _decide(90.0, 9.0)
+    assert hard_stop.must_abort_running is True
+
+    # Исчерпанный резерв — тоже жёсткий факт, даже если процент невелик.
+    no_reserve = _decide(60.0, 1.0)
+    assert no_reserve.must_abort_running is True

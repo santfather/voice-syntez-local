@@ -128,6 +128,14 @@ class MemoryDecision:
     thresholds: MemoryThresholds = field(default_factory=MemoryThresholds)
     # Датчики прочитались. Если нет — решение не применяется, и это видно в отчёте.
     sensor_ok: bool = True
+    # Прерывать ли **уже идущую** тяжёлую задачу. Это не то же самое, что «не
+    # начинать новую»: постановка (§11.2) различает CRITICAL («остановить dispatch
+    # новых задач») и HARD STOP («текущую безопасно завершить/прервать»). Поэтому
+    # прерываем работу только тогда, когда есть жёсткий факт: HARD STOP или
+    # исчерпанный абсолютный резерв. Процентный CRITICAL сам по себе идущий
+    # benchmark не убивает — иначе один замер посередине модели даёт обрезанные
+    # данные вместо результата.
+    must_abort_running: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -142,6 +150,7 @@ class MemoryDecision:
             "pressure": self.pressure,
             "model_size_gb": self.model_size_gb,
             "sensor_ok": self.sensor_ok,
+            "must_abort_running": self.must_abort_running,
             "thresholds": self.thresholds.to_dict(),
         }
 
@@ -245,6 +254,9 @@ def decide(
     return MemoryDecision(
         level=level,
         reason="; ".join(reasons),
+        must_abort_running=(
+            level == LEVEL_HARD_STOP or available_gb < limits.reserve_min_gb
+        ),
         # WARNING — «новую тяжёлую задачу не запускать» (§11.2), поэтому запуск
         # разрешён только в NORMAL. Это осознанно строго: лучше отложить прогон,
         # чем получить числа на машине, которая уходит в swap.

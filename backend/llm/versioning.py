@@ -24,7 +24,7 @@ from pathlib import Path
 logger = logging.getLogger("tts.llm.versioning")
 
 BENCHMARK_VERSION = "1"
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 # Версия схемы живёт в `schemas.SCHEMA_VERSION`; здесь — только для отчёта.
 
 GIT_TIMEOUT_SEC = 5.0

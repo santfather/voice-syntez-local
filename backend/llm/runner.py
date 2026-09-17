@@ -42,6 +42,16 @@ from .prompt import PromptTemplate, load_prompt
 
 logger = logging.getLogger("tts.llm.runner")
 
+# Как передаётся схема ответа:
+# - `json`   — модель получает схему текстом в prompt, а `format="json"`
+#              гарантирует валидный JSON; контракт проверяет backend (строго и с
+#              одним повтором). Выбран по умолчанию: grammar-режим ниже ломает
+#              ответы части моделей (см. отчёт benchmark'а).
+# - `schema` — та же схема уходит в `format` Ollama, то есть генерация
+#              ограничивается грамматикой.
+RESPONSE_FORMAT_JSON = "json"
+RESPONSE_FORMAT_SCHEMA = "schema"
+RESPONSE_FORMATS: tuple[str, ...] = (RESPONSE_FORMAT_JSON, RESPONSE_FORMAT_SCHEMA)
 DEFAULT_NUM_CTX = 8192
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_SEED = 0
@@ -52,10 +62,17 @@ DEFAULT_MAX_REPAIRS = 1
 RAW_FILE = "raw.jsonl"
 METRICS_FILE = "metrics.json"
 RUN_FILE = "run.json"
+# Сколько ждать фактического возврата памяти после выгрузки модели. `/api/ps`
+# перестаёт показывать модель раньше, чем macOS отдаёт страницы: без ожидания
+# следующая модель получает WARNING «резерв меньше нормы» на ровном месте, и
+# последовательный прогон останавливается сам собой.
+RELEASE_TIMEOUT_SEC = 60.0
+RELEASE_POLL_SEC = 3.0
 REPAIR_INSTRUCTION = (
     "Предыдущий ответ не прошёл проверку схемы. Верни ТОЛЬКО JSON-объект по схеме, "
     "без пояснений и без markdown. Поля span_start/span_end/source обязаны точно "
-    "соответствовать тексту реплики."
+    "соответствовать тексту реплики. Не убирай найденные аннотации: исправь только "
+    "перечисленные ошибки."
 )
 
 
@@ -160,10 +177,12 @@ class BenchmarkRunner:
         thresholds: memory.MemoryThresholds | None = None,
         sensor: memory.Sensor | None = None,
         max_repairs: int = DEFAULT_MAX_REPAIRS,
+        response_format: str = RESPONSE_FORMAT_JSON,
         check_memory: bool = True,
         dataset_version: str = "1",
         on_progress: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.client = client
         self.cases = list(cases)
@@ -178,6 +197,9 @@ class BenchmarkRunner:
         self.gate = gate or memory.HeavyGate()
         self.thresholds = thresholds or memory.thresholds_from_env()
         self.sensor = sensor
+        if response_format not in RESPONSE_FORMATS:
+            raise BenchmarkError(f"неизвестный режим схемы: {response_format}")
+        self.response_format = response_format
         self.max_repairs = max_repairs
         # `check_memory=False` — только для путей без настоящей модели (--dry-run):
         # там политика памяти не защищает ни от чего, зато делает результат
@@ -186,6 +208,7 @@ class BenchmarkRunner:
         self.dataset_version = dataset_version
         self.on_progress = on_progress or (lambda message: logger.info("%s", message))
         self.clock = clock
+        self.sleep = sleep
 
     # -- планирование -----------------------------------------------------------
     def select_cases(
@@ -329,12 +352,11 @@ class BenchmarkRunner:
                     peak_percent = max(peak_percent, float(sample.get("system_percent") or 0.0))
                     if sample.get("pressure") in (memory.PRESSURE_YELLOW, memory.PRESSURE_RED):
                         pressure_events += 1
-                    # Модель уже загружена: если память ушла в CRITICAL/HARD STOP,
-                    # дальше не идём — иначе прогон начнёт влиять на свои же замеры.
-                    if sample.get("level") in (
-                        memory.LEVEL_CRITICAL,
-                        memory.LEVEL_HARD_STOP,
-                    ):
+                    # Модель уже загружена. Прерываем работу только по жёсткому
+                    # факту (HARD STOP или исчерпанный резерв), а не по
+                    # процентному CRITICAL: иначе замер посередине модели даёт
+                    # обрезанные данные вместо результата, хотя резерв цел.
+                    if sample.get("must_abort_running"):
                         self.on_progress(
                             f"{model}: прогон остановлен на кейсе {case.id} — "
                             + f"{sample.get('reason')}"
@@ -355,6 +377,7 @@ class BenchmarkRunner:
             )
 
         confirmed = self._unload_model(model)
+        release = self._wait_for_release(model, info.size_gb)
         measured = self._combine_reports(model, cases, raw_path, reports)
         attempted_ids = {run.case_id for run in measured}
         attempted = [case for case in cases if case.id in attempted_ids]
@@ -365,6 +388,7 @@ class BenchmarkRunner:
             # Считаются только реальные замеры: при dry-run их нет вовсе.
             "samples": sum(1 for sample in memory_samples if sample),
             "decision": decision.to_dict(),
+            "release": release,
         }
         # Метрики считаются по всем ответам модели (в том числе дописанным в
         # прошлом запуске), но только по тем кейсам, которые она действительно
@@ -411,7 +435,9 @@ class BenchmarkRunner:
         cancel: Callable[[], bool] | None,
     ) -> CaseRun:
         payload = case.prompt_payload()
-        messages = self.prompt.messages(payload)
+        messages = self.prompt.messages(
+            payload, schema_json=self._schema_text()
+        )
         started = self.clock()
         error = ""
         repair_attempted = False
@@ -427,10 +453,15 @@ class BenchmarkRunner:
             while analysis is None and repairs < self.max_repairs:
                 repair_attempted = True
                 repairs += 1
+                # В повторном запросе перечисляются конкретные ошибки: без этого
+                # модель «упрощает» ответ до пустого списка и теряет найденное.
+                repair = REPAIR_INSTRUCTION
+                if errors:
+                    repair += " Ошибки: " + ", ".join(dict.fromkeys(errors)) + "."
                 repair_messages = [
                     *messages,
                     {"role": "assistant", "content": raw_text[:2000]},
-                    {"role": "user", "content": REPAIR_INSTRUCTION},
+                    {"role": "user", "content": repair},
                 ]
                 chat = self._chat(model, repair_messages, cancel=cancel)
                 raw_text = chat.text
@@ -466,12 +497,19 @@ class BenchmarkRunner:
             options=dict(self.options),
         )
 
+    def _schema_text(self) -> str:
+        """Та же схема, что и в валидаторе, — текстом для prompt'а."""
+        import json as _json
+
+        return _json.dumps(s.analysis_json_schema(), ensure_ascii=False, indent=2)
+
     def _chat(self, model: str, messages: list[dict], *, cancel: Callable[[], bool] | None):
-        """Один вызов модели с JSON-схемой и коротким keep-alive."""
+        """Один вызов модели с JSON-выходом и коротким keep-alive."""
+        schema = s.analysis_json_schema() if self.response_format == RESPONSE_FORMAT_SCHEMA else None
         return self.client.chat(
             model,
             messages,
-            schema=s.analysis_json_schema(),
+            schema=schema,
             options=dict(self.options),
             keep_alive=DEFAULT_KEEP_ALIVE,
             cancel=cancel,
@@ -494,6 +532,7 @@ class BenchmarkRunner:
         return metrics_mod.Prediction(
             case_id=run.case_id,
             category=run.category,
+            target_text=case.target_text if case is not None else None,
             raw_text=run.raw_text,
             analysis=analysis,
             errors=errors,
@@ -540,6 +579,39 @@ class BenchmarkRunner:
     def _completed_cases(self, raw_path: Path) -> set[str]:
         return {run.case_id for run in self._read_jsonl(raw_path)}
 
+    def _wait_for_release(self, model: str, size_gb: float) -> dict:
+        """Ждёт фактического возврата памяти после выгрузки модели.
+
+        Выгрузка подтверждается по `/api/ps`, но страницы возвращаются системе
+        позже. Если не подождать, следующая модель получит WARNING из-за остатков
+        предыдущей — то есть прогон будет ограничен не памятью машины, а
+        инерцией освобождения. Ожидание ограничено по времени: «ждать вечно» —
+        это тот же отказ, только незаметный.
+        """
+        if not self.check_memory:
+            return {"waited_sec": 0.0, "recovered": True, "available_gb": None}
+        needed = size_gb + self.thresholds.reserve_min_gb
+        started = self.clock()
+        decision = memory.decide_current(thresholds=self.thresholds, sensor=self.sensor)
+        while decision.available_gb < needed and self.clock() - started < RELEASE_TIMEOUT_SEC:
+            self.sleep(RELEASE_POLL_SEC)
+            decision = memory.decide_current(thresholds=self.thresholds, sensor=self.sensor)
+        waited = round(self.clock() - started, 1)
+        recovered = decision.available_gb >= needed
+        message = (
+            f"{model}: память освобождена за {waited} c ({decision.available_gb:.1f} GB)"
+            if recovered
+            else f"{model}: память не вернулась за {waited} c "
+            + f"({decision.available_gb:.1f} GB из нужных {needed:.1f} GB)"
+        )
+        self.on_progress(message)
+        return {
+            "waited_sec": waited,
+            "recovered": recovered,
+            "available_gb": round(decision.available_gb, 2),
+            "needed_gb": round(needed, 2),
+        }
+
     def _unload_everything(self) -> list[str]:
         """Выгружает все модели: так требует CRITICAL/HARD STOP (§11.2)."""
         try:
@@ -582,7 +654,8 @@ class BenchmarkRunner:
             context=int(self.options.get("num_ctx", DEFAULT_NUM_CTX)),
             temperature=float(self.options.get("temperature", DEFAULT_TEMPERATURE)),
             seed=self.options.get("seed"),
-            options=self.options,
+            # Режим схемы — часть условий прогона: без него числа невоспроизводимы.
+            options={**self.options, "response_format": self.response_format},
         )
         versioning.write_run_metadata(model_dir / RUN_FILE, metadata)
         metrics_report["metadata"] = metadata.to_dict()

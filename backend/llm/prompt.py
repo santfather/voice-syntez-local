@@ -18,8 +18,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "russian_linguistics" / "prompts"
-ANALYZER_PROMPT = "analyzer.v1.txt"
+ANALYZER_PROMPT = "analyzer.v2.txt"
+# v1 остаётся в дереве: по нему уже были прогоны, и он нужен для сравнения
+# «до/после» — но по умолчанию используется v2.
+ANALYZER_PROMPT_V1 = "analyzer.v1.txt"
 PLACEHOLDER = "{{case}}"
+# Схему ответа prompt получает плейсхолдером, а не копией в тексте: иначе через
+# месяц файл и валидатор разошлись бы, и модель учили бы одной схеме, а проверяли
+# другой.
+SCHEMA_PLACEHOLDER = "{{schema}}"
 
 
 @dataclass(frozen=True)
@@ -32,15 +39,24 @@ class PromptTemplate:
     user_template: str
     path: str = ""
 
-    def messages(self, case_payload: dict, *, system_extra: str = "") -> list[dict]:
+    def messages(
+        self,
+        case_payload: dict,
+        *,
+        schema_json: str = "",
+        system_extra: str = "",
+    ) -> list[dict]:
         """Сообщения для `/api/chat`: system + user с подставленным кейсом.
 
         JSON кейса идёт с `ensure_ascii=False`: модели проще читать русский текст
-        как русский, а не как `\\u0442`-последовательности.
+        как русский, а не как `\\u0442`-последовательности. `schema_json` — та же
+        схема, по которой backend проверяет ответ: модель обязана видеть ровно её,
+        а не пересказ.
         """
         case_json = json.dumps(case_payload, ensure_ascii=False, indent=2)
         user = self.user_template.replace(PLACEHOLDER, case_json)
-        system = self.system if not system_extra else f"{self.system}\n\n{system_extra}"
+        system = self.system.replace(SCHEMA_PLACEHOLDER, schema_json) if schema_json else self.system
+        system = system if not system_extra else f"{system}\n\n{system_extra}"
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -83,6 +99,8 @@ def parse_prompt(text: str, *, name: str, path: str = "") -> PromptTemplate:
         raise ValueError(f"prompt «{name}»: нужны непустые секции [system] и [user]")
     if PLACEHOLDER not in user:
         raise ValueError(f"prompt «{name}»: в секции [user] нет {PLACEHOLDER}")
+    if SCHEMA_PLACEHOLDER not in system:
+        raise ValueError(f"prompt «{name}»: в секции [system] нет {SCHEMA_PLACEHOLDER}")
     return PromptTemplate(name=name, version=version, system=system, user_template=user, path=path)
 
 

@@ -318,6 +318,20 @@ def _extract_json(raw_text: str) -> tuple[dict | None, list[str]]:
     return payload, []
 
 
+def normalize_schema_version(value: object) -> str:
+    """Приводит версию схемы к сравнимому виду.
+
+    Модели почти всегда отдают `"1.0"` там, где в контракте стоит `"1"` — это та же
+    самая версия, а не другая. Считать такое расхождение ошибкой значило бы мерить
+    педантичность формата вместо русского языка; при этом настоящая смена версии
+    (`"2"`, `"1.1"`) обязана ломать разбор. Поэтому снимаем косметику: ведущая `v`,
+    пробелы и хвостовой `.0`.
+    """
+    text = str(value or "").strip().lstrip("vV")
+    text = text.removesuffix(".0")
+    return text
+
+
 def extract_json_object(raw_text: str) -> tuple[dict | None, list[str]]:
     """Публичный разбор JSON-объекта из ответа — нужен метрикам.
 
@@ -351,7 +365,8 @@ def parse_analysis(
     allowed = set(allowed_types)
     if set(payload) - set(RESPONSE_FIELDS):
         errors.append(ERROR_UNKNOWN_FIELD)
-    version = str(payload.get("schema_version") or SCHEMA_VERSION)
+    raw_version = payload.get("schema_version")
+    version = normalize_schema_version(raw_version) or SCHEMA_VERSION
     if check_schema_version and version != SCHEMA_VERSION:
         errors.append(ERROR_SCHEMA_VERSION)
 

@@ -277,6 +277,39 @@ def test_llm_response_rejects_bad_confidence():
     assert errors == [s.ERROR_CONFIDENCE_RANGE]
 
 
+def test_llm_response_accepts_schema_version_noise():
+    """`"1.0"`, `"1"` и `"v1"` — одна и та же версия схемы, а `"2"` — другая.
+
+    Модели почти всегда пишут `"1.0"`: считать это ошибкой значило бы мерить
+    педантичность формата, а не русский язык. Настоящую смену версии разбор обязан
+    ловить.
+    """
+    # Пустая версия приравнивается к текущей: отсутствие поля в контракте
+    # допускалось и раньше, менять это здесь незачем.
+    for value in ("1", "1.0", "v1", " 1.0 ", ""):
+        payload = json.loads(_valid_response())
+        payload["schema_version"] = value
+        analysis, errors = s.parse_analysis(
+            json.dumps(payload, ensure_ascii=False),
+            expected_replica_id=17,
+            target_text=TARGET,
+        )
+        assert errors == [], value
+        assert analysis is not None
+        assert analysis.schema_version == "1"
+
+    for value in ("2", "1.1"):
+        payload = json.loads(_valid_response())
+        payload["schema_version"] = value
+        analysis, errors = s.parse_analysis(
+            json.dumps(payload, ensure_ascii=False),
+            expected_replica_id=17,
+            target_text=TARGET,
+        )
+        assert analysis is None, value
+        assert s.ERROR_SCHEMA_VERSION in errors, value
+
+
 def test_llm_response_rejects_rewritten_text_field():
     """Попытка вернуть переписанный текст не проходит валидацию.
 
@@ -350,17 +383,35 @@ def test_json_in_markdown_fence_is_accepted():
 # --- prompt и версии ------------------------------------------------------------
 def test_prompt_loads_with_version_and_placeholder():
     template = prompt.load_prompt()
-    assert template.version == "1"
+    assert template.version == versioning.PROMPT_VERSION
     assert prompt.PLACEHOLDER in template.user_template
-    messages = template.messages({"replica_id": 1, "target_text": "Да."})
+    assert prompt.SCHEMA_PLACEHOLDER in template.system
+    schema_text = json.dumps(s.analysis_json_schema(), ensure_ascii=False, indent=2)
+    messages = template.messages(
+        {"replica_id": 1, "target_text": "Да."}, schema_json=schema_text
+    )
     assert messages[0]["role"] == "system"
     assert "ТОЛЬКО JSON" in messages[0]["content"]
     assert '"target_text": "Да."' in messages[1]["content"]
+    # Схема доходит до модели целиком и ровно та же, что проверяет backend: иначе
+    # модель учили бы одной схеме, а принимали другую.
+    assert prompt.SCHEMA_PLACEHOLDER not in messages[0]["content"]
+    assert '"span_start"' in messages[0]["content"]
+    assert "homograph" in messages[0]["content"]
+    assert "CONTEXT_DISAMBIGUATION" in messages[0]["content"]
 
 
-def test_prompt_without_version_is_rejected():
+def test_prompt_requires_case_and_schema_placeholders():
     with pytest.raises(ValueError, match="версия"):
         prompt.parse_prompt("[system]\ns\n[user]\n{{case}}", name="x")
+    with pytest.raises(ValueError, match="schema"):
+        prompt.parse_prompt(
+            "# version: 1\n[system]\nбез плейсхолдера\n[user]\n{{case}}", name="x"
+        )
+    with pytest.raises(ValueError, match="case"):
+        prompt.parse_prompt(
+            "# version: 1\n[system]\n{{schema}}\n[user]\nбез плейсхолдера", name="x"
+        )
 
 
 def test_prompt_without_placeholder_is_rejected():
@@ -395,7 +446,7 @@ def test_model_metadata_is_saved():
 def test_prompt_version_is_saved():
     metadata = versioning.build_run_metadata(model_tag="m", include_machine=False)
     payload = metadata.to_dict()
-    assert payload["prompt_version"] == "1"
+    assert payload["prompt_version"] == versioning.PROMPT_VERSION
     assert payload["dataset_version"] == "1"
     assert payload["benchmark_version"] == versioning.BENCHMARK_VERSION
     assert payload["timestamp"]

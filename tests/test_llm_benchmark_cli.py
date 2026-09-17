@@ -11,7 +11,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import tools.llm_benchmark as cli
+from backend.llm import versioning
 from backend.llm.fake_client import FakeOllamaClient
 from backend.llm.ollama_client import OllamaModel
 
@@ -148,7 +151,7 @@ def test_cli_saves_and_compares_baseline(tmp_path, capsys):
     assert baseline_path.exists()
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     assert baseline["model"] == "qwen3:8b"
-    assert baseline["prompt_version"] == "1"
+    assert baseline["prompt_version"] == versioning.PROMPT_VERSION
     assert baseline["metrics"]["issue_f1"] == 1.0
     assert baseline["categories"]["homograph"] == 1.0
 
@@ -189,3 +192,21 @@ def test_cli_repeat_makes_evaluations_and_keeps_cases(tmp_path):
     assert data["metrics"]["evaluations"] == 6
     assert data["metrics"]["cases"] == 3
     assert data["metrics"]["planned_cases"] == 3
+
+
+def test_cli_response_format_flag(tmp_path):
+    """Режим схемы выбирается флагом и по умолчанию безопасный (`json`)."""
+    default = cli.build_parser().parse_args([])
+    assert default.response_format == "json"
+    grammar = cli.build_parser().parse_args(["--response-format", "schema"])
+    assert grammar.response_format == "schema"
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--response-format", "магия"])
+    code = cli.main(
+        _args(tmp_path, "--limit", "2", "--model", "qwen3:8b", "--response-format", "json")
+    )
+    assert code == cli.EXIT_OK
+    metadata = json.loads(
+        (tmp_path / "qwen3-8b" / "run.json").read_text(encoding="utf-8")
+    )
+    assert metadata["options"]["response_format"] == "json"
