@@ -13,6 +13,12 @@
 больше памяти, чем весь остальной бэкенд вместе с F5-TTS. В общем процессе это
 упиралось бы в лимит watchdog'а (resource_guard.MAX_RSS_MB), а падение
 распознавания уносило бы с собой модель синтеза.
+
+Режим `--words` (`python -m backend.transcribe_worker <путь> --words`) отдаёт
+таймстемпы слов. Он нужен границам коротких реплик: контекстный синтез склеивает
+несколько фраз в один прогон, и разрезать результат «примерно по времени» нельзя —
+только по реальным границам слов (short_utterances §11, §31). Таймстемпы берутся у
+того же Whisper, поэтому новая зависимость не появляется.
 """
 
 import json
@@ -20,6 +26,7 @@ import sys
 
 ASR_MODEL_ID = "openai/whisper-large-v3-turbo"
 FULL_FLAG = "--full"
+WORDS_FLAG = "--words"
 
 
 def _log(*args) -> None:
@@ -28,10 +35,11 @@ def _log(*args) -> None:
 
 
 def main() -> int:
-    full = FULL_FLAG in sys.argv
-    paths = [arg for arg in sys.argv[1:] if arg != FULL_FLAG]
+    words = WORDS_FLAG in sys.argv
+    full = words or FULL_FLAG in sys.argv
+    paths = [arg for arg in sys.argv[1:] if arg not in (FULL_FLAG, WORDS_FLAG)]
     if len(paths) != 1:
-        _log(f"usage: python -m backend.transcribe_worker <audio path> [{FULL_FLAG}]")
+        _log(f"usage: python -m backend.transcribe_worker <audio path> [{FULL_FLAG}|{WORDS_FLAG}]")
         return 2
 
     # Порядок импортов здесь важен: config выставляет лимиты потоков в переменных
@@ -60,26 +68,32 @@ def main() -> int:
         torch_dtype=torch.float16 if device == "mps" else torch.float32,
         device=device,
     )
-    ref_text = pipe(
+    result = pipe(
         effective_path,
         chunk_length_s=30,
         batch_size=8,
         generate_kwargs={"task": "transcribe"},
-        return_timestamps=False,
-    )["text"].strip()
-
-    print(
-        json.dumps(
-            {
-                "ref_text": ref_text,
-                "effective_sec": round(
-                    AudioSegment.from_file(effective_path).duration_seconds, 2
-                ),
-                "full_sec": round(AudioSegment.from_file(audio_path).duration_seconds, 2),
-            },
-            ensure_ascii=False,
-        )
+        return_timestamps="word" if words else False,
     )
+    ref_text = str(result.get("text") or "").strip()
+
+    payload: dict = {
+        "ref_text": ref_text,
+        "effective_sec": round(AudioSegment.from_file(effective_path).duration_seconds, 2),
+        "full_sec": round(AudioSegment.from_file(audio_path).duration_seconds, 2),
+    }
+    if words:
+        # Таймстемп может быть `None` (слово без границы) или `(start, None)`:
+        # такие слова пропускаются, а не выдумываются — граница обязана быть
+        # настоящей, иначе обрезка вернётся к «примерно по времени».
+        payload["words"] = [
+            {"word": str(chunk.get("text") or "").strip(), "start": start, "end": end}
+            for chunk in (result.get("chunks") or [])
+            for start, end in [chunk.get("timestamp") or (None, None)]
+            if start is not None and end is not None
+        ]
+
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 

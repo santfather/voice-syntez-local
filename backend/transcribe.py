@@ -34,6 +34,9 @@ WORKER_TIMEOUT_SEC = float(os.environ.get("TTS_ASR_TIMEOUT_SEC", "900"))
 # Режим «расшифровать файл целиком»: без него воркер режет запись так же, как
 # референс для модели (первые ~12 секунд).
 WORKER_FULL_FLAG = "--full"
+# Режим «с таймстемпами слов»: нужен границам коротких реплик, где обрезка
+# контекстного синтеза обязана опираться на реальные границы слов.
+WORKER_WORDS_FLAG = "--words"
 
 # Ниже этой доли совпавших слов считаем, что расшифровка от другой записи.
 MATCH_THRESHOLD = 0.6
@@ -46,6 +49,18 @@ class Transcription:
     ref_text: str  # что реально произнесено в записи
     effective_sec: float  # длительность фрагмента, который уйдёт в модель
     full_sec: float  # длительность исходного файла
+
+
+@dataclass(frozen=True)
+class WordStamp:
+    """Слово и его границы в секундах — то, по чему режется контекстный синтез."""
+
+    word: str
+    start: float
+    end: float
+
+    def to_dict(self) -> dict:
+        return {"word": self.word, "start": round(self.start, 3), "end": round(self.end, 3)}
 
 
 def _run_worker(audio_path: Path, full: bool) -> Transcription:
@@ -83,6 +98,42 @@ def _run_worker(audio_path: Path, full: bool) -> Transcription:
 def transcribe_file(audio_path: Path) -> Transcription:
     """Распознаёт речь в записи; режет её так же, как это делает синтез."""
     return _run_worker(audio_path, full=False)
+
+
+def _run_words_worker(audio_path: Path) -> list[WordStamp]:
+    """Запускает воркер в режиме таймстемпов слов."""
+    command = [sys.executable, "-m", WORKER_MODULE, str(audio_path), WORKER_WORDS_FLAG]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=config.BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=WORKER_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"распознавание не уложилось в {WORKER_TIMEOUT_SEC:.0f} с") from exc
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stderr or "").strip().splitlines()[-3:])
+        raise RuntimeError(f"распознавание не удалось: {tail or 'код ' + str(proc.returncode)}")
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        return [
+            WordStamp(word=str(item["word"]), start=float(item["start"]), end=float(item["end"]))
+            for item in payload.get("words") or []
+        ]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("распознавание вернуло неожиданный ответ") from exc
+
+
+def transcribe_words(audio_path: Path) -> list[WordStamp]:
+    """Распознаёт запись целиком и отдаёт границы слов.
+
+    Нужно границам коротких реплик: без реальных границ контекстный синтез не
+    режется, а откатывается на DIRECT (см. `short_utterance_boundary`).
+    """
+    return _run_words_worker(audio_path)
 
 
 def transcribe_audio(audio_path: Path) -> str:
