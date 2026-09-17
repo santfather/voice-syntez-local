@@ -34,8 +34,6 @@
     "dialogue-0268",
     "dialogue-0269",
     "dialogue-0270",
-    "dialogue-0271",
-    "dialogue-0272",
     "dialogue-0282",
     "dialogue-0283",
     "dialogue-0284",
@@ -45,5 +43,13 @@
     "dialogue-0288",
     "dialogue-0289"
   ],
-  "needs_review_annotations": 70
+  "needs_review_annotations": 72,
+  "utterance_classes": {
+    "CONFIRMATION": 13,
+    "NEGATION": 5,
+    "NORMAL": 9,
+    "QUESTION": 4,
+    "SHORT_REPLY": 8,
+    "SURPRISE": 6
+  }
 }

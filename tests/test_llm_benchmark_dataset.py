@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,53 @@ def test_benchmark_short_replica_cases_expect_hint_not_text(dataset):
         assert case.notes.strip(), f"{case.id}: не указано, что это за реплика"
         # Смысл короткой реплики берётся из контекста, значит он обязателен.
         assert case.context_before or case.context_after, f"{case.id}: короткая реплика без контекста"
+
+
+def test_benchmark_homograph_readings_are_machine_checkable(dataset):
+    """Чтение омографа описано ключевыми словами, и пары чтений не пересекаются.
+
+    Модель не ставит ударение (это делает RUAccent), поэтому единственный
+    проверяемый след правильного чтения — пояснение. Если наборы ключевых слов
+    пары пересекаются, метрика засчитала бы оба чтения сразу.
+    """
+    homographs = [
+        case
+        for case in dataset
+        if any(item.type == s.TYPE_HOMOGRAPH for item in case.expected)
+    ]
+    assert len(homographs) >= 30
+    readings: dict[str, list[set[str]]] = {}
+    for case in homographs:
+        item = case.expected[0]
+        keywords = {part.strip().lower() for part in item.meaning.split(",") if part.strip()}
+        assert keywords, f"{case.id}: у омографа нет ключевых слов чтения"
+        assert all(re.search("[а-яё]", word) for word in keywords), case.id
+        # Переписывать омограф не нужно: решение принимает backend по аннотации.
+        assert item.suggested_form == "", f"{case.id}: омограф не должен предлагать замену"
+        lemma = re.search(r"«([^»]+)»", case.notes)
+        if lemma:
+            readings.setdefault(lemma.group(1), []).append(keywords)
+    for lemma, sets in readings.items():
+        assert len(sets) == 2, f"«{lemma}»: ожидались два чтения, найдено {len(sets)}"
+        assert not (sets[0] & sets[1]), f"«{lemma}»: чтения пересекаются по {sets[0] & sets[1]}"
+
+
+def test_benchmark_utterance_classes_are_valid(dataset):
+    """Класс реплики задан там, где смысл берётся из контекста, и он из словаря."""
+    with_class = [case for case in dataset if case.expected_utterance]
+    assert len(with_class) >= 40
+    for case in with_class:
+        assert case.expected_utterance in s.UTTERANCE_CLASSES, case.id
+        assert case.context_before or case.context_after, case.id
+    short_ids = {case.id for case in dataset if case.category == s.CATEGORY_SHORT}
+    assert short_ids <= {case.id for case in with_class}
+    dialogue_ambiguous = [
+        case
+        for case in dataset
+        if case.category == s.CATEGORY_DIALOGUE and case.ambiguous
+    ]
+    assert dialogue_ambiguous
+    assert all(case.expected_utterance for case in dialogue_ambiguous)
 
 
 def test_benchmark_files_are_present_and_parse():

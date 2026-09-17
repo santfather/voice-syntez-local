@@ -86,6 +86,22 @@
     "ambiguous": {
       "type": "boolean"
     },
+    "expect_no_issue": {
+      "type": "boolean"
+    },
+    "expected_utterance": {
+      "type": "string",
+      "enum": [
+        "",
+        "NORMAL",
+        "SHORT_REPLY",
+        "QUESTION",
+        "CONFIRMATION",
+        "NEGATION",
+        "SURPRISE",
+        "CONTEXT_DEPENDENT"
+      ]
+    },
     "notes": {
       "type": "string"
     },
