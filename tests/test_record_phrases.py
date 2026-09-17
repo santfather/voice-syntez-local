@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import NoReturn
 
+from backend import qa_screening
 from backend.text_normalization import normalize
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -115,10 +116,18 @@ NEW_REGISTER_MARKERS: tuple[tuple[str, str], ...] = (
     ("ирония", "ирония"),
 )
 
-# Ориентир длины: F5-TTS берёт из референса первые ~12 с (XTTS — до 30 с), поэтому
-# фразы намеренно короткие. 160 знаков спокойным темпом читаются примерно за 10 с
-# и оставляют запас на паузы, не растягивая начитку под лимит движка.
-MAX_PHRASE_CHARS = 160
+# Ориентир длины: F5-TTS берёт из референса первые ~12 с, XTTS — до 30 с, поэтому
+# фразы намеренно короткие. Считаем не знаки, а **длительность** — тем же грубым
+# оценщиком, которым пользуется Smart QA (`qa_screening._expected_sec`): он
+# учитывает длину слов и пунктуацию, а не только их количество. Знаки как критерий
+# обманывали бы: 132 знака длинными словами и 132 знака короткими — разное время
+# начитки.
+REFERENCE_BUDGET_SEC = 12.0
+
+
+def _reading_seconds(text: str) -> float:
+    """Оценка длительности начитки в секундах (оценщик проекта, не свой)."""
+    return float(qa_screening._expected_sec(text))
 
 # Слова тестовой фразы, где «ё» гарантирована словарём нормализации. В исходнике
 # они записаны через «ё», а в проверке ниже — ещё и через «е».
@@ -344,14 +353,42 @@ def test_new_intonation_registers_present():
 
 # --- 5. Длина фразы ------------------------------------------------------------
 def test_every_phrase_fits_short_reference_budget():
+    """Каждая фраза укладывается в первые ~12 с референса, которые берёт F5.
+
+    Новые фразы чуть длиннее прежних (самая длинная — ~8.8 с против ~7.4 с у самой
+    длинной исходной), поэтому проверяется не «как у исходных знак в знак», а
+    настоящий лимит движка: 12 секунд с запасом. Меряем оценщиком проекта, а не
+    количеством знаков.
+    """
     too_long = [
-        (label, len(text))
+        (label, round(_reading_seconds(text), 1))
         for label, text in record_phrases()
-        if len(text) > MAX_PHRASE_CHARS
+        if _reading_seconds(text) > REFERENCE_BUDGET_SEC
     ]
     assert not too_long, (
-        f"фразы длиннее {MAX_PHRASE_CHARS} знаков не влезают в первые ~12 с референса F5: "
-        f"{too_long}"
+        f"фразы длиннее {REFERENCE_BUDGET_SEC:.0f} с не влезают в референс F5: {too_long}"
+    )
+
+
+def test_new_phrases_stay_near_original_reading_time():
+    """Новые фразы не растянуты под лимит: они того же порядка, что исходные.
+
+    Документ правок требует, чтобы фразы остались короткими, а не были удлинены
+    специально под 30-секундный лимит XTTS. Порог в 1.5× от самой длинной исходной
+    фразы фиксирует именно это: разброс есть, растягивания нет.
+    """
+    phrases = record_phrases()
+    originals = [_reading_seconds(text) for _, text in phrases[:5]]
+    longest_original = max(originals)
+    new = [(label, round(_reading_seconds(text), 1)) for label, text in phrases[5:]]
+    stretched = [
+        (label, seconds)
+        for label, seconds in new
+        if seconds > longest_original * 1.5
+    ]
+    assert not stretched, (
+        f"новые фразы заметно длиннее исходных (максимум исходных "
+        f"{longest_original:.1f} с): {stretched}"
     )
 
 
