@@ -188,6 +188,65 @@ def engine_idle_unload_minutes() -> float:
     return minutes if minutes > 0 else 0.0
 
 
+# --- Короткие реплики (short_phrasases.md) ------------------------------------
+# Короткие реплики звучат хуже длинных: модели не хватает контекста. Слой
+# исправления живёт после подготовки текста и по умолчанию **выключен**: он
+# включается только по результатам живого benchmark (`tools/short_bench.py`),
+# потому что «улучшение» здесь надо измерять, а не предполагать.
+SHORT_UTTERANCE_ENV = "TTS_SHORT_UTTERANCE"
+SHORT_UTTERANCE_DEFAULT_ENABLED = os.environ.get(SHORT_UTTERANCE_ENV, "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Пороги классов (§2). Слова — основная ось, знаки — страховка от одного
+# длинного слова: «Здравствуйте» по словам короткое, а по звучанию уже нет.
+SHORT_UTTERANCE_VERY_SHORT_WORDS = int(os.environ.get("TTS_SHORT_VERY_SHORT_WORDS", "2"))
+SHORT_UTTERANCE_SHORT_WORDS = int(os.environ.get("TTS_SHORT_SHORT_WORDS", "5"))
+SHORT_UTTERANCE_VERY_SHORT_CHARS = int(os.environ.get("TTS_SHORT_VERY_SHORT_CHARS", "20"))
+SHORT_UTTERANCE_SHORT_CHARS = int(os.environ.get("TTS_SHORT_SHORT_CHARS", "60"))
+# Ограниченный повтор короткой реплики (§19): 2–3 попытки, не больше.
+SHORT_UTTERANCE_MAX_ATTEMPTS = int(os.environ.get("TTS_SHORT_MAX_ATTEMPTS", "2"))
+# Нейтральный carrier для SYNTHETIC_CONTEXT (§7): минимально влияет на эмоцию,
+# не меняет смысл цели и используется только если benchmark это подтвердил.
+SHORT_UTTERANCE_SYNTHETIC_CARRIER = os.environ.get(
+    "TTS_SHORT_SYNTHETIC_CARRIER", "Хорошо."
+)
+SHORT_UTTERANCE_SYNTHETIC_CARRIERS = (
+    SHORT_UTTERANCE_SYNTHETIC_CARRIER,
+    "Понятно.",
+    "Так.",
+    "Вот так.",
+)
+# Насколько далеко ищется реплика того же спикера для контекста (§9). Соседняя
+# реплика часто принадлежит другому персонажу, поэтому «рядом» — это несколько
+# реплик, но не вся сцена.
+SHORT_UTTERANCE_CONTEXT_WINDOW = int(os.environ.get("TTS_SHORT_CONTEXT_WINDOW", "3"))
+# Сколько реплик одного спикера разрешено склеивать в один синтез (§10).
+SHORT_UTTERANCE_BATCH_MAX = int(os.environ.get("TTS_SHORT_BATCH_MAX", "3"))
+# Sanity-check длительности короткого куска (§21): ожидаемая длительность
+# считается от длины текста (символов в секунду), а не задаётся одним числом для
+# всех реплик. Порог — доля от ожидаемой плюс абсолютный минимум.
+SHORT_UTTERANCE_CHARS_PER_SEC = float(os.environ.get("TTS_SHORT_CHARS_PER_SEC", "15"))
+SHORT_UTTERANCE_MIN_DURATION_RATIO = float(
+    os.environ.get("TTS_SHORT_MIN_DURATION_RATIO", "0.35")
+)
+SHORT_UTTERANCE_MIN_DURATION_SEC = float(os.environ.get("TTS_SHORT_MIN_DURATION_SEC", "0.15"))
+# Политика по движкам, измеренная benchmark'ом. Пусто — везде DIRECT (§29 Phase 4).
+# Формат переменной: "f5=direct,xtts=synthetic_context".
+def _engine_strategies() -> dict[str, str]:
+    raw = os.environ.get("TTS_SHORT_ENGINE_STRATEGIES", "").strip()
+    result: dict[str, str] = {}
+    for item in raw.split(","):
+        name, _, strategy = item.partition("=")
+        if name.strip() and strategy.strip():
+            result[name.strip()] = strategy.strip()
+    return result
+
+
+SHORT_UTTERANCE_ENGINE_STRATEGIES = _engine_strategies()
+
 # --- Изоляция синтеза в отдельном процессе (creash_report) --------------------
 # Модель и инференс живут в дочернем процессе. Причина не в архитектурной
 # красоте: падение нативной библиотеки (SIGABRT/SIGSEGV) или убийство процесса

@@ -29,6 +29,7 @@ from .settings_resolution import (
     resolve_synthesis_settings,
     split_values,
 )
+from .short_utterance import classify_utterance, count_words
 from .text_preprocess import normalize, normalize_stages
 from .transcribe import transcribe_audio, word_error_rate
 from .voices_store import Voice, get_store
@@ -724,6 +725,53 @@ def _pause_samples(speaker: SpeakerSettings, render: RenderSettings) -> int:
     return int(SAMPLE_RATE * max(pause_ms, 0) / 1000)
 
 
+def _log_synthesis_input(
+    *,
+    engine: SynthesisEngine,
+    voice: Voice,
+    text: str,
+    source_text: str | None,
+    tuning: SpeakerSettings,
+    settings: RenderSettings,
+    position: str,
+    label: str,
+    seed: int | None,
+    params: dict,
+) -> None:
+    """Одна строка со всем входом синтеза — непосредственно перед вызовом движка.
+
+    Требование §1 пакета коротких реплик: без такого следа «звучит плохо» не с чем
+    связать — ни движок, ни голос, ни длину текста, ни сид, ни референс в кадре не
+    видны. Строка одна и структурированная (`key=value`), поэтому её разбирает и
+    benchmark, и grep при разборе жалобы.
+
+    Тексты пишутся **отпечатком** (длина, sha1, первые слова), а не целиком:
+    реплика — пользовательский контент, и в лог она не попадает
+    (`worker_protocol.text_fingerprint`). Benchmark'у, который работает на своих
+    фиксированных фразах, этого достаточно, а разбор инцидента получает ровно то,
+    что нужно для сверки с интерфейсом.
+    """
+    logger.info(
+        "tts.synthesis.input engine=%s voice=%s label=%s position=%s source=[%s] "
+        "final=[%s] prepared=%s words=%s class=%s ref=%s ref_text=[%s] speed=%.2f "
+        "seed=%s params=%s",
+        engine.id,
+        tuning.voice_id,
+        label,
+        position,
+        _text_fingerprint_text(source_text if source_text is not None else text),
+        _text_fingerprint_text(text),
+        source_text is not None,
+        count_words(text),
+        classify_utterance(text).kind,
+        voice.audio_path.name,
+        _text_fingerprint_text(voice.ref_text or ""),
+        tuning.speed,
+        seed,
+        params,
+    )
+
+
 def _synthesize_in_thread(
     engine: SynthesisEngine, **kwargs: Any
 ) -> tuple[tuple[np.ndarray, int] | None, Exception | None]:
@@ -749,6 +797,7 @@ async def _synthesize_chunk(
     settings: RenderSettings,
     position: str,
     label: str,
+    source_text: str | None = None,
 ) -> tuple[np.ndarray, int | None]:
     """Синтезирует один кусок, отделяя свой таймаут от чужой ошибки движка.
 
@@ -761,8 +810,24 @@ async def _synthesize_chunk(
     Сид выбирается здесь, а не в движке: пайплайн — единственное место, которое
     знает и про поддержку сида движком, и про то, что значение надо вернуть
     наверх вместе с куском.
+
+    `source_text` — исходная реплика до подготовки; нужна только для строки лога
+    о входе синтеза (см. `_log_synthesis_input`), модели она не уходит.
     """
     seed = random.randrange(config.SEED_MAX) if engine.supports_seed else None
+    params = _engine_params(tuning, settings, seed)
+    _log_synthesis_input(
+        engine=engine,
+        voice=voice,
+        text=text,
+        source_text=source_text,
+        tuning=tuning,
+        settings=settings,
+        position=position,
+        label=label,
+        seed=seed,
+        params=params,
+    )
     started = time.monotonic()
     try:
         outcome, failure = await asyncio.wait_for(
@@ -773,7 +838,7 @@ async def _synthesize_chunk(
                 ref_audio_path=str(voice.audio_path),
                 ref_text=voice.ref_text,
                 speed=tuning.speed,
-                **_engine_params(tuning, settings, seed),
+                **params,
             ),
             timeout=config.CHUNK_TIMEOUT_SEC,
         )
@@ -949,7 +1014,14 @@ async def _synthesize_checked(
     qa = settings.qa
     if qa is None or qa.mode == config.QA_MODE_OFF:
         chunk, seed = await _synthesize_chunk(
-            engine, voice, text, tuning, settings, position=position, label=label
+            engine,
+            voice,
+            text,
+            tuning,
+            settings,
+            position=position,
+            label=label,
+            source_text=replica.text,
         )
         return chunk, seed, None
 
@@ -983,6 +1055,7 @@ async def _synthesize_checked(
             settings,
             position=position,
             label=label,
+            source_text=replica.text,
         )
         attempts = attempt
         screening = None
