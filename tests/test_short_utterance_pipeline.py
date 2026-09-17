@@ -357,7 +357,9 @@ def test_status_exposes_short_policy(monkeypatch):
     payload = asyncio.run(main.status())
     policy = payload["short_utterance"]
     assert policy["enabled"] is False
-    assert policy["strategies"]["f5"] == su.STRATEGY_DIRECT
+    # Политика измеренная: у F5 выигрывает контекст того же спикера, у XTTS — direct.
+    assert policy["strategies"]["f5"] == su.STRATEGY_SAME_SPEAKER_CONTEXT
+    assert policy["strategies"]["xtts"] == su.STRATEGY_DIRECT
     assert su.STRATEGY_AUTO in policy["available_strategies"]
     assert su.STRATEGY_BATCH_AND_CROP not in policy["available_strategies"]
     assert policy["thresholds"]["very_short_words"] == config.SHORT_UTTERANCE_VERY_SHORT_WORDS

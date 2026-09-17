@@ -365,19 +365,29 @@ def test_context_does_not_leak_empty_plan_for_empty_utterance():
 
 
 def test_unknown_strategy_is_rejected():
-    assert su.resolve_strategy("f5", su.STRATEGY_AUTO) == su.STRATEGY_DIRECT
+    # `auto` разрешается в измеренную политику движка, а не в «как получится».
+    assert su.resolve_strategy("f5", su.STRATEGY_AUTO) == su.default_strategy("f5")
     assert su.resolve_strategy("f5", su.STRATEGY_PUNCTUATION) == su.STRATEGY_PUNCTUATION
     with pytest.raises(ValueError, match="Неизвестная стратегия"):
         su.resolve_strategy("f5", "магия")
 
 
-def test_production_policy_is_direct_until_benchmark(monkeypatch):
-    """До измерений производственная политика — DIRECT (§29, Phase 4)."""
-    assert su.default_strategy("f5") == su.STRATEGY_DIRECT
+def test_production_policy_is_measured_per_engine(monkeypatch):
+    """Политика — измеренная по движкам, а не одна на всех (§29, Phase 4).
+
+    Benchmark показал выигрыш контекста того же спикера только у F5; у XTTS
+    разницы не нашлось, поэтому там остаётся direct. Движок без измерений тоже
+    остаётся на direct: «нет данных» не повод включать экспериментальную
+    стратегию, но и не повод запрещать — политика переопределяется окружением.
+    """
+    assert su.default_strategy("f5") == config.SHORT_UTTERANCE_MEASURED_STRATEGIES["f5"]
+    assert su.default_strategy("xtts") == su.STRATEGY_DIRECT
+    assert su.default_strategy("xtts-banana") == su.STRATEGY_DIRECT
+    assert su.default_strategy("неизвестный") == su.STRATEGY_DIRECT
+
     monkeypatch.setitem(config.SHORT_UTTERANCE_ENGINE_STRATEGIES, "f5", su.STRATEGY_PUNCTUATION)
     assert su.default_strategy("f5") == su.STRATEGY_PUNCTUATION
     assert su.resolve_strategy("f5", su.STRATEGY_AUTO) == su.STRATEGY_PUNCTUATION
-    assert su.default_strategy("xtts") == su.STRATEGY_DIRECT
 
 
 def test_synthesis_input_is_logged_with_full_context(caplog, voices):

@@ -354,13 +354,17 @@ def synthesize_variant(
             )
         except Exception as exc:  # noqa: BLE001 — распознавание может быть недоступно
             logger.warning("Расшифровка недоступна (%s): %s", variant.phrase, exc)
-    verdict = su.check_chunk(
-        final,
-        variant.phrase,
-        transcription=variant.transcription or None,
-        wer=variant.wer,
-    )
-    variant.verdict = verdict.to_dict()
+    # Короткий вердикт применяется только к коротким фразам: длинные контролируют
+    # регрессию (§28), а пороги короткого куска к ним неприменимы — иначе отчёт
+    # показывал бы «провал» там, где production слой вообще не работает.
+    if su.classify_utterance(variant.phrase).is_short:
+        verdict = su.check_chunk(
+            final,
+            variant.phrase,
+            transcription=variant.transcription or None,
+            wer=variant.wer,
+        )
+        variant.verdict = verdict.to_dict()
     return variant
 
 
@@ -394,12 +398,24 @@ def summarize(variants: list[Variant]) -> dict:
     def bucket(key: str, item: Variant, target: dict) -> None:
         entry = target.setdefault(
             key,
-            {"count": 0, "ok": 0, "wer": [], "duration": [], "silence": [], "generation": []},
+            {
+                "count": 0,
+                "judged": 0,
+                "ok": 0,
+                "wer": [],
+                "duration": [],
+                "silence": [],
+                "generation": [],
+            },
         )
         entry["count"] += 1
-        verdict = item.verdict or {}
-        if verdict.get("ok"):
-            entry["ok"] += 1
+        verdict = item.verdict
+        if verdict is not None:
+            # Доля «ок» считается по проверенным вариантам: длинные контрольные
+            # фразы коротким вердиктом не судятся.
+            entry["judged"] += 1
+            if verdict.get("ok"):
+                entry["ok"] += 1
         if item.wer is not None:
             entry["wer"].append(item.wer)
         entry["duration"].append(item.duration_sec)
@@ -415,9 +431,11 @@ def summarize(variants: list[Variant]) -> dict:
 
     def finalize(entry: dict) -> dict:
         count = max(entry["count"], 1)
+        judged = max(entry["judged"], 1)
         return {
             "count": entry["count"],
-            "ok_share": round(entry["ok"] / count, 3),
+            "judged": entry["judged"],
+            "ok_share": round(entry["ok"] / judged, 3),
             "wer_mean": round(sum(entry["wer"]) / len(entry["wer"]), 3) if entry["wer"] else None,
             "duration_mean": round(sum(entry["duration"]) / count, 3),
             "silence_mean": round(sum(entry["silence"]) / count, 3),
@@ -529,6 +547,32 @@ def conclude(report: dict, summary: dict) -> list[str]:
     return conclusions
 
 
+def _write_report(out_dir: Path, plan: Plan, voices: list, variants: list[Variant], args) -> None:
+    """Собирает и записывает отчёт (JSON + Markdown) по уже готовым вариантам."""
+    summary = summarize(variants)
+    errors = [item for item in variants if item.error]
+    report = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "voices": [f"{voice.name} ({voice.engine}, {voice.id})" for voice in voices],
+        "strategies": [item.strip() for item in args.strategies.split(",") if item.strip()],
+        "seeds": list(range(1, max(args.seeds, 1) + 1)),
+        "boundary_method": args.boundary,
+        "variants_total": len(plan.variants),
+        "variants_done": len(variants),
+        "errors": len(errors),
+        "plan": plan.to_dict(),
+        "variants": [item.to_dict() for item in variants],
+        "summary": summary,
+        "conclusions": [],
+    }
+    report["conclusions"] = conclude(report, summary)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "report.md").write_text(render_markdown(report), encoding="utf-8")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark коротких реплик")
     parser.add_argument("--voices", default="", help="id голосов через запятую (по умолчанию авто)")
@@ -544,6 +588,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", default="", help="каталог отчёта (по умолчанию output/short-bench)")
     parser.add_argument("--plan", action="store_true", help="только план, без моделей")
     parser.add_argument("--json", action="store_true", help="напечатать путь к JSON-отчёту")
+    parser.add_argument(
+        "--no-incremental",
+        dest="incremental",
+        action="store_false",
+        help="писать отчёт только в конце (по умолчанию — после каждого варианта)",
+    )
     return parser.parse_args(argv)
 
 
@@ -620,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
             f"«{variant.phrase}»",
             flush=True,
         )
+        started = time.monotonic()
         synthesize_variant(
             variant,
             voice,
@@ -628,31 +679,12 @@ def main(argv: list[str] | None = None) -> int:
             with_asr=not args.no_asr,
         )
         variants.append(variant)
+        print(f"    {time.monotonic() - started:.1f} c", flush=True)
+        # Отчёт пишется после каждого варианта: прогон длинный (десятки синтезов
+        # и распознаваний), и терять его целиком из-за одного сбоя нельзя.
+        if args.incremental:
+            _write_report(out_dir, plan, voices, variants, args)
 
-    summary = summarize(variants)
-    errors = [item for item in variants if item.error]
-    report = {
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "voices": [f"{voice.name} ({voice.engine}, {voice.id})" for voice in voices],
-        "strategies": list(strategies),
-        "seeds": list(range(1, max(args.seeds, 1) + 1)),
-        "boundary_method": args.boundary,
-        "variants_total": len(variants),
-        "errors": len(errors),
-        "plan": plan.to_dict(),
-        "variants": [item.to_dict() for item in variants],
-        "summary": summary,
-        "conclusions": [],
-    }
-    report["conclusions"] = conclude(report, summary)
-    (out_dir / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    markdown = render_markdown(report)
-    (out_dir / "report.md").write_text(markdown, encoding="utf-8")
-
-    print()
-    print(markdown)
     print(f"Отчёт: {out_dir / 'report.md'}")
     print(f"JSON:  {out_dir / 'report.json'}")
     if args.json:

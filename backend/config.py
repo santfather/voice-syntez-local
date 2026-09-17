@@ -236,11 +236,24 @@ SHORT_UTTERANCE_MIN_DURATION_SEC = float(os.environ.get("TTS_SHORT_MIN_DURATION_
 # Метод определения границы цели в контекстном синтезе: `asr` (таймстемпы слов,
 # единственный пригодный для производства) или `silence` (только benchmark).
 SHORT_UTTERANCE_BOUNDARY_METHOD = os.environ.get("TTS_SHORT_BOUNDARY", "asr")
-# Политика по движкам, измеренная benchmark'ом. Пусто — везде DIRECT (§29 Phase 4).
-# Формат переменной: "f5=direct,xtts=synthetic_context".
+# Измеренная политика (benchmark 2026-09-17, `tools/short_bench.py`, реальные голоса):
+# у F5 контекст того же спикера убирает реальные дефекты коротких реплик — WER 0.0
+# против 0.125–0.2 и 70 % прошедших короткую проверку против 50 % у direct (в том
+# числе «Да.» с WER 1.0 и повтор в «Нет.»); synthetic_context даёт те же 70 %, но
+# оставляет риск carrier'а в аудио. У XTTS разницы не нашлось (0.60 ok у обеих
+# стратегий, WER 0.0), поэтому остаётся direct: лишний синтез без выигрыша не нужен.
+# Движок без измерений (xtts-banana) тоже остаётся на direct — «нет данных» не
+# повод включать экспериментальную стратегию.
+SHORT_UTTERANCE_MEASURED_STRATEGIES: dict[str, str] = {
+    "f5": "same_speaker_context",
+}
+
+
+# Политика по движкам. Начинается с измеренной и переопределяется окружением:
+# формат переменной "f5=direct,xtts=synthetic_context".
 def _engine_strategies() -> dict[str, str]:
     raw = os.environ.get("TTS_SHORT_ENGINE_STRATEGIES", "").strip()
-    result: dict[str, str] = {}
+    result: dict[str, str] = dict(SHORT_UTTERANCE_MEASURED_STRATEGIES)
     for item in raw.split(","):
         name, _, strategy = item.partition("=")
         if name.strip() and strategy.strip():
