@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend import config, resource_guard
 from backend.engines.base import ENGINE_F5, ENGINE_XTTS
-from backend.engines.registry import get_engine
+from backend.engines.registry import create_local_engine
 
 ROW_TEMPLATE = "{title:<30}{rss:>11}{system:>13}{torch_mps:>16}{driver:>18}"
 
@@ -85,7 +85,12 @@ def delta(after: dict, before: dict) -> str:
 
 
 def load_engine(engine_id: str) -> tuple[object | None, float]:
-    engine = get_engine(engine_id)
+    # Движок собирается в этом процессе намеренно (`create_local_engine`), а не
+    # через `get_engine`: при включённой изоляции синтеза реестр отдал бы прокси,
+    # модель поднялась бы в отдельном процессе-воркере, и замер «сколько занимает
+    # движок» показывал бы пустой процесс инструмента. Здесь нужен именно
+    # локальный экземпляр — его RSS и виден в таблице.
+    engine = create_local_engine(engine_id)
     started = time.monotonic()
     try:
         engine.load()
