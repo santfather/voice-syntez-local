@@ -22,7 +22,7 @@ def _now() -> str:
 
 
 def _row_to_entry(row: sqlite3.Row) -> dict:
-    return {
+    entry = {
         "id": row["id"],
         "source": row["source"],
         "target": row["target"],
@@ -33,6 +33,14 @@ def _row_to_entry(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    # Область есть только у проектных правил: у глобальной таблицы такой колонки
+    # нет, и выдумывать `project_id: null` значило бы притворяться, что правило
+    # привязано к проекту с пустым идентификатором.
+    # `keys()`, а не `in`: sqlite3.Row — не словарь, и `in` перебирает значения,
+    # а не имена колонок (SIM118 здесь не применим).
+    if "project_id" in row.keys():  # noqa: SIM118
+        entry["project_id"] = row["project_id"]
+    return entry
 
 
 class PronunciationRepository:
