@@ -171,7 +171,16 @@ STRATEGIES = (
     STRATEGY_SYNTHETIC_CONTEXT,
     STRATEGY_BATCH_AND_CROP,
 )
-SELECTABLE_STRATEGIES = (STRATEGY_AUTO, *STRATEGIES)
+# Что можно выбрать в интерфейсе и запросе. Склейки группы здесь нет: она
+# требует общего прогона на группу и раздачи кусков по границам, то есть другого
+# устройства цикла, и живёт пока только в benchmark'е (`build_batches`).
+SELECTABLE_STRATEGIES = (
+    STRATEGY_AUTO,
+    STRATEGY_DIRECT,
+    STRATEGY_PUNCTUATION,
+    STRATEGY_SAME_SPEAKER_CONTEXT,
+    STRATEGY_SYNTHETIC_CONTEXT,
+)
 # Стратегии, добавляющие контекст: их результат обязательно обрезается до цели.
 CONTEXT_STRATEGIES = (
     STRATEGY_SAME_SPEAKER_CONTEXT,
@@ -345,6 +354,9 @@ class SynthesisPlan:
     target_text: str
     synthesis_text: str
     strategy: str = STRATEGY_DIRECT
+    # Цель в том виде, в каком её понимает движок: для движков без ударений — без
+    # «+». Нужна откату на DIRECT, который синтезирует цель отдельно.
+    engine_target_text: str = ""
     context_text: str = ""
     context_source: str = ""
     utterance_class: str = CLASS_NORMAL
@@ -355,7 +367,14 @@ class SynthesisPlan:
 
     @property
     def needs_crop(self) -> bool:
-        return self.synthesis_text != self.target_text
+        """Нужна ли обрезка результата.
+
+        Только когда в синтез добавлен **контекст**: тогда в аудио звучит больше,
+        чем целевая реплика, и лишнее надо срезать. Смена пунктуации (стратегия
+        `punctuation`) текста не удлиняет — обрезать там нечего, и попытка искать
+        границу только тратила бы распознавание.
+        """
+        return bool(self.context_text)
 
     @property
     def synthesis_hash(self) -> str:
@@ -439,6 +458,11 @@ def build_plan(
     не может гарантировать надёжную границу для обрезки (§31).
     """
     target = context.target_text
+    # Движок, не понимающий «+», не должен получить его и в цели: подготовленный
+    # текст обычно уже engine-specific, но после смены движка у реплики мог
+    # остаться старый вариант подготовки. `target_text` при этом не меняется — он
+    # остаётся тем, что подтвердил пользователь.
+    target_for_engine = target if supports_accents else strip_accents(target)
     utterance = context.utterance or classify_utterance(target)
     # Сторона контекста по умолчанию зависит от стратегии: синтетический carrier
     # обрамляет цель с двух сторон (§7), а реплика того же спикера идёт префиксом —
@@ -447,7 +471,8 @@ def build_plan(
         side = SIDE_BOTH if strategy == STRATEGY_SYNTHETIC_CONTEXT else SIDE_PREFIX
     base = SynthesisPlan(
         target_text=target,
-        synthesis_text=target,
+        synthesis_text=target_for_engine,
+        engine_target_text=target_for_engine,
         strategy=strategy,
         utterance_class=utterance.kind,
         side=side,
@@ -476,14 +501,20 @@ def build_plan(
     elif strategy == STRATEGY_SYNTHETIC_CONTEXT:
         raw, source = (carrier or config.SHORT_UTTERANCE_SYNTHETIC_CARRIER), SOURCE_SYNTHETIC
     elif strategy == STRATEGY_BATCH_AND_CROP:
-        # Текст группы подставляет вызывающий (`build_batches`): здесь только
-        # фиксируется, что реплика идёт в общем синтезе.
-        return replace(base, synthesis_text=target, context_source=SOURCE_GROUP)
+        # Склейка соседних реплик в один синтез — эксперимент benchmark'а (§10,
+        # §32): она требует одного прогона на группу и раздачи кусков по
+        # границам, то есть другого устройства цикла. Пока измерение не показало
+        # выигрыш, рендер работает как раньше, и это видно в метаданных.
+        return replace(
+            base,
+            strategy=STRATEGY_DIRECT,
+            note="склейка группы — режим benchmark'а, в рендере пока direct",
+        )
     else:
         raise ValueError(f"Неизвестная стратегия короткой реплики: {strategy}")
 
     context_text = raw if supports_accents else strip_accents(raw)
-    synthesis = _join(context_text, target, side)
+    synthesis = _join(context_text, target_for_engine, side)
     return replace(base, synthesis_text=synthesis, context_text=context_text, context_source=source)
 
 

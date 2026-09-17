@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 
 from . import config, qa_screening, take_quality
+from . import short_utterance as su
+from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
@@ -132,6 +134,64 @@ class QaOutcome:
 
 
 @dataclass
+class ShortUtteranceSettings:
+    """Настройки слоя коротких реплик (§23).
+
+    Выключено по умолчанию: стратегия включается по результатам живого benchmark'а
+    (`tools/short_bench.py`), а не по предположению. `strategy = auto` берёт
+    измеренную политику движка (`short_utterance.default_strategy`).
+    """
+
+    enabled: bool = config.SHORT_UTTERANCE_DEFAULT_ENABLED
+    strategy: str = su.STRATEGY_AUTO
+    # Сторона контекста (A/B/C/D из §30) и carrier; None — значения стратегии.
+    side: str | None = None
+    carrier: str | None = None
+    thresholds: su.ShortThresholds = field(default_factory=su.ShortThresholds)
+    max_attempts: int = config.SHORT_UTTERANCE_MAX_ATTEMPTS
+    boundary_method: str = config.SHORT_UTTERANCE_BOUNDARY_METHOD
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "strategy": self.strategy,
+            "side": self.side,
+            "carrier": self.carrier,
+            "thresholds": self.thresholds.to_dict(),
+            "max_attempts": self.max_attempts,
+            "boundary_method": self.boundary_method,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "ShortUtteranceSettings | None":
+        """Настройки из запроса; `None` — слой не запрашивали вовсе.
+
+        Пустое тело означает «как решено в приложении» (политика из конфига), а не
+        «выключить»: иначе интерфейс, не передавший поле, гасил бы оптимизацию.
+        """
+        if raw is None:
+            return None
+        settings = cls(
+            enabled=bool(raw.get("enabled", config.SHORT_UTTERANCE_DEFAULT_ENABLED)),
+            strategy=str(raw.get("strategy") or su.STRATEGY_AUTO),
+            side=raw.get("side") or None,
+            carrier=(raw.get("carrier") or None),
+            thresholds=su.ShortThresholds.from_dict(raw.get("thresholds")),
+            max_attempts=int(raw.get("max_attempts") or config.SHORT_UTTERANCE_MAX_ATTEMPTS),
+            boundary_method=str(
+                raw.get("boundary_method") or config.SHORT_UTTERANCE_BOUNDARY_METHOD
+            ),
+        )
+        if settings.strategy not in su.SELECTABLE_STRATEGIES:
+            raise ValueError(f"Неизвестная стратегия короткой реплики: {settings.strategy}")
+        if settings.side is not None and settings.side not in su.CONTEXT_SIDES:
+            raise ValueError(f"Неизвестная сторона контекста: {settings.side}")
+        if settings.boundary_method not in boundary_module.METHODS:
+            raise ValueError(f"Неизвестный метод границ: {settings.boundary_method}")
+        return settings
+
+
+@dataclass
 class SpeakerSettings:
     voice_id: str
     speed: float = config.DEFAULT_SPEED
@@ -195,6 +255,10 @@ class RenderSettings:
     # ровно для того, чтобы «посчитать текст на месте» не осталось незаметным
     # обходом обязательной подготовки (см. `render_dialogue`).
     require_prepared: bool = False
+    # Оптимизация коротких реплик (§23). `None` — слой не запрашивали: работает
+    # политика приложения (по умолчанию выключено, пока benchmark не покажет
+    # улучшение).
+    short_utterance: "ShortUtteranceSettings | None" = None
 
 
 @dataclass
@@ -213,6 +277,9 @@ class RenderResult:
     # оценка естественности голоса: набор измерений, по которым видно, почему
     # take может звучать плохо (см. `take_quality`).
     qualities: list[take_quality.TakeQuality] = field(default_factory=list)
+    # План короткой реплики по индексу: класс, стратегия, источник контекста,
+    # отпечаток синтез-текста (§24). Пусто — слой не применялся.
+    short_runs: dict[int, "ShortRun"] = field(default_factory=dict)
 
 
 @dataclass
@@ -241,6 +308,10 @@ class RenderPartial:
     # синтезированы, а сбой случился на сборке (склейка, запись файла).
     failed_index: int | None
     error: str
+    # Планы коротких реплик готовых кусков: продолжение рендера не должно терять
+    # метаданные уже сделанного (см. §24). Поле с значением по умолчанию, поэтому
+    # стоит последним.
+    short_runs: dict[int, "ShortRun"] = field(default_factory=dict)
 
     @property
     def done(self) -> int:
@@ -278,6 +349,9 @@ class ChunkVariant:
     # Диагностика этого звучания (клиппинг, тишина, громкость, LUFS...). None —
     # метрик нет: так выглядят варианты, сохранённые до фазы, и это норма.
     quality: take_quality.TakeQuality | None = None
+    # Метаданные короткой реплики (§24): класс, стратегия, источник контекста,
+    # отпечаток синтез-текста. None — обычная реплика.
+    plan: dict | None = None
 
 
 class ChunkTimeoutError(RuntimeError):
@@ -969,6 +1043,147 @@ async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
     )
 
 
+@dataclass
+class ShortRun:
+    """Короткая реплика в работе: план для модели и посчитанный вердикт.
+
+    `Run` — потому что это состояние одного прогона, а не настройка: план уже
+    учитывает движок (разметку ударений) и стратегию, а вердикт появляется после
+    синтеза и решает, повторять ли попытку.
+    """
+
+    plan: su.SynthesisPlan
+    settings: ShortUtteranceSettings
+    verdict: su.ShortVerdict | None = None
+    boundary: boundary_module.Boundary | None = None
+    fallback: str = ""
+    attempts: int = 0
+
+    @property
+    def active(self) -> bool:
+        return self.settings.enabled
+
+    def to_dict(self) -> dict:
+        payload = self.plan.to_dict()
+        payload["short_utterance_fallback"] = self.fallback
+        payload["short_utterance_attempts"] = self.attempts
+        payload["short_utterance_verdict"] = (
+            None if self.verdict is None else self.verdict.to_dict()
+        )
+        payload["short_utterance_boundary"] = (
+            None if self.boundary is None else self.boundary.to_dict()
+        )
+        return payload
+
+
+def short_run_for(
+    replica: Replica,
+    engine: SynthesisEngine,
+    settings: RenderSettings,
+    *,
+    context: su.ShortUtteranceContext | None = None,
+) -> ShortRun | None:
+    """Строит план короткой реплики — или `None`, если слой не применяется.
+
+    Слой не применяется, когда он выключен или когда реплика обычная (NORMAL):
+    длинный текст идёт прежним путём без единого лишнего шага (§28). Стратегия
+    `auto` превращается в измеренную политику движка здесь же — по одному месту
+    на все пути синтеза.
+    """
+    short = settings.short_utterance
+    if short is None or not short.enabled:
+        return None
+    text = (replica.final_text or "").strip() or replica.text
+    context = context or su.ShortUtteranceContext(target_index=0, target_text=text)
+    utterance = context.utterance or su.classify_utterance(text, short.thresholds)
+    if not utterance.is_short:
+        return None
+    strategy = su.resolve_strategy(engine.id, short.strategy)
+    plan = su.build_plan(
+        context,
+        strategy=strategy,
+        supports_accents=engine.supports_accents,
+        carrier=short.carrier,
+        side=short.side,
+    )
+    if not plan.utterance_class or plan.utterance_class == su.CLASS_NORMAL:
+        plan = replace(plan, utterance_class=utterance.kind)
+    return ShortRun(plan=plan, settings=short)
+
+
+async def _synthesize_attempt(
+    engine: SynthesisEngine,
+    voice: Voice,
+    replica: Replica,
+    text: str,
+    tuning: SpeakerSettings,
+    settings: RenderSettings,
+    position: str,
+    label: str,
+    short: ShortRun | None,
+    attempt: int,
+) -> tuple[np.ndarray, int | None]:
+    """Одна попытка: синтез плана, обрезка до цели и откат, если границы нет.
+
+    Порядок обязателен: обрезка идёт **до** подготовки куска, потому что
+    подготовка выравнивает громкость, и с необрезанным контекстом уровень задавал
+    бы он, а не целевая реплика.
+    """
+    # План применяется, пока не случился откат. Откат закрепляется: если границы
+    # не нашлось, следующие попытки синтезируют цель сразу — повторять заведомо
+    # бесполезный контекстный прогон незачем.
+    # Цель в «плоском» виде: подготовленный текст, а если слой строился — тот, что
+    # понимает движок (без «+» у движков без ударений). Обычный путь это не
+    # меняет: без слоя текстом остаётся подготовленный `final_text`.
+    plain_text = text
+    if short is not None and short.active:
+        plain_text = short.plan.engine_target_text or text
+    use_plan = short is not None and short.active and not short.fallback
+    synthesis_text = short.plan.synthesis_text if use_plan else plain_text
+    needs_crop = use_plan and short.plan.needs_crop
+    chunk, seed = await _synthesize_chunk(
+        engine,
+        voice,
+        synthesis_text,
+        _nudge_tuning(voice, engine, tuning, attempt - 1),
+        settings,
+        position=position,
+        label=label,
+        source_text=replica.text,
+    )
+    if not needs_crop:
+        return chunk, seed
+
+    cropped, boundary = await asyncio.to_thread(
+        boundary_module.crop_to_target,
+        chunk,
+        short.plan.target_text,
+        method=short.settings.boundary_method,
+        side=short.plan.side,
+    )
+    if boundary is None:
+        # Надёжной границы нет: лучше прежнее поведение, чем контекст в файле.
+        short.fallback = "нет надёжной границы — синтез цели отдельно"
+        logger.info(
+            "Реплика %s: граница цели не найдена (%s) — синтезирую без контекста",
+            position, short.plan.strategy,
+        )
+        chunk, seed = await _synthesize_chunk(
+            engine,
+            voice,
+            plain_text,
+            _nudge_tuning(voice, engine, tuning, attempt - 1),
+            settings,
+            position=position,
+            label=label,
+            source_text=replica.text,
+        )
+        return chunk, seed
+
+    short.boundary = boundary
+    return cropped, seed
+
+
 async def _synthesize_checked(
     engine: SynthesisEngine,
     voice: Voice,
@@ -980,14 +1195,20 @@ async def _synthesize_checked(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
-) -> tuple[np.ndarray, int | None, QaOutcome | None]:
-    """Синтез куска: обычный или с проверкой (`settings.qa`).
+    context: su.ShortUtteranceContext | None = None,
+) -> tuple[np.ndarray, int | None, QaOutcome | None, ShortRun | None]:
+    """Синтез куска: обычный, с проверкой (`settings.qa`) и/или коротким слоем.
 
-    Без проверки это ровно один вызов движка. С проверкой каждая попытка — это
-    полный синтез плюс отдельный процесс Whisper, поэтому цикл ограничен и числом
-    попыток, и временем, а из проверенных берётся лучшая по WER, даже если порог
-    так и не взят: выбросить уже сгенерированное аудио и вернуть ошибку значило бы
-    потерять работу ради формальности.
+    Без проверок это ровно один вызов движка. Каждая дополнительная проверка
+    добавляет к попытке полный синтез (и, в строгом режиме, отдельный процесс
+    Whisper), поэтому цикл ограничен и числом попыток, и временем. Из попыток
+    берётся лучшая: сначала по вердикту короткой реплики (меньше причин), затем по
+    WER — выбросить уже сгенерированное аудио и вернуть ошибку значило бы потерять
+    работу ради формальности.
+
+    Короткий слой встроен в тот же цикл, а не в отдельный: у него общий бюджет
+    времени, общие безопасные точки отмены и тот же выбор лучшей попытки. Разница
+    только в том, что он добавляет свой критерий приёмки (§19–§21).
 
     Smart-режим отличается только входом в расшифровку: сначала кусок проходит
     дешёвый отбор по waveform, и если брака не видно, Whisper не поднимается
@@ -1011,23 +1232,23 @@ async def _synthesize_checked(
         text = await asyncio.to_thread(
             _text_for_engine, replica.text, engine, settings.auto_accent
         )
+    short = short_run_for(replica, engine, settings, context=context)
     qa = settings.qa
-    if qa is None or qa.mode == config.QA_MODE_OFF:
-        chunk, seed = await _synthesize_chunk(
-            engine,
-            voice,
-            text,
-            tuning,
-            settings,
-            position=position,
-            label=label,
-            source_text=replica.text,
+    use_qa = qa is not None and qa.mode != config.QA_MODE_OFF
+
+    if short is None and not use_qa:
+        chunk, seed = await _synthesize_attempt(
+            engine, voice, replica, text, tuning, settings, position, label, None, 1
         )
-        return chunk, seed, None
+        return chunk, seed, None, None
 
     started = time.monotonic()
-    limit = max(qa.max_attempts, 1)
-    best: tuple[np.ndarray, int | None, float] | None = None
+    limit = max(
+        qa.max_attempts if use_qa else 1,
+        short.settings.max_attempts if short is not None else 1,
+        1,
+    )
+    best: tuple[tuple, np.ndarray, int | None, QaOutcome | None] | None = None
     attempts = 0
     status = QA_ATTEMPTS
     screening: qa_screening.Screening | None = None
@@ -1037,7 +1258,7 @@ async def _synthesize_checked(
         if attempt > 1:
             if should_abort and should_abort():
                 raise JobCancelledError(f"Реплика {position}: отменено между попытками")
-            if time.monotonic() - started >= qa.budget_sec:
+            if use_qa and time.monotonic() - started >= qa.budget_sec:
                 status = QA_BUDGET
                 break
             # Whisper на каждой попытке — это ещё один процесс и ещё ~1.6 ГБ
@@ -1045,72 +1266,182 @@ async def _synthesize_checked(
             if wait_for_memory is not None:
                 await wait_for_memory()
         if on_note:
-            on_note(f"Реплика {position}: проверка, попытка {attempt} из {limit}")
+            reason = "проверка" if use_qa else "короткая реплика"
+            on_note(f"Реплика {position}: {reason}, попытка {attempt} из {limit}")
 
-        chunk, seed = await _synthesize_chunk(
-            engine,
-            voice,
-            text,
-            _nudge_tuning(voice, engine, tuning, attempt - 1),
-            settings,
-            position=position,
-            label=label,
-            source_text=replica.text,
+        chunk, seed = await _synthesize_attempt(
+            engine, voice, replica, text, tuning, settings, position, label, short, attempt
         )
         attempts = attempt
+        if short is not None:
+            short.attempts = attempt
         screening = None
-        if qa.smart:
+        qa_outcome: QaOutcome | None = None
+        transcription: str | None = None
+        wer: float | None = None
+        qa_accepted = True
+        if use_qa and qa.smart:
             # Отбор идёт в потоке: на длинном куске это автокорреляция, и в
             # event loop ей делать нечего.
             screening = await asyncio.to_thread(qa_screening.screen_chunk, chunk, replica.text)
             if not screening.suspicious:
-                logger.info(
-                    "Реплика %s: отбор не нашёл брака — расшифровка не нужна", position
+                logger.info("Реплика %s: отбор не нашёл брака — расшифровка не нужна", position)
+                qa_outcome = QaOutcome(
+                    status=QA_PASSED, wer=None, attempts=attempt, mode=qa.mode, screening=screening
                 )
-                return chunk, seed, QaOutcome(
-                    status=QA_PASSED,
+            elif on_note:
+                on_note(
+                    f"Реплика {position}: отбор нашёл брак "
+                    f"({qa_screening.describe_reasons(screening.reasons)}) — расшифровка"
+                )
+        if use_qa and qa_outcome is None:
+            try:
+                transcription, wer = await _transcribe_and_measure(chunk, replica.text)
+            except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не губит задачу
+                logger.warning(
+                    "Реплика %s: проверка недоступна (%s: %s) — принимаю без проверки",
+                    position, type(exc).__name__, exc,
+                )
+                qa_outcome = QaOutcome(
+                    status=QA_UNAVAILABLE,
                     wer=None,
                     attempts=attempt,
                     mode=qa.mode,
                     screening=screening,
                 )
-            if on_note:
-                on_note(
-                    f"Реплика {position}: отбор нашёл брак "
-                    f"({qa_screening.describe_reasons(screening.reasons)}) — расшифровка"
+            else:
+                # «Проверить не удалось» — не провал: попытку не повторяем только
+                # из-за недоступности Whisper, но короткий вердикт продолжит работу.
+                qa_accepted = wer <= qa.wer_threshold
+                qa_outcome = QaOutcome(
+                    status=QA_PASSED if qa_accepted else QA_ATTEMPTS,
+                    wer=wer,
+                    attempts=attempt,
+                    mode=qa.mode,
+                    screening=screening,
                 )
-        try:
-            wer = await _measure_wer(chunk, replica.text)
-        except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не должна губить задачу
-            logger.warning(
-                "Реплика %s: проверка недоступна (%s: %s) — принимаю без проверки",
-                position, type(exc).__name__, exc,
+                if on_note:
+                    on_note(f"Реплика {position}: проверка {attempt} из {limit}, WER {wer:.2f}")
+
+        verdict = None
+        if short is not None:
+            verdict = await asyncio.to_thread(
+                su.check_chunk,
+                chunk,
+                short.plan.target_text,
+                transcription=transcription,
+                wer=wer,
             )
-            return chunk, seed, QaOutcome(
-                status=QA_UNAVAILABLE,
-                wer=None,
+            short.verdict = verdict
+            if on_note and not verdict.ok:
+                on_note(
+                    f"Реплика {position}: короткая проверка — "
+                    f"{su.describe_short_reasons(list(verdict.reasons))}"
+                )
+
+        accepted = qa_accepted and (verdict.ok if verdict is not None else True)
+        if accepted:
+            if qa_outcome is None:
+                # Проверка не гонялась вовсе: короткий слой справился сам.
+                qa_outcome = None
+            logger.info(
+                "Реплика %s: принята (попытка %s, стратегия %s)",
+                position, attempt, short.plan.strategy if short else "direct",
+            )
+            return chunk, seed, qa_outcome, short
+        if use_qa and qa_outcome.status == QA_UNAVAILABLE and verdict is None:
+            # Нечем проверять — повторять нечего.
+            return chunk, seed, qa_outcome, short
+
+        if qa_outcome is not None and qa_outcome.status == QA_PASSED:
+            # Порог WER взят, но короткая проверка нашла дефект: попытку считаем
+            # неудачной, иначе «Да, да, да…» уезжало бы в файл с отметкой «ок».
+            qa_outcome = QaOutcome(
+                status=QA_ATTEMPTS,
+                wer=wer,
                 attempts=attempt,
                 mode=qa.mode,
                 screening=screening,
             )
-
-        if best is None or wer < best[2]:
-            best = (chunk, seed, wer)
-        if on_note:
-            on_note(f"Реплика {position}: проверка {attempt} из {limit}, WER {wer:.2f}")
-        if wer <= qa.wer_threshold:
-            status = QA_PASSED
-            break
+        key = _attempt_score(verdict, wer)
+        if best is None or key > best[0]:
+            best = (key, chunk, seed, qa_outcome)
 
     assert best is not None  # первая попытка выполняется всегда
-    chunk, seed, wer = best
+    _, chunk, seed, qa_outcome = best
+    if short is not None:
+        short.verdict = su.check_chunk(chunk, short.plan.target_text)
+    # Итог цикла: «бюджет исчерпан» важнее статуса последней попытки, потому что
+    # именно он объясняет, почему попыток больше не было. Число попыток — общее,
+    # а не той, что оказалась лучшей.
+    final_status = (
+        status
+        if status == QA_BUDGET
+        else (qa_outcome.status if qa_outcome is not None else QA_ATTEMPTS)
+    )
+    final_outcome = (
+        None
+        if qa_outcome is None
+        else QaOutcome(
+            status=final_status,
+            wer=qa_outcome.wer,
+            attempts=attempts,
+            mode=qa_outcome.mode,
+            screening=qa_outcome.screening,
+        )
+    )
     logger.info(
-        "Реплика %s: проверка — %s, WER %.2f, попыток %s",
-        position, status, wer, attempts,
+        "Реплика %s: проверка — %s, попыток %s, стратегия %s",
+        position, final_status if final_outcome is not None else "не гонялась", attempts,
+        short.plan.strategy if short else "direct",
     )
-    return chunk, seed, QaOutcome(
-        status=status, wer=wer, attempts=attempts, mode=qa.mode, screening=screening
+    return chunk, seed, final_outcome, short
+
+
+def _attempt_score(verdict: su.ShortVerdict | None, wer: float | None) -> tuple:
+    """Ключ выбора лучшей попытки: сначала короткий вердикт, затем WER."""
+    if verdict is None:
+        return (0, 0, -(wer if wer is not None else 1.0))
+    reasons, negative_wer = verdict.score
+    return (1 if verdict.ok else 0, reasons, negative_wer)
+
+
+async def _transcribe_and_measure(chunk: np.ndarray, expected: str) -> tuple[str, float]:
+    """Расшифровка куска и WER — одной операцией, чтобы текст был под рукой.
+
+    Короткая проверка хочет не только число, но и саму расшифровку («Да, да, да…»
+    видно словами). Вернуть её из `_measure_wer` дешевле, чем запускать Whisper
+    второй раз ради той же записи.
+    """
+    recognized = await _transcribe_chunk(chunk)
+    if not recognized.strip():
+        return recognized, 1.0  # модель промолчала — это провал проверки
+    rules = active_rules()
+    wer = word_error_rate(
+        normalize(expected, pronunciation=rules, supports_accents=False),
+        normalize(recognized, pronunciation=rules, supports_accents=False),
     )
+    return recognized, wer
+
+
+async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
+    """Считает WER куска относительно текста, который в него отправляли.
+
+    Расшифровка проходит ту же предобработку (`normalize`), что и текст перед
+    синтезом: Whisper пишет числа цифрами («2026»), а в модель ушло «две тысячи
+    двадцать шестом» — без общего шага они расходились бы в каждом числе, и
+    проверка валилась бы на ровном месте.
+
+    Словарь произношения применяется к **обеим** сторонам. Модель произносит
+    замену («SQL» → «эскьюэль»), и Whisper запишет именно её; если reference
+    оставить без словаря, каждая такая реплика выглядела бы ошибкой — WER 0.75
+    при пороге 0.2, лишние попытки и лишний запуск Whisper на ровном месте.
+    Обратная сторона той же монеты: Whisper иногда пишет услышанное как «SQL»,
+    и тогда словарь нужен уже расшифровке. Один шаг на оба текста закрывает оба
+    случая — ровно так же, как `normalize` закрывает числа.
+    """
+    _, wer = await _transcribe_and_measure(chunk, expected)
+    return wer
 
 
 async def render_dialogue(
@@ -1175,6 +1506,15 @@ async def render_dialogue(
                 + ". Выполните анализ диалога и подтвердите найденные слова."
             )
 
+    # Контекст коротких реплик строится один раз на весь диалог: он нужен
+    # соседям, а значит известен только здесь. Исходные тексты при этом не
+    # меняются — план живёт рядом с репликой, а не в ней (см. short_utterance).
+    short_contexts: list[su.ShortUtteranceContext] = []
+    if settings.short_utterance is not None and settings.short_utterance.enabled:
+        short_contexts = await asyncio.to_thread(
+            su.build_contexts, replicas, thresholds=settings.short_utterance.thresholds
+        )
+
     resolved: dict[str, Voice] = {}
     per_replica: dict[int, SpeakerSettings] = {}
     for index, replica in enumerate(replicas):
@@ -1195,6 +1535,8 @@ async def render_dialogue(
     seeds: list[int | None] = list(resume.seeds) if resume else []
     checks: list[QaOutcome | None] = list(resume.qa) if resume else []
     qualities: list[take_quality.TakeQuality] = list(resume.qualities) if resume else []
+    # План короткой реплики по индексу: он уходит в метаданные куска (§24).
+    short_runs: dict[int, ShortRun] = dict(resume.short_runs) if resume else {}
     total = len(replicas)
     cursor = segments[-1][1] if segments else 0
     # Сколько реплик уже готово: их не синтезируем заново — в этом смысл
@@ -1229,7 +1571,7 @@ async def render_dialogue(
             engine = engines[voice.engine]
 
             started = time.monotonic()
-            chunk, seed, qa_outcome = await _synthesize_checked(
+            chunk, seed, qa_outcome, short_run = await _synthesize_checked(
                 engine,
                 voice,
                 replica,
@@ -1239,7 +1581,10 @@ async def render_dialogue(
                 label=replica.label,
                 wait_for_memory=wait_for_memory,
                 on_note=on_note,
+                context=short_contexts[index - 1] if short_contexts else None,
             )
+            if short_run is not None:
+                short_runs[index - 1] = short_run
             seeds.append(seed)
             checks.append(qa_outcome)
             pause = _pause_samples(settings_for_replica, settings)
@@ -1278,6 +1623,7 @@ async def render_dialogue(
             seeds=seeds,
             qa=checks,
             qualities=qualities,
+            short_runs=short_runs,
             failed_index=current_index,
             error=str(exc),
         )
@@ -1295,6 +1641,7 @@ async def render_dialogue(
         seeds=seeds,
         qa=checks,
         qualities=qualities,
+        short_runs=short_runs,
     )
 
 
@@ -1306,7 +1653,8 @@ async def synthesize_replica(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
-) -> tuple[np.ndarray, int | None, QaOutcome | None, take_quality.TakeQuality]:
+    context: su.ShortUtteranceContext | None = None,
+) -> tuple[np.ndarray, int | None, QaOutcome | None, take_quality.TakeQuality, ShortRun | None]:
     """Синтезирует и готовит один кусок — без записи в готовый файл.
 
     Возвращает подготовленный кусок, сид, которым он получен, итог строгой
@@ -1328,7 +1676,7 @@ async def synthesize_replica(
     engine = _engine_for(voice)
     await asyncio.to_thread(engine.load)
 
-    chunk, seed, qa_outcome = await _synthesize_checked(
+    chunk, seed, qa_outcome, short_run = await _synthesize_checked(
         engine,
         voice,
         replica,
@@ -1339,6 +1687,7 @@ async def synthesize_replica(
         wait_for_memory=wait_for_memory,
         on_note=on_note,
         should_abort=should_abort,
+        context=context,
     )
     prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
     # Диагностика считается здесь, где под рукой и сырой выход модели, и
@@ -1351,7 +1700,7 @@ async def synthesize_replica(
         "Реплика %s (%s) пересинтезирована: %.2f c аудио, сид %s",
         index + 1, replica.label, prepared.size / SAMPLE_RATE, seed,
     )
-    return prepared, seed, qa_outcome, quality
+    return prepared, seed, qa_outcome, quality, short_run
 
 
 async def synthesize_take(
@@ -1374,7 +1723,7 @@ async def synthesize_take(
     бы не то, что происходит при обычной генерации.
     """
     replica = Replica(voice=tuning.voice_id or voice.id, text=text, line_number=1)
-    return await _synthesize_checked(
+    chunk, seed, qa_outcome, _short_run = await _synthesize_checked(
         engine,
         voice,
         replica,
@@ -1386,6 +1735,7 @@ async def synthesize_take(
         on_note=on_note,
         should_abort=should_abort,
     )
+    return chunk, seed, qa_outcome
 
 
 def write_take(path: Path, chunk: np.ndarray, tuning: SpeakerSettings) -> float:
@@ -1421,6 +1771,7 @@ def save_chunk_variant(
     label: str,
     qa: QaOutcome | None = None,
     quality: take_quality.TakeQuality | None = None,
+    plan: dict | None = None,
 ) -> ChunkVariant:
     """Сохраняет кусок вариантом: файл для прослушивания + сид в карточке.
 
@@ -1439,6 +1790,7 @@ def save_chunk_variant(
         duration_sec=chunk.size / SAMPLE_RATE,
         qa=qa,
         quality=quality,
+        plan=plan,
     )
 
 

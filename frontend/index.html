@@ -340,6 +340,35 @@
               удлиняет сборку и может подолгу ждать освобождения памяти.
             </span>
           </label>
+          <div class="field" style="margin-top: 12px">
+            <span>Короткие реплики (качество)</span>
+            <label class="toggle">
+              <input type="checkbox" id="short-enabled" />
+              Оптимизировать короткие реплики
+            </label>
+            <div class="grid-2" style="margin-top: 6px">
+              <label class="field" style="margin: 0">
+                <span>Стратегия</span>
+                <select id="short-strategy">
+                  <option value="auto">Авто — измеренная политика</option>
+                  <option value="direct">Direct — как раньше</option>
+                  <option value="punctuation">Punctuation — нормализовать пунктуацию</option>
+                  <option value="same_speaker_context">Контекст того же спикера</option>
+                  <option value="synthetic_context">Нейтральный контекст</option>
+                </select>
+              </label>
+              <label class="field" style="margin: 0">
+                <span>Пороги: очень короткая / короткая, слов</span>
+                <span class="threshold-row">
+                  <input type="number" id="short-very-short" min="1" max="10" value="2" />
+                  <input type="number" id="short-short" min="1" max="20" value="5" />
+                </span>
+              </label>
+            </div>
+            <span class="muted">
+              Обычные реплики идут прежним путём. Короткие («Да.», «Привет!») получают больше контекста для модели: соседнюю реплику того же спикера или нейтральный носитель. Контекст добавляется только к тому, что уходит в модель: в готовом файле — только ваша реплика, обрезка идёт по таймстемпам слов. Стратегия «Авто» берёт измеренную политику движка (сейчас direct — прежнее поведение).
+            </span>
+          </div>
           <label class="field" style="margin-top: 12px">
             <span>Нарезка на куски</span>
             <select id="chunk-strategy">
@@ -560,6 +589,35 @@
               удлиняет озвучку и может подолгу ждать освобождения памяти.
             </span>
           </label>
+          <div class="field" style="margin-top: 12px">
+            <span>Короткие куски (качество)</span>
+            <label class="toggle">
+              <input type="checkbox" id="text-short-enabled" />
+              Оптимизировать короткие реплики
+            </label>
+            <div class="grid-2" style="margin-top: 6px">
+              <label class="field" style="margin: 0">
+                <span>Стратегия</span>
+                <select id="text-short-strategy">
+                  <option value="auto">Авто — измеренная политика</option>
+                  <option value="direct">Direct — как раньше</option>
+                  <option value="punctuation">Punctuation — нормализовать пунктуацию</option>
+                  <option value="same_speaker_context">Контекст того же спикера</option>
+                  <option value="synthetic_context">Нейтральный контекст</option>
+                </select>
+              </label>
+              <label class="field" style="margin: 0">
+                <span>Пороги: очень короткая / короткая, слов</span>
+                <span class="threshold-row">
+                  <input type="number" id="text-short-very-short" min="1" max="10" value="2" />
+                  <input type="number" id="text-short-short" min="1" max="20" value="5" />
+                </span>
+              </label>
+            </div>
+            <span class="muted">
+              Обычные реплики идут прежним путём. Короткие («Да.», «Привет!») получают больше контекста для модели: соседнюю реплику того же спикера или нейтральный носитель. Контекст добавляется только к тому, что уходит в модель: в готовом файле — только ваша реплика, обрезка идёт по таймстемпам слов. Стратегия «Авто» берёт измеренную политику движка (сейчас direct — прежнее поведение).
+            </span>
+          </div>
           <label class="field" style="margin-top: 12px">
             <span>Нарезка на куски</span>
             <select id="text-chunk-strategy">

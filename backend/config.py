@@ -233,6 +233,9 @@ SHORT_UTTERANCE_MIN_DURATION_RATIO = float(
     os.environ.get("TTS_SHORT_MIN_DURATION_RATIO", "0.35")
 )
 SHORT_UTTERANCE_MIN_DURATION_SEC = float(os.environ.get("TTS_SHORT_MIN_DURATION_SEC", "0.15"))
+# Метод определения границы цели в контекстном синтезе: `asr` (таймстемпы слов,
+# единственный пригодный для производства) или `silence` (только benchmark).
+SHORT_UTTERANCE_BOUNDARY_METHOD = os.environ.get("TTS_SHORT_BOUNDARY", "asr")
 # Политика по движкам, измеренная benchmark'ом. Пусто — везде DIRECT (§29 Phase 4).
 # Формат переменной: "f5=direct,xtts=synthetic_context".
 def _engine_strategies() -> dict[str, str]:

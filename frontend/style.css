@@ -346,6 +346,10 @@ input[type="file"] { color: var(--muted); font-size: 11px; }
 
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 
+/* Два числовых порога рядом: подпись объясняет, что это «очень короткая / короткая». */
+.threshold-row { display: flex; gap: 8px; }
+.threshold-row input { width: 100%; }
+
 .toggle {
   display: flex;
   align-items: center;

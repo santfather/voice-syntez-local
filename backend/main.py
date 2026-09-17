@@ -36,6 +36,7 @@ from . import (
     timeline,
     transcribe,
 )
+from . import short_utterance as su
 from .accentizer import Accentizer
 from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettings
 from .db.connection import init_db
@@ -221,6 +222,28 @@ QaModeOrNone = Annotated[
 ]
 
 
+class ShortUtteranceRequest(BaseModel):
+    """Настройки слоя коротких реплик (§23).
+
+    Все поля необязательные: интерфейс присылает только то, что менял, а
+    недостающее берётся из политики приложения. `strategy = auto` — измеренная
+    политика движка, `direct` — прежнее поведение.
+    """
+
+    enabled: bool = config.SHORT_UTTERANCE_DEFAULT_ENABLED
+    strategy: Literal[
+        "auto", "direct", "punctuation", "same_speaker_context", "synthetic_context"
+    ] = "auto"
+    side: Literal["prefix", "suffix", "both"] | None = None
+    carrier: str | None = None
+    thresholds: dict | None = None
+    max_attempts: int | None = None
+    boundary_method: Literal["asr", "silence"] | None = None
+
+    def to_settings(self) -> audio_pipeline.ShortUtteranceSettings:
+        return audio_pipeline.ShortUtteranceSettings.from_dict(self.model_dump())
+
+
 class GenerateRequest(TrackOptions):
     dialogue_text: str
     speakers: dict[str, SpeakerConfig] = Field(default_factory=dict)
@@ -234,6 +257,8 @@ class GenerateRequest(TrackOptions):
     qa: QaMode = config.QA_MODE_OFF
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
+    # Короткие реплики (§23): выключено по умолчанию, включается настройкой.
+    short_utterance: ShortUtteranceRequest | None = None
     # Фоновая задача (Фаза 11): рендер уходит в приоритет 3 и пропускает вперёд
     # preview и перегенерацию. Поле необязательное — без него поведение прежнее.
     background: bool = False
@@ -247,6 +272,8 @@ class RenderTextRequest(SpeakerConfig, TrackOptions):
     qa: QaMode = config.QA_MODE_OFF
     output_format: Literal["wav", "mp3"] = config.DEFAULT_OUTPUT_FORMAT
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
+    # См. `GenerateRequest.short_utterance`.
+    short_utterance: ShortUtteranceRequest | None = None
     # См. `GenerateRequest.background`.
     background: bool = False
 
@@ -333,6 +360,8 @@ class ProjectRenderRequest(BaseModel):
     qa: QaModeOrNone = None
     output_format: Literal["wav", "mp3"] | None = None
     chunk_strategy: ChunkStrategy | None = None
+    # Короткие реплики: None — взять сохранённое в проекте (как у остальных ручек).
+    short_utterance: ShortUtteranceRequest | None = None
     # Фоновая задача (Фаза 11): приоритет 3. Не запоминается в настройках проекта:
     # это свойство запуска, а не сборки.
     background: bool = False
@@ -491,6 +520,18 @@ async def status() -> dict:
         # поэтому остаётся доступным, даже когда воркер мёртв.
         "worker_isolation": config.worker_isolation_enabled(),
         "workers": get_supervisor().status(),
+        # Слой коротких реплик: включён ли по умолчанию, какая стратегия измерена
+        # для каждого движка и какие пороги классов действуют. Интерфейсу это
+        # нужно, чтобы показать «Авто» и объяснить, что именно произойдёт.
+        "short_utterance": {
+            "enabled": config.SHORT_UTTERANCE_DEFAULT_ENABLED,
+            "strategies": {
+                engine_id: su.default_strategy(engine_id) for engine_id in ENGINE_INFOS
+            },
+            "available_strategies": list(su.SELECTABLE_STRATEGIES),
+            "thresholds": su.ShortThresholds().to_dict(),
+            "boundary_method": config.SHORT_UTTERANCE_BOUNDARY_METHOD,
+        },
         # Состояние памяти одной сводкой (NORMAL/WARNING/CRITICAL + причина):
         # очередь решает по нему, начинать ли задачу, watchdog — прерывать ли
         # идущую, а пользователю нужно объяснение («память системы занята на
@@ -1484,6 +1525,7 @@ async def generate(payload: GenerateRequest) -> dict:
             auto_accent=payload.auto_accent,
             output_format=payload.output_format,
             qa=QaSettings.for_mode(payload.qa),
+            short_utterance=_short_settings(payload.short_utterance),
         ),
     )
     try:
@@ -1522,6 +1564,7 @@ async def render_text(payload: RenderTextRequest) -> dict:
             auto_accent=payload.auto_accent,
             output_format=payload.output_format,
             qa=QaSettings.for_mode(payload.qa),
+            short_utterance=_short_settings(payload.short_utterance),
         ),
     )
     try:
@@ -1677,6 +1720,20 @@ def _project_or_404(project_id: str) -> dict:
     return project
 
 
+def _short_settings(raw: ShortUtteranceRequest | None) -> audio_pipeline.ShortUtteranceSettings | None:
+    """Настройки коротких реплик из запроса: `None` — политика приложения.
+
+    Ошибка разбора (неизвестная стратегия) — это 400, а не молчаливый откат:
+    опечатка в стратегии не должна выглядеть как «слой не сработал».
+    """
+    if raw is None:
+        return None
+    try:
+        return raw.to_settings()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> tuple[RenderSettings, dict]:
     """Настройки сборки: сохранённые в проекте плюс то, что пришло в запросе.
 
@@ -1704,12 +1761,17 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
     # собранные до появления Smart, хранят `true`/`false`.
     qa = _qa_mode(pick("qa", config.QA_MODE_OFF), fallback=config.QA_MODE_OFF)
 
+    short_saved = saved.get("short_utterance")
+    short_settings = _short_settings(payload.short_utterance) or (
+        audio_pipeline.ShortUtteranceSettings.from_dict(short_saved) if short_saved else None
+    )
     settings = RenderSettings(
         pause_ms=pause_ms,
         cross_fade_duration=cross_fade,
         auto_accent=auto_accent,
         output_format=output_format,
         qa=QaSettings.for_mode(qa),
+        short_utterance=short_settings,
     )
     remembered = {
         "pause_ms": pause_ms,
@@ -1718,6 +1780,9 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
         "output_format": output_format,
         "chunk_strategy": strategy,
         "qa": qa,
+        # Настройка коротких реплик — часть сборки проекта: повторный запуск без
+        # тела запроса должен звучать так же.
+        "short_utterance": None if short_settings is None else short_settings.to_dict(),
     }
     return settings, remembered
 

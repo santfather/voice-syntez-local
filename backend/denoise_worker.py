@@ -31,7 +31,7 @@ def _shim_torchaudio_backend() -> None:
     этого torchaudio <= 2.6 нельзя: он связан с torch и f5-tts, а весь набор версий
     проекта проверен на torchaudio 2.11.
     """
-    import torchaudio  # noqa: F401  (проверка ниже опирается на наличие атрибута)
+    import torchaudio
 
     if hasattr(torchaudio, "backend"):
         return
@@ -40,7 +40,7 @@ def _shim_torchaudio_backend() -> None:
     backend = types.ModuleType("torchaudio.backend")
     common = types.ModuleType("torchaudio.backend.common")
 
-    class AudioMetaData:  # noqa: D101 — заглушка вместо удалённого класса
+    class AudioMetaData:
         sample_rate: int
         num_frames: int
         num_channels: int
@@ -59,7 +59,6 @@ def main() -> int:
 
     # Порядок импортов важен: config выставляет лимиты потоков в переменных окружения,
     # и сделать это нужно до первого импорта torch.
-    from . import config  # noqa: I001
 
     import numpy as np
     import soundfile as sf

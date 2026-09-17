@@ -41,7 +41,7 @@ def _install_transformers_shim() -> None:
     """
     import torch
     import transformers
-    import transformers.pytorch_utils as pytorch_utils
+    from transformers import pytorch_utils
 
     if hasattr(pytorch_utils, "isin_mps_friendly"):
         return
@@ -97,7 +97,7 @@ class XTTSEngine(SynthesisEngine):
             self._mark("loading")
             try:
                 self._load_model(config.pick_device())
-            except Exception as exc:  # noqa: BLE001 — состояние нужно отдать в /api/status
+            except Exception as exc:
                 logger.error("Не удалось загрузить XTTS (%s): %s", self.id, exc)
                 self._model = None
                 self._mark("failed", exc)

@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from . import audio_pipeline, benchmark, config, eta, resource_guard, take_quality
+from . import short_utterance as su
 from .audio_pipeline import (
     NoteCallback,
     ProgressCallback,
@@ -1083,6 +1084,36 @@ class JobQueue:
         job.message = f"{title}{where}"
 
     @staticmethod
+    def _short_plan_dict(short_run) -> dict | None:
+        """Метаданные короткой реплики для карточки куска (§24) или None."""
+        if short_run is None:
+            return None
+        return short_run.to_dict()
+
+    @staticmethod
+    def _short_context(job: Job, index: int):
+        """Контекст соседей для перегенерации одной реплики.
+
+        Перегенерация идёт по сохранённому payload, поэтому соседи известны — и
+        короткая реплика после пересборки звучит так же, как при общей сборке.
+        Если контекст собрать не удалось, слой честно работает без него.
+        """
+        payload = job.payload
+        settings = payload.settings if payload else None
+        if payload is None or settings is None or settings.short_utterance is None:
+            return None
+        if not settings.short_utterance.enabled:
+            return None
+        try:
+            contexts = su.build_contexts(
+                payload.replicas, thresholds=settings.short_utterance.thresholds
+            )
+        except Exception as exc:  # noqa: BLE001 — контекст вторичен, синтез важнее
+            logger.warning("Задача %s: контекст короткой реплики не собран (%s)", job.id, exc)
+            return None
+        return contexts[index] if 0 <= index < len(contexts) else None
+
+    @staticmethod
     def _set_replica_status(project_id: str, index: int, status: str) -> None:
         """Статус реплики проекта. Ошибка записи задачу не губит (см. `_mark_project`)."""
         try:
@@ -1169,9 +1200,11 @@ class JobQueue:
                     "label": f"рендер {job.id} · {PARTIAL_TAKE_LABEL}",
                     "seed": partial.seeds[index] if index < len(partial.seeds) else None,
                     "engine": audio_pipeline.voice_engine(speaker.voice_id if speaker else ""),
-                    "parameters": audio_pipeline.chunk_parameters(replica, speaker)
-                    if speaker
-                    else {},
+                    "parameters": {
+                        **(audio_pipeline.chunk_parameters(replica, speaker)
+                           if speaker else {}),
+                        **(JobQueue._short_plan_dict(partial.short_runs.get(index)) or {}),
+                    },
                     "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
                     "qa": partial.qa[index].to_dict()
                     if index < len(partial.qa) and partial.qa[index] is not None
@@ -1234,9 +1267,11 @@ class JobQueue:
                         "engine": audio_pipeline.voice_engine(
                             speaker.voice_id if speaker else ""
                         ),
-                        "parameters": audio_pipeline.chunk_parameters(replica, speaker)
-                        if speaker
-                        else {},
+                        "parameters": {
+                            **(audio_pipeline.chunk_parameters(replica, speaker)
+                               if speaker else {}),
+                            **(self._short_plan_dict(result.short_runs.get(index)) or {}),
+                        },
                         "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
                         "qa": result.qa[index].to_dict()
                         if index < len(result.qa) and result.qa[index] is not None
@@ -1276,14 +1311,20 @@ class JobQueue:
             await self._keep_current(job, task.index, job.payload.settings, job.output_path)
             if self._cancelled(job.id):
                 raise audio_pipeline.JobCancelledError("Отменено до синтеза")
-            prepared, seed, qa_outcome, quality = await audio_pipeline.synthesize_replica(
-                replica=replica,
-                speaker=speaker,
-                settings=job.payload.settings,
-                index=task.index,
-                wait_for_memory=lambda: self._wait_for_memory(job.id),
-                on_note=self._note_callback(job),
-                should_abort=lambda: self._cancelled(job.id),
+            prepared, seed, qa_outcome, quality, short_run = (
+                await audio_pipeline.synthesize_replica(
+                    replica=replica,
+                    speaker=speaker,
+                    settings=job.payload.settings,
+                    index=task.index,
+                    wait_for_memory=lambda: self._wait_for_memory(job.id),
+                    on_note=self._note_callback(job),
+                    should_abort=lambda: self._cancelled(job.id),
+                    # Перегенерация идёт по сохранённому payload, поэтому соседи
+                    # известны: короткая реплика получает тот же контекст, что и
+                    # при обычной сборке, а не синтезируется «в вакууме».
+                    context=self._short_context(job, task.index),
+                )
             )
             # Синтез мог вернуться уже после запроса отмены: тогда вариант не
             # сохраняем — в файл попадёт недоделанная пересборка.
@@ -1291,6 +1332,7 @@ class JobQueue:
                 raise audio_pipeline.JobCancelledError("Отменено до сохранения варианта")
             variant = await self._add_variant(
                 job, task.index, prepared, seed, qa_outcome, quality,
+                plan=self._short_plan_dict(short_run),
             )
             duration, bounds = await audio_pipeline.apply_variant(
                 source_path=job.output_path,
@@ -1399,14 +1441,16 @@ class JobQueue:
             # Реплика помечается занятой до передачи воркеру: после падения видно,
             # какую именно реплику собирали (creash_report §7).
             self._set_replica_status(task.project_id, task.index, config.REPLICA_STATUS_RENDERING)
-            prepared, seed, qa_outcome, quality = await audio_pipeline.synthesize_replica(
-                replica=task.replica,
-                speaker=speaker,
-                settings=task.settings,
-                index=task.index,
-                wait_for_memory=lambda: self._wait_for_memory(job.id),
-                on_note=self._note_callback(job),
-                should_abort=lambda: self._cancelled(job.id),
+            prepared, seed, qa_outcome, quality, short_run = (
+                await audio_pipeline.synthesize_replica(
+                    replica=task.replica,
+                    speaker=speaker,
+                    settings=task.settings,
+                    index=task.index,
+                    wait_for_memory=lambda: self._wait_for_memory(job.id),
+                    on_note=self._note_callback(job),
+                    should_abort=lambda: self._cancelled(job.id),
+                )
             )
             variant = await asyncio.to_thread(
                 audio_pipeline.save_chunk_variant,
@@ -1432,7 +1476,10 @@ class JobQueue:
                     "engine": audio_pipeline.voice_engine(
                         str(task.replica.voice_id or speaker.voice_id)
                     ),
-                    "parameters": audio_pipeline.chunk_parameters(task.replica, speaker),
+                    "parameters": {
+                        **audio_pipeline.chunk_parameters(task.replica, speaker),
+                        **(self._short_plan_dict(short_run) or {}),
+                    },
                     "duration_sec": variant.duration_sec,
                     "qa": qa_outcome.to_dict() if qa_outcome is not None else None,
                     "quality": variant.quality.to_dict()
@@ -1614,12 +1661,13 @@ class JobQueue:
         seed: int | None,
         qa: QaOutcome | None = None,
         quality: take_quality.TakeQuality | None = None,
+        plan: dict | None = None,
     ) -> audio_pipeline.ChunkVariant:
         """Добавляет новый вариант куска и делает его текущим."""
         seq = self._take_seq(job, index)
         variant = await asyncio.to_thread(
             audio_pipeline.save_chunk_variant,
-            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}", qa, quality,
+            job.id, index, f"v{seq}", chunk, seed, f"вариант {seq}", qa, quality, plan,
         )
         job.variants.setdefault(index, []).append(variant)
         job.active_variant[index] = variant.id

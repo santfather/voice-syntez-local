@@ -43,7 +43,7 @@ class F5Engine(SynthesisEngine):
         self._mark("loading")
         try:
             self._engine.load()
-        except Exception as exc:  # noqa: BLE001 — состояние нужно отдать в /api/status
+        except Exception as exc:
             logger.error("Не удалось загрузить F5-TTS: %s", exc)
             self._mark("failed", exc)
             raise

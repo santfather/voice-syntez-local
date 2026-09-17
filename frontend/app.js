@@ -3,6 +3,8 @@
 const $ = (id) => document.getElementById(id);
 
 const state = {
+  // Политика коротких реплик из /api/status — для подписи «Авто» в панели.
+  shortPolicy: null,
   voices: [],
   engines: {},         // id -> паспорт движка из /api/engines
   engineTouched: false, // пользователь сам выбрал движок в форме нового голоса
@@ -3320,6 +3322,7 @@ function takesHtml(replica) {
           <span class="variant-label">${esc(take.label || 'вариант')}${take.active ? ' · активно' : ''}</span>
           <span class="muted">${Number(take.duration_sec || 0).toFixed(1)} с · ${esc(seedText(take.seed))}</span>
           ${takeWarnings(take.quality)}
+          ${shortNote(take)}
           ${qaNote(take.qa)}
           ${take.active ? '' : '<button class="tiny" data-role="take-pick">поставить</button>'}
         </div>
@@ -3328,6 +3331,34 @@ function takesHtml(replica) {
   }).join('');
   return `<div class="variant-list">${rows}</div>`;
 }
+
+// Что сделал слой коротких реплик с этим звучанием (§24): класс, стратегия и
+// источник контекста лежат в параметрах куска, поэтому видны задним числом.
+function shortNote(take) {
+  const params = take.parameters || {};
+  const strategy = params.short_utterance_strategy;
+  if (!strategy || strategy === 'direct') return '';
+  const source = params.short_utterance_context_source || '';
+  const klass = params.short_utterance_class || '';
+  const parts = [SHORT_STRATEGY_LABELS[strategy] || strategy];
+  if (source) parts.push(SHORT_SOURCE_LABELS[source] || source);
+  const title = `Класс: ${klass}. Отпечаток синтез-текста: ${params.synthesis_text_hash || '—'}`;
+  return `<span class="replica-qa muted" title="${esc(title)}">${esc(parts.join(' · '))}</span>`;
+}
+
+const SHORT_STRATEGY_LABELS = {
+  punctuation: 'короткая: пунктуация',
+  same_speaker_context: 'короткая: контекст спикера',
+  synthetic_context: 'короткая: нейтральный контекст',
+  batch_and_crop: 'короткая: группа',
+};
+
+const SHORT_SOURCE_LABELS = {
+  same_speaker_previous: 'предыдущая реплика',
+  same_speaker_next: 'следующая реплика',
+  synthetic: 'носитель',
+  group: 'группа',
+};
 
 function replicaCardHtml(replica) {
   const index = replica.index;
@@ -3652,6 +3683,43 @@ async function selectTake(index, takeId) {
 // перед запуском сохраняем карточки спикеров (в них могли печатать только что)
 // и ставим задачу рендера. Отдельной задачи «по тексту» больше нет — текст
 // попадает в проект разбором.
+// Настройки коротких реплик из панели (§23). Префикс различает панели диалога и
+// сплошного текста: у них свои наборы полей, а серверу уходит одно и то же.
+function shortUtterancePayload(prefix = '') {
+  const enabledEl = $(`${prefix}short-enabled`);
+  if (!enabledEl || !enabledEl.checked) return { enabled: false };
+  const veryShort = parseInt($(`${prefix}short-very-short`).value, 10);
+  const short = parseInt($(`${prefix}short-short`).value, 10);
+  return {
+    enabled: true,
+    strategy: $(`${prefix}short-strategy`).value,
+    thresholds: {
+      very_short_words: Number.isFinite(veryShort) ? veryShort : undefined,
+      short_words: Number.isFinite(short) ? short : undefined,
+    },
+  };
+}
+
+// Политика приложения из /api/status: подставляем измеренные значения, чтобы
+// «Авто» в панели означало именно то, что произойдёт на сервере.
+function applyShortPolicy(status) {
+  const policy = status && status.short_utterance;
+  if (!policy) return;
+  const thresholds = policy.thresholds || {};
+  for (const prefix of ['', 'text-']) {
+    const enabled = $(`${prefix}short-enabled`);
+    if (!enabled) continue;
+    enabled.checked = Boolean(policy.enabled);
+    if (thresholds.very_short_words) {
+      $(`${prefix}short-very-short`).value = thresholds.very_short_words;
+    }
+    if (thresholds.short_words) {
+      $(`${prefix}short-short`).value = thresholds.short_words;
+    }
+  }
+  state.shortPolicy = policy;
+}
+
 async function generate() {
   if (!state.project) return;
   showAlert($('job-error'), '');
@@ -3664,6 +3732,7 @@ async function generate() {
     qa: $('qa').value,
     output_format: $('output-format').value,
     chunk_strategy: $('chunk-strategy').value,
+    short_utterance: shortUtterancePayload(),
   };
 
   $('btn-generate').disabled = true;
@@ -4153,6 +4222,7 @@ async function renderText() {
     cross_fade_duration: parseFloat($('text-crossfade').value),
     auto_accent: $('text-auto-accent').checked,
     qa: $('text-qa').value,
+    short_utterance: shortUtterancePayload('text-'),
     output_format: $('text-output-format').value,
     chunk_strategy: $('text-chunk-strategy').value,
   };
@@ -4294,6 +4364,7 @@ async function refreshStatus() {
   try {
     const status = await api('/api/status');
     state.modelReady = status.model_loaded;
+    applyShortPolicy(status);
     const engines = status.engines || [];
     const failedEngine = engines.find((e) => e.state === 'failed');
     const loadingEngines = engines.filter((e) => e.state === 'loading');
