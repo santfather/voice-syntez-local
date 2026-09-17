@@ -7,13 +7,16 @@
 
 Поведение задаётся текстом реплики, потому что весь путь запроса — это текст:
 
-* `CRASH` — процесс падает нативно (`os.abort()`, то есть SIGABRT);
+* `CRASH`/`краш` — процесс падает нативно (`os.abort()`, то есть SIGABRT);
 * `SEGV` — падение с SIGSEGV (проверяет разбор другого сигнала);
-* `BOOM`  — обычная ошибка Python внутри модели (воркер обязан остаться жив);
-* `HANG`  — зависание: процесс жив, ответа нет (проверяет таймаут и убийство);
-* `SLOW`  — долгий, но честный инференс (проверяет, что занятость воркера видна
+* `BOOM`/`бум` — обычная ошибка Python внутри модели (воркер обязан остаться жив);
+* `HANG`/`висни` — зависание: процесс жив, ответа нет (проверяет таймаут и убийство);
+* `SLOW` — долгий, но честный инференс (проверяет, что занятость воркера видна
   снаружи и что выгрузка не влезает в идущий синтез);
 * всё остальное — предсказуемая синусоида длиной от текста.
+
+Кириллические маркеры нужны для живых проверок через API: латиница до модели не
+доходит — её транслитерирует нормализация текста (см. text_normalization/latin).
 """
 
 from __future__ import annotations
@@ -54,19 +57,20 @@ class FakeWorkerEngine(SynthesisEngine):
 
     def _synthesize(self, text, ref_audio_path, ref_text, speed, params):
         self.synthesizes += 1
-        if "CRASH" in text:
+        lowered = text.lower()
+        if "crash" in lowered or "краш" in lowered:
             # Нативное падение: исключение поймать нельзя, и это ровно тот
             # сценарий, ради которого воркер вынесен в отдельный процесс.
             os.abort()
-        if "SEGV" in text:
+        if "segv" in lowered:
             import ctypes
 
             ctypes.string_at(0)  # SIGSEGV: проверяем разбор другого сигнала
-        if "BOOM" in text:
+        if "boom" in lowered or "бум" in lowered:
             raise RuntimeError("модель сломалась внутри воркера")
-        if "HANG" in text:
+        if "hang" in lowered or "висни" in lowered:
             time.sleep(HANG_SECONDS)
-        if "SLOW" in text:
+        if "slow" in lowered:
             time.sleep(SLOW_SECONDS)
         seconds = 0.2 + SECONDS_PER_CHAR * max(len(text), 1)
         samples = int(SAMPLE_RATE * seconds)
