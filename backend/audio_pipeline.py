@@ -19,7 +19,7 @@ from . import config, qa_screening, take_quality
 from .accentizer import accentuate
 from .dialogue_parser import Replica
 from .engines.base import SAMPLE_RATE, SynthesisEngine
-from .engines.registry import get_engine
+from .engines.registry import created_engines, get_engine
 from .engines.worker_protocol import ERROR_AUDIO, text_fingerprint
 from .pronunciation import active_rules
 from .settings_resolution import (
@@ -1658,6 +1658,28 @@ def cleanup_output(ttl_hours: float = config.OUTPUT_TTL_HOURS) -> int:
     if removed:
         logger.info("Очистил %s старых файлов из output/", removed)
     return removed
+
+
+def abort_running_inference(reason: str = "остановка") -> list[str]:
+    """Просит движки, умеющие это, прервать текущий инференс.
+
+    Нужно при выключении приложения: зависший кусок нельзя прервать извне, и без
+    этого остановка ждала бы его таймаута (`TTS_CHUNK_TIMEOUT_SEC`), а поток
+    оставался бы в нативном вызове. Результат куска всё равно выбрасывается —
+    задача отменена. Движки в процессе бэкенда хука не имеют (`getattr`), поэтому
+    вызов безопасен и для них.
+    """
+    aborted: list[str] = []
+    for engine_id, engine in created_engines().items():
+        abort = getattr(engine, "abort_current", None)
+        if not callable(abort):
+            continue
+        try:
+            if abort(reason):
+                aborted.append(engine_id)
+        except Exception as exc:  # noqa: BLE001 — выключение важнее аккуратности
+            logger.warning("Движок %s: не удалось прервать инференс (%s)", engine_id, exc)
+    return aborted
 
 
 def partial_files() -> list[Path]:

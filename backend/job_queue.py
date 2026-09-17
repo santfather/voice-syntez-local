@@ -23,7 +23,7 @@ from .db.store import get_projects_store
 from .dialogue_parser import Replica
 from .engines import worker_protocol as proto
 from .engines.base import STATE_LOADING, STATE_READY
-from .engines.registry import created_engine
+from .engines.registry import created_engine, created_engines
 from .voices_store import Voice
 
 logger = logging.getLogger(__name__)
@@ -295,9 +295,21 @@ class JobQueue:
         logger.info("Воркер очереди запущен")
 
     async def stop(self) -> None:
+        """Останавливает очередь: отменяет текущую задачу и прерывает её инференс.
+
+        Прерывание обязательно: результат куска выбрасывается (задача отменена),
+        а без него остановка ждала бы таймаута куска, держа поток в нативном
+        вызове. Супервизор к этому моменту уже помечен как выключающийся
+        (см. `main.lifespan`), поэтому такое прерывание не считается падением.
+        """
         if self._worker_task is None:
             return
         self._worker_task.cancel()
+        aborted = await asyncio.to_thread(
+            audio_pipeline.abort_running_inference, "остановка очереди"
+        )
+        if aborted:
+            logger.info("Прерван инференс при остановке: %s", ", ".join(aborted))
         try:
             await self._worker_task
         except asyncio.CancelledError:
@@ -733,30 +745,66 @@ class JobQueue:
                 queue.task_done()
 
     async def _wait_for_memory(self, job_id: str) -> None:
-        """Не начинает задачу, пока память занята не только этим процессом.
+        """Не начинает задачу, пока память не в порядке (creash_report §20–§22).
 
-        Проверка стоит именно перед взятием job, а не в фоновом watchdog: задача
+        Проверка стоит перед взятием job, а не только в фоновом watchdog: задача
         должна остаться в очереди с понятным сообщением, а не стартовать и лечь
-        дополнительной нагрузкой поверх уже существующей. Свой потолок
-        (`MAX_RSS_MB`) при этом продолжает действовать отдельно.
+        дополнительной нагрузкой поверх уже существующей. Состояние берётся у
+        `memory_monitor` — он видит и системную память, и RSS процессов синтеза,
+        где и живут модели; свой потолок бэкенда при этом действует отдельно.
+
+        Перед ожиданием очередь пробует вернуть память самым дешёвым способом:
+        выгружает простаивающие движки. Выгружать занятый движок нельзя — это
+        оборвало бы чужой инференс, — а простаивающий держит гигабайты.
         """
         job = self._jobs.get(job_id)
         warned = False
-        while resource_guard.check_system_memory_pressure():
+        while resource_guard.is_memory_critical():
             if self._cancelled(job_id):
                 return
-            percent = resource_guard.snapshot()["system_mem_percent"]
+            if not warned:
+                unloaded = await asyncio.to_thread(self._free_memory_for_job)
+                if unloaded:
+                    logger.warning(
+                        "Задача %s ждёт памяти: выгружены простаивающие движки %s",
+                        job_id, ", ".join(unloaded),
+                    )
+                    # После выгрузки состояние могло измениться — перепроверяем
+                    # до сообщения «перегружено», чтобы не пугать зря.
+                    if not resource_guard.is_memory_critical():
+                        logger.info("Задача %s: память освободилась после выгрузки", job_id)
+                        return
+            state = resource_guard.memory_state()
             if job is not None:
-                job.message = f"Система перегружена: память занята на {percent:.0f}% — ожидание"
+                job.message = f"Система перегружена: {state['reason']} — ожидание"
             if not warned:
                 warned = True
-                logger.warning(
-                    "Задача %s ждёт: системная память %.0f%% выше порога %d%%",
-                    job_id, percent, config.SYSTEM_MEM_THRESHOLD_PERCENT,
-                )
+                logger.warning("Задача %s ждёт: %s", job_id, state["reason"])
             await asyncio.sleep(MEMORY_WAIT_RETRY_SEC)
         if warned:
             logger.info("Задача %s: память освободилась, начинаю", job_id)
+
+    def _free_memory_for_job(self) -> list[str]:
+        """Выгружает простаивающие движки, если прямо сейчас никто не синтезирует.
+
+        Проверка именно по текущей задаче, а не по `is_busy()`: ожидающая задача
+        тоже делает очередь «занятой», но синтеза в ней нет — выгружать движок
+        как раз и нужно ради неё. Во время рендера (`_current_job_id` выставлен)
+        выгрузка не делается: модель понадобится следующей реплике.
+        """
+        if self._current_job_id is not None:
+            return []
+        unloaded: list[str] = []
+        for engine_id, engine in created_engines().items():
+            if not engine.is_loaded or engine.active_synthesizes:
+                continue
+            try:
+                engine.unload()
+            except Exception as exc:  # noqa: BLE001 — уборка не повод падать
+                logger.warning("Движок %s: выгрузка перед ожиданием памяти не удалась (%s)", engine_id, exc)
+                continue
+            unloaded.append(engine_id)
+        return unloaded
 
     def _drop_variants(self, job: Job) -> None:
         """Убирает снятые варианты и их файлы.
@@ -839,10 +887,26 @@ class JobQueue:
             job.message = f"Готово: {result.duration_sec:.1f} c аудио"
             job.status = JobStatus.DONE
             logger.info("Задача %s завершена за %.1f c", job.id, time.monotonic() - started)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            # Остановка сервера: задача не «упала», а не пережила выключение.
+            # Готовое сохраняется так же, как при падении воркера, а реплика
+            # помечается прерванной — иначе после рестарта она выглядела бы как
+            # «ещё синтезируется» (см. recovery при старте).
             job.status = JobStatus.ERROR
             job.error = "Отменено (остановка сервера)"
+            job.error_type = proto.ERROR_INTERRUPTED
             job.cancel_requested = True
+            partial = getattr(exc, "partial_render", None)
+            if payload.project_id and partial is not None and partial.failed_index is not None:
+                self._set_replica_status(
+                    payload.project_id, partial.failed_index, config.REPLICA_STATUS_INTERRUPTED
+                )
+            logger.warning(
+                "Задача %s прервана остановкой сервера (готово реплик: %s)",
+                job.id, 0 if partial is None else partial.done,
+            )
+            # Готовое сохраняется синхронно: ждать запись в момент отмены поздно.
+            self._save_partial_takes_now(job, payload, partial)
             self._discard_partial(job)
             raise
         except _RenderFailed as failed:
@@ -1047,36 +1111,7 @@ class JobQueue:
         if not project_id or partial is None or not partial.pieces:
             return
         try:
-            paths = await asyncio.to_thread(
-                audio_pipeline.export_partial_takes, project_id, partial.pieces
-            )
-            takes: list[dict] = []
-            count = min(len(paths), len(partial.pieces), len(payload.replicas), len(partial.segments))
-            for index in range(count):
-                replica = payload.replicas[index]
-                speaker = payload.speakers.get(replica.voice)
-                start, end = partial.segments[index]
-                takes.append(
-                    {
-                        "index": index,
-                        "audio_path": str(paths[index]),
-                        "label": f"рендер {job.id} · {PARTIAL_TAKE_LABEL}",
-                        "seed": partial.seeds[index] if index < len(partial.seeds) else None,
-                        "engine": audio_pipeline.voice_engine(
-                            speaker.voice_id if speaker else ""
-                        ),
-                        "parameters": audio_pipeline.chunk_parameters(replica, speaker)
-                        if speaker
-                        else {},
-                        "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
-                        "qa": partial.qa[index].to_dict()
-                        if index < len(partial.qa) and partial.qa[index] is not None
-                        else None,
-                        "quality": partial.qualities[index].to_dict()
-                        if index < len(partial.qualities) and partial.qualities[index] is not None
-                        else None,
-                    }
-                )
+            takes = await asyncio.to_thread(self._build_partial_takes, job, payload, partial)
             await asyncio.to_thread(
                 get_projects_store().save_partial_takes, project_id, job.id, takes
             )
@@ -1089,6 +1124,64 @@ class JobQueue:
                 "Проект %s: не удалось сохранить куски прерванного рендера (%s: %s)",
                 project_id, type(exc).__name__, exc,
             )
+
+    def _save_partial_takes_now(
+        self, job: Job, payload: JobPayload, partial: audio_pipeline.RenderPartial | None
+    ) -> None:
+        """То же, но без ожидания: вызывается при остановке сервера.
+
+        Ждать асинхронную запись в момент отмены уже поздно — задача отменена,
+        цикл событий останавливается. Путь синхронный (файлы и база пишутся
+        синхронными функциями) и короткий: цена секунды задержки при выключении
+        ниже цены потерянных реплик, которые уже синтезированы.
+        """
+        project_id = payload.project_id
+        if not project_id or partial is None or not partial.pieces:
+            return
+        try:
+            takes = self._build_partial_takes(job, payload, partial)
+            get_projects_store().save_partial_takes(project_id, job.id, takes)
+            logger.warning(
+                "Задача %s: сохранено %d кусков при остановке сервера", job.id, len(takes)
+            )
+        except Exception as exc:  # noqa: BLE001 — выключение важнее аккуратности
+            logger.warning(
+                "Проект %s: не удалось сохранить куски при остановке (%s: %s)",
+                project_id, type(exc).__name__, exc,
+            )
+
+    @staticmethod
+    def _build_partial_takes(
+        job: Job, payload: JobPayload, partial: audio_pipeline.RenderPartial
+    ) -> list[dict]:
+        """Файлы и карточки кусков прерванного рендера — общая часть обоих путей."""
+        paths = audio_pipeline.export_partial_takes(payload.project_id, partial.pieces)
+        takes: list[dict] = []
+        count = min(len(paths), len(partial.pieces), len(payload.replicas), len(partial.segments))
+        for index in range(count):
+            replica = payload.replicas[index]
+            speaker = payload.speakers.get(replica.voice)
+            start, end = partial.segments[index]
+            takes.append(
+                {
+                    "index": index,
+                    "audio_path": str(paths[index]),
+                    "label": f"рендер {job.id} · {PARTIAL_TAKE_LABEL}",
+                    "seed": partial.seeds[index] if index < len(partial.seeds) else None,
+                    "engine": audio_pipeline.voice_engine(speaker.voice_id if speaker else ""),
+                    "parameters": audio_pipeline.chunk_parameters(replica, speaker)
+                    if speaker
+                    else {},
+                    "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
+                    "qa": partial.qa[index].to_dict()
+                    if index < len(partial.qa) and partial.qa[index] is not None
+                    else None,
+                    "quality": partial.qualities[index].to_dict()
+                    if index < len(partial.qualities) and partial.qualities[index] is not None
+                    else None,
+                }
+            )
+        return takes
 
     @staticmethod
     def _mark_project(

@@ -3,8 +3,14 @@
 Точечные лимиты (потоки torch/OMP, один воркер очереди, таймаут инференса)
 закрывают известные причины перерасхода, но не защищают от неизвестных:
 утечка в новой версии библиотеки, неучтённый параллелизм, разросшийся список
-кусков в памяти. Watchdog следит за RSS и прерывает текущую задачу, не убивая
+кусков в памяти. Watchdog следит за памятью и прерывает текущую задачу, не убивая
 процесс приложения.
+
+Картину памяти собирает `memory_monitor` (свой RSS + RSS воркеров синтеза +
+заполненность системы), а здесь остаются решения: ждать перед задачей
+(`is_memory_critical`, см. `job_queue._wait_for_memory`) или прервать идущую
+(`ResourceGuard`). Разделение важно: очередь не начинает новую работу в
+критическом состоянии, а watchdog останавливает ту, из-за которой оно наступило.
 """
 
 import asyncio
@@ -16,7 +22,7 @@ from collections.abc import Callable
 
 import psutil
 
-from . import config
+from . import config, memory_monitor
 
 logger = logging.getLogger("tts.resource_guard")
 
@@ -92,7 +98,25 @@ def check_system_memory_pressure() -> bool:
     на каждой итерации превратилось бы в спам. Решение о сообщении принимает
     вызывающий (см. `job_queue._wait_for_memory`).
     """
-    return psutil.virtual_memory().percent > config.SYSTEM_MEM_THRESHOLD_PERCENT
+    return memory_monitor.sample()["system_percent"] > config.SYSTEM_MEM_THRESHOLD_PERCENT
+
+
+def memory_state() -> dict:
+    """Состояние памяти целиком: для `/api/status` и объяснения пауз в очереди.
+
+    Отдаёт и числа, и причину: пользователю нужно не «CRITICAL», а «память
+    системы занята на 91 %», иначе непонятно, что закрывать.
+    """
+    return memory_monitor.get_state()
+
+
+def is_memory_critical() -> bool:
+    """Критическое состояние: новую тяжёлую работу не начинать.
+
+    Учитывает не только системный порог, но и RSS процессов синтеза — модель
+    живёт в воркере, и её вес в RSS бэкенда не виден (см. `memory_monitor`).
+    """
+    return memory_monitor.is_critical()
 
 
 class ResourceGuard:
@@ -106,12 +130,12 @@ class ResourceGuard:
     async def run(self) -> None:
         while True:
             await asyncio.sleep(CHECK_INTERVAL_SEC)
-            rss_mb = _proc().memory_info().rss / (1024 * 1024)
-            if rss_mb > config.MAX_RSS_MB:
+            state = memory_monitor.get_state()
+            if state["state"] == memory_monitor.STATE_CRITICAL:
                 self._breach_streak += 1
                 logger.warning(
-                    "RSS %.0f МБ > лимита %d МБ (%d/%d)",
-                    rss_mb, config.MAX_RSS_MB, self._breach_streak, SUSTAINED_BREACH_CHECKS,
+                    "Память: %s (%d/%d)",
+                    state["reason"], self._breach_streak, SUSTAINED_BREACH_CHECKS,
                 )
             else:
                 self._breach_streak = 0
@@ -122,7 +146,8 @@ class ResourceGuard:
                 if now - self._last_breach_at > 60:
                     self._last_breach_at = now
                     logger.error(
-                        "Устойчивое превышение памяти (%.0f МБ) — прерываю текущую задачу", rss_mb
+                        "Устойчивое превышение памяти (%s) — прерываю текущую задачу",
+                        state["reason"],
                     )
                     self._on_breach()
                 self._breach_streak = 0

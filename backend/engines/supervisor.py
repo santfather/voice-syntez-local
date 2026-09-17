@@ -172,6 +172,16 @@ class WorkerSupervisor:
             handles = list(self._handles.values())
         return [handle.to_dict() for handle in sorted(handles, key=lambda h: h.engine_id)]
 
+    def alive_pids(self) -> list[int]:
+        """PID живых воркеров — для учёта памяти (см. `memory_monitor`).
+
+        Без этой суммы watchdog видел бы только процесс бэкенда, а модели живут
+        в воркерах: их вес и есть главный потребитель памяти на машине.
+        """
+        with self._lock:
+            handles = list(self._handles.values())
+        return [pid for handle in handles if (pid := handle.pid) and handle.alive()]
+
     # -- запросы ---------------------------------------------------------------
     def request(self, engine_id: str, payload: dict, *, timeout: float) -> dict:
         """Отправляет запрос и возвращает ответ воркера.
@@ -449,6 +459,17 @@ class WorkerSupervisor:
             pending = handle.pending_failure
         if pending is not None and failure is None:
             return pending
+        if self._stopping:
+            # Воркер остановлен нами (выключение приложения): его смерть — не
+            # падение, и попадать в диагностику со счётчиком отказов она не
+            # должна. Иначе выключение портило бы статистику и состояние health.
+            logger.info(
+                "Воркер %s: завершение во время остановки приложения падением не считается",
+                handle.engine_id,
+            )
+            return failure or proto.WorkerCrashError(
+                message, engine=handle.engine_id, details=self._exit_info(handle)
+            )
         if kill:
             self._kill(handle.process)
         info = self._exit_info(handle)
@@ -616,6 +637,16 @@ class WorkerSupervisor:
             paths.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
         return env
+
+    def begin_shutdown(self) -> None:
+        """Помечает начало выключения: замены не поднимаются, отказы не считаются падениями.
+
+        Вызывается до остановки очереди. Без этого шага прерывание инференса при
+        выключении записывалось бы как аварийное завершение процесса и портило бы
+        диагностику: пользователь видел бы «воркер падал», хотя приложение просто
+        закрывали.
+        """
+        self._stopping = True
 
     def stop_all(self, grace: float | None = None) -> int:
         """Останавливает все воркеры. Возвращает число живых, которые были остановлены.

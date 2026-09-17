@@ -118,7 +118,13 @@ def workspace(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_memory_pressure(monkeypatch):
-    """Очередь не должна засыпать в ожидании свободной системной памяти."""
+    """Очередь не должна засыпать в ожидании свободной памяти.
+
+    Патчатся оба входа: `is_memory_critical` — то, чем пользуется очередь, и
+    `check_system_memory_pressure` — прежняя проверка, на которую опираются
+    отдельные тесты.
+    """
+    monkeypatch.setattr(job_queue.resource_guard, "is_memory_critical", lambda: False)
     monkeypatch.setattr(job_queue.resource_guard, "check_system_memory_pressure", lambda: False)
 
 
