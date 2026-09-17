@@ -786,6 +786,13 @@ footer b { color: #aaa8b0; font-weight: 400; }
 .dict-pair .dict-arrow { flex: 0 0 auto; color: var(--lime); }
 .dict-rule code { padding: 1px 5px; border-radius: 3px; background: #1b1b21; color: #d9caff; }
 
+/* --- предложения для словаря (вкладка «Сплошной текст») ------------------------ */
+/* Карточка кандидата: слово и группа, редактируемая замена, причина и действия.
+   Внешний вид совпадает с карточкой правила — это тот же словарь, только ещё
+   не подтверждённый. */
+.suggestion .field { margin-bottom: 0; }
+.suggestion .dict-pair { flex: 1 1 auto; }
+
 /* --- адаптив ------------------------------------------------------------------ */
 @media (max-width: 1180px) {
   .status-cluster { gap: 11px; }

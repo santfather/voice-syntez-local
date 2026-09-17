@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -133,6 +133,56 @@ def compile_rule(rule: PronunciationRule, supports_accents: bool = True) -> _Com
     return _CompiledRule(source=source, target=target, pattern=pattern)
 
 
+def compile_rules(
+    entries: PronunciationEntries = None,
+    supports_accents: bool = True,
+    *,
+    include_disabled: bool = False,
+) -> list[_CompiledRule]:
+    """Собирает регулярки правил в порядке применения.
+
+    `include_disabled` нужен шагам, которые смотрят на словарь как на «память»:
+    отклонённое пользователем правило выключено, но слово, которое оно покрывает,
+    повторно предлагать нельзя. Для самого применения правил выключенные
+    пропускаются всегда.
+
+    Порядок — длинный источник раньше короткого; при равной длине порядок
+    исходный: сортировка стабильна, и словарь не «переставляет» равные правила сам.
+    """
+    compiled: list[_CompiledRule] = []
+    if not entries:
+        return compiled
+    for value in _iter_entries(entries):
+        rule = _coerce_rule(value)
+        if rule is None:
+            logger.warning("Правило словаря пропущено (непонятный формат): %r", value)
+            continue
+        if not rule.enabled and not include_disabled:
+            continue
+        item = compile_rule(rule, supports_accents=supports_accents)
+        if item is not None:
+            compiled.append(item)
+    compiled.sort(key=lambda item: len(item.source), reverse=True)
+    return compiled
+
+
+def coverage_predicate(
+    entries: PronunciationEntries = None, *, include_disabled: bool = False
+) -> Callable[[str], bool]:
+    """Предикат «слово покрыто правилом словаря» — теми же шаблонами, что и замена.
+
+    Используется шагом восстановления «ё»: явное правило пользователя должно
+    побеждать автоматику. С `include_disabled=True` годится и для фильтра
+    предложений — выключенное правило остаётся памятью об отклонённом варианте.
+    """
+    compiled = compile_rules(entries, include_disabled=include_disabled)
+
+    def covered(word: str) -> bool:
+        return any(item.pattern.search(word) is not None for item in compiled)
+
+    return covered
+
+
 def apply_pronunciation_report(
     text: str, entries: PronunciationEntries = None, supports_accents: bool = True
 ) -> tuple[str, list[dict]]:
@@ -145,21 +195,7 @@ def apply_pronunciation_report(
     if not text or not entries:
         return text, []
 
-    compiled: list[_CompiledRule] = []
-    for value in _iter_entries(entries):
-        rule = _coerce_rule(value)
-        if rule is None:
-            logger.warning("Правило словаря пропущено (непонятный формат): %r", value)
-            continue
-        if not rule.enabled:
-            continue
-        item = compile_rule(rule, supports_accents=supports_accents)
-        if item is not None:
-            compiled.append(item)
-
-    # Длинный источник раньше короткого; при равной длине порядок исходный —
-    # сортировка стабильна, и словарь не «переставляет» равные правила сам.
-    compiled.sort(key=lambda item: len(item.source), reverse=True)
+    compiled = compile_rules(entries, supports_accents=supports_accents)
 
     matches: list[dict] = []
     for item in compiled:

@@ -19,6 +19,16 @@ def _tokens(text: str) -> list[str]:
     return re.split(r"(\s+)", text)
 
 
+# Граница предложения: знак конца или перевод строки. Модель ё-омографов читает
+# одно предложение за вызов — длинный текст она молча обрезала бы по лимиту входа.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def _sentences(text: str) -> list[str]:
+    """Куски текста по границам предложений — вход модели ё-омографов."""
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+
+
 def _is_manual(token: str) -> bool:
     """Слово, ударение в котором уже расставлено вручную."""
     return bool(token) and not token.isspace() and _MANUAL_STRESS_RE.search(token) is not None
@@ -172,6 +182,58 @@ class Accentizer:
                 pending.append(token)
         flush()
         return "".join(result)
+
+    # -- только чтение: источники предложений в словарь --------------------------
+    # Обе обёртки не поднимают модель (работают лишь когда она уже поднята) и молча
+    # возвращают None, если библиотека недоступна или сменила формат: предложения —
+    # вспомогательная функция, и она не имеет права уронить разбор текста.
+    def yo_homograph_scores(self, text: str) -> list[dict] | None:
+        """Предсказания модели ё-омографов вместе со `score` — или None.
+
+        `score` берётся только настоящий, из модели: если библиотека его не отдаёт,
+        источник предложений пропускается, а не получает выдуманную уверенность.
+
+        Модель читает одно предложение за вызов и обрезает слишком длинный вход,
+        поэтому текст режется по границам предложений, а результаты складываются.
+        Упавшее предложение пропускается — из-за одного сбоя терять остальные нельзя.
+        """
+        if not self.is_loaded:
+            return None
+        model = getattr(self._accent, "yo_homograph_model", None)
+        if model is None:
+            return None
+        result: list[dict] = []
+        for sentence in _sentences(text):
+            try:
+                entities = model.predict_yo_homographs(sentence)
+            except Exception as exc:  # noqa: BLE001 — недоступность модели не ошибка
+                logger.warning("Модель ё-омографов не ответила на предложение: %s", exc)
+                continue
+            if not isinstance(entities, list):
+                continue
+            for item in entities:
+                if not isinstance(item, dict):
+                    continue
+                word = item.get("word")
+                score = item.get("score")
+                if not isinstance(word, str) or not word:
+                    continue
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    continue
+                result.append(
+                    {"word": word, "score": float(score), "entity": str(item.get("entity", ""))}
+                )
+        return result
+
+    def yo_form(self, word: str) -> str | None:
+        """Ё-форма слова из словаря ruaccent (только чтение) или None."""
+        if not self.is_loaded:
+            return None
+        mapping = getattr(self._accent, "yo_homographs", None)
+        if not isinstance(mapping, dict):
+            return None
+        value = mapping.get(word.lower())
+        return value if isinstance(value, str) and value else None
 
 
 def accentuate(text: str) -> str:

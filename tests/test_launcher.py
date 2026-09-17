@@ -324,9 +324,29 @@ def test_install_needed_is_idempotent_until_requirements_change(tmp_path):
 
 
 # --- 7. .gitignore -------------------------------------------------------------
-def test_gitignore_ignores_logs_directory():
+def test_gitignore_ignores_root_runtime_directories():
+    """Рабочие каталоги в корне игнорируются, а одноимённые вложенные — нет.
+
+    Шаблон без ведущего «/» (`data/`) действует на любой глубине: однажды он
+    совпал с `backend/text_normalization/data/` и выкинул из репозитория словарь
+    восстановления «ё». Поэтому здесь проверяется не текст строки, а её смысл:
+    корневые каталоги игнорируются, вложенный `data/` — нет.
+    """
     lines = [line.strip() for line in (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
-    assert "logs/" in lines
+    assert "/logs/" in lines
+    for directory in ("/venv/", "/models/", "/voices/", "/output/", "/data/"):
+        assert directory in lines, f"корневой {directory} должен игнорироваться"
+
+    def ignored(relative: str) -> bool:
+        return subprocess.run(
+            ["git", "check-ignore", "-q", relative], cwd=PROJECT_ROOT, check=False
+        ).returncode == 0
+
+    assert ignored("data/voice_syntez.db"), "база проектов не должна попадать в git"
+    assert ignored("logs/voice_syntez.log")
+    assert not ignored("backend/text_normalization/data/yo_safe.tsv.gz"), (
+        "словарь «ё» обязан быть в репозитории: без него шаг не работает на чистой установке"
+    )
 
 
 # --- 8. run.sh не сломан -------------------------------------------------------

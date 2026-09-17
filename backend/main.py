@@ -61,8 +61,9 @@ from .model_manager import (
 )
 from .pronunciation import PronunciationConflict
 from .pronunciation import get_store as get_pronunciation_store
+from .pronunciation_suggest import build_suggestions
 from .resource_guard import ResourceGuard
-from .text_normalization import normalize, normalize_report
+from .text_normalization import PronunciationRule, normalize_stages
 from .voices_store import ALLOWED_AUDIO_SUFFIXES, MAX_AUDIO_BYTES, Voice, get_store
 
 logging.basicConfig(
@@ -848,6 +849,13 @@ class PronunciationPreviewRequest(BaseModel):
     engine: str | None = None
 
 
+class PronunciationSuggestionsRequest(BaseModel):
+    """Поиск кандидатов в словарь. `engine` необязателен и не поднимает TTS-модель."""
+
+    text: str
+    engine: str | None = None
+
+
 class TextPreviewRequest(BaseModel):
     """Что услышит модель: текст и движок, по которым показать все стадии.
 
@@ -914,11 +922,11 @@ async def delete_pronunciation(entry_id: int) -> dict:
 
 @app.post("/api/pronunciation/preview")
 async def preview_pronunciation(payload: PronunciationPreviewRequest) -> dict:
-    """Показывает стадии обработки текста: нормализация → словарь → движок.
+    """Показывает стадии обработки текста: нормализация → «ё» → словарь → движок.
 
     Ничего не пишет в базу и не поднимает TTS-движок: `engine` нужен только для
     флага `supports_accents` из паспорта, а не для синтеза. `matches` — какие
-    правила сработали и сколько раз.
+    правила сработали и сколько раз, `yo` — текст после восстановления «ё».
     """
     text = payload.text.strip()
     if not text:
@@ -940,9 +948,64 @@ async def preview_pronunciation(payload: PronunciationPreviewRequest) -> dict:
         supports_accents = info.supports_accents
 
     entries = get_pronunciation_store().active_rules()
-    normalized = normalize(text)
-    result, matches = normalize_report(text, entries, supports_accents=supports_accents)
-    return {"original": text, "normalized": normalized, "result": result, "matches": matches}
+    stages = normalize_stages(text, entries, supports_accents=supports_accents)
+    return {
+        "original": text,
+        "normalized": stages.normalized,
+        "yo": stages.yo,
+        "result": stages.result,
+        "matches": stages.matches,
+    }
+
+
+@app.post("/api/pronunciation/suggestions")
+async def suggest_pronunciation(payload: PronunciationSuggestionsRequest) -> dict:
+    """Слова, которые стоит уточнить: ё-омографы, омографы ударения и редкие.
+
+    Ничего не пишет и не синтезирует: TTS-движок не поднимается вовсе. RUAccent
+    может подняться (он и есть один из источников кандидатов), но его недоступность
+    не ошибка — источник просто пропускается. Подтверждение и отклонение идут через
+    обычный `POST /api/pronunciation`: отдельного хранилища у предложений нет.
+    """
+    text = payload.text.strip()
+    if not text:
+        # Пустой текст — не ошибка: панель предложений просто ничего не показывает.
+        return {"candidates": [], "considered": 0}
+    if len(text) > config.MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Текст длиннее {config.MAX_TEXT_CHARS} символов — сократите его",
+        )
+    supports_accents = True
+    if payload.engine:
+        info = ENGINE_INFOS.get(payload.engine)
+        if info is None:
+            known = ", ".join(sorted(ENGINE_INFOS))
+            raise HTTPException(
+                status_code=400,
+                detail=f"Неизвестный движок: {payload.engine}. Доступны: {known}",
+            )
+        supports_accents = info.supports_accents
+
+    # Правила берутся целиком, включая выключенные: отклонённое предложение должно
+    # оставаться памятью, иначе то же слово вернётся в панель на новом тексте.
+    rules = [
+        PronunciationRule(
+            source=row["source"],
+            target=row["target"],
+            case_sensitive=row["case_sensitive"],
+            whole_word=row["whole_word"],
+            enabled=row["enabled"],
+        )
+        for row in get_pronunciation_store().list_entries()
+    ]
+    report = await asyncio.to_thread(
+        build_suggestions,
+        text,
+        rules=rules,
+        supports_accents=supports_accents,
+    )
+    return report.to_dict()
 
 
 def _preview_source(payload: TextPreviewRequest) -> tuple[str, str, EngineInfo]:
@@ -1052,6 +1115,7 @@ async def preview_text_stages(payload: TextPreviewRequest) -> dict:
     return {
         "original": stages.original,
         "normalized": stages.normalized,
+        "yo": stages.yo,
         "dictionary": stages.dictionary,
         "accentized": stages.accentized,
         "final": stages.final,

@@ -159,13 +159,38 @@ def test_preview_f5_shows_all_stages(voices, fake_accent):
             # Числа развёрнуты ещё до словаря и ударений — общей нормализацией.
             assert "две тысячи двадцать шестом" in data["normalized"]
             assert "пять процентов" in data["normalized"]
-            # Ни одного правила словаря: стадия словаря равна нормализации.
-            assert data["dictionary"] == data["normalized"]
+            # Слов с гарантированной «ё» в тексте нет: стадия «ё» ничего не меняет,
+            # и это видно по равенству, а не по отсутствию ключа.
+            assert data["yo"] == data["normalized"]
+            # Ни одного правила словаря: стадия словаря равна стадии «ё».
+            assert data["dictionary"] == data["yo"]
             assert data["matches"] == []
             # Ударения — отдельная стадия, у F5 она отличима от словаря.
             assert data["accentized"] == f"[{data['dictionary']}]"
             assert data["final"] == data["accentized"]
             assert set(data["accentizer"]) == {"state", "error"}
+
+    _run(scenario)
+
+
+# --- 1a. стадия восстановления «ё» -----------------------------------------------
+def test_preview_shows_yo_restoration_stage(voices, fake_accent):
+    async def scenario():
+        async with _client() as client:
+            response = await _preview(
+                client, text="Идет ежик и 12 рублей", voice_id=XTTS_VOICE
+            )
+            assert response.status_code == 200, response.text
+            data = response.json()
+            # Нормализация показывает текст до «ё», стадия «ё» — после: по разнице
+            # видно, что шаг сработал, а не «просто так появился».
+            assert "ежик" in data["normalized"]
+            assert "ёжик" not in data["normalized"]
+            assert "ёжик" in data["yo"]
+            assert "Идёт" in data["yo"]
+            assert data["dictionary"] == data["yo"]
+            assert data["final"] == data["dictionary"]
+            assert "ёжик" in data["final"]
 
     _run(scenario)
 
@@ -275,6 +300,26 @@ def test_preview_matches_synthesis_input_for_xtts(voices, fake_accent, stub):
             )
             assert stub.calls[0]["text"] == data["final"]
             assert "+" not in stub.calls[0]["text"]
+
+    _run(scenario)
+
+
+def test_preview_matches_synthesis_input_with_yo(voices, fake_accent, stub):
+    """Стадия «ё» — не украшение preview: она ровно так же уходит в движок."""
+    text = "Идет ежик домой"
+
+    async def scenario():
+        async with _client() as client:
+            data = (await _preview(client, text=text, voice_id=XTTS_VOICE)).json()
+            await audio_pipeline.render_dialogue(
+                job_id="preview-yo",
+                replicas=[Replica(voice="#1", text=text, line_number=1)],
+                speakers={"#1": SpeakerSettings(voice_id=XTTS_VOICE)},
+                settings=RenderSettings(pause_ms=0, output_format="wav"),
+            )
+            assert stub.calls[0]["text"] == data["final"]
+            assert "ёжик" in stub.calls[0]["text"]
+            assert "Идёт" in stub.calls[0]["text"]
 
     _run(scenario)
 

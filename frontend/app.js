@@ -21,6 +21,7 @@ const state = {
   dictionary: [],      // правила словаря произношения: [{id, source, target, ...}]
   dictionaryLoaded: false, // словарь уже запрашивался (чтобы не мигать «загружаю»)
   dictionaryEditing: null, // id правила, которое правится в форме (null — новое)
+  suggestions: [],     // кандидаты в словарь для текста вкладки 03
   replicaPreview: {},  // индекс реплики -> {loading} | {data} | {error} для «что услышит модель»
   benchmark: {},       // voice_id -> состояние панели «сравнить движки»
   models: null,        // последний ответ /api/models: {models, disk}
@@ -796,7 +797,7 @@ function previewPanelHtml(config) {
     <div class="alert error" data-role="error"></div>
     <p class="hint muted" data-role="empty">
       Пока ничего не проверяли. Здесь появятся стадии: исходный текст → нормализация
-      → словарь произношения → ударения → итог. Синтез не запускается.
+      → восстановление «ё» → словарь произношения → ударения → итог. Синтез не запускается.
     </p>
     <div data-role="result" hidden></div>`;
 }
@@ -877,8 +878,19 @@ function previewStagesHtml(data) {
     ? stage('УДАРЕНИЯ (RUACCENT)', data.accentized) + accents
     : accents;
 
+  // Стадия «ё» показывается отдельно: «е» и «ё» — разные символы, и по равенству
+  // с нормализацией видно, сработал шаг или нет. Неоднозначные «е/ё» он не
+  // трогает намеренно — их уточняет панель предложений.
+  const yoChanged = data.yo !== data.normalized;
+  const yoNote = yoChanged
+    ? '<p class="hint muted" style="margin-top:6px">Бесспорные слова получили «ё»: '
+      + '«е» на месте «ё» модель прочитала бы как «е».</p>'
+    : '<p class="hint muted" style="margin-top:6px">Шаг ничего не изменил: слов '
+      + 'с гарантированной «ё» не нашлось (неоднозначные «е/ё» здесь не меняются).</p>';
+
   return stage('ИСХОДНЫЙ ТЕКСТ', data.original)
     + stage('НОРМАЛИЗАЦИЯ', data.normalized)
+    + stage('ВОССТАНОВЛЕНИЕ Ё', data.yo) + yoNote
     + stage('СЛОВАРЬ ПРОИЗНОШЕНИЯ', data.dictionary) + matches
     + accentStage
     + stage(`ИТОГ: ЧТО УСЛЫШИТ МОДЕЛЬ · ${esc(data.engine_label)}`, data.final);
@@ -962,6 +974,216 @@ async function previewReplica(index) {
     state.replicaPreview[index] = { error: error.message };
   }
   renderReplicaCards();
+}
+
+// --- предложения для словаря --------------------------------------------------
+// Кандидатов считает бэкенд тем же путём, что и preview («/api/pronunciation/
+// suggestions»), поэтому фронт ничего не пересчитывает. Подтверждение и отклонение
+// — обычные записи словаря через уже существующий CRUD: отдельного хранилища у
+// предложений нет. Отклонение создаёт выключенное правило с пометкой — оно
+// остаётся на вкладке 04 и работает памятью об отказе, поэтому слово больше
+// не предлагается (фильтр на бэкенде смотрит и на выключенные правила).
+const SUGGESTION_KINDS = {
+  yo_homograph: 'е/ё',
+  yo_low_confidence: 'е/ё · модель',
+  stress_homograph: 'ударение',
+  rare: 'редкое слово',
+};
+
+const CONFIRMED_NOTE = 'подтверждено в предложениях';
+const REJECTED_NOTE = 'отклонено в предложениях';
+
+function suggestionsEngineId() {
+  const voice = voiceById($('text-voice').value);
+  return voice ? voice.engine : null;
+}
+
+function resetSuggestions() {
+  state.suggestions = [];
+  $('suggestions-list').innerHTML = '';
+  $('btn-add-all-suggestions').hidden = true;
+}
+
+function renderSuggestions() {
+  const box = $('suggestions-list');
+  const addAll = $('btn-add-all-suggestions');
+  if (!state.suggestions.length) {
+    box.innerHTML = '';
+    addAll.hidden = true;
+    return;
+  }
+  addAll.hidden = false;
+  box.innerHTML = state.suggestions.map((item, index) => `
+    <div class="card suggestion" data-index="${index}">
+      <div class="row between">
+        <div class="dict-pair"><b>${esc(item.word)}</b><span class="dict-arrow">→</span></div>
+        <span class="tag">${esc(SUGGESTION_KINDS[item.kind] || item.kind)}</span>
+      </div>
+      <label class="field" style="margin:10px 0 0">
+        <span>Предлагаемая замена</span>
+        <input type="text" data-role="target" value="${esc(item.target)}"
+          placeholder="${item.target ? '' : 'впишите ударение, например «звон+ит»'}" />
+      </label>
+      <p class="hint muted" style="margin:8px 0 0">${esc(item.reason)}</p>
+      ${item.alternatives.length
+        ? `<div class="tag-row" style="margin:8px 0 0">${item.alternatives
+          .map((alt) => `<span class="tag">${esc(alt)}</span>`).join('')}</div>`
+        : ''}
+      <div class="row" style="margin-top:10px">
+        <button class="tiny" data-role="add">Добавить</button>
+        <button class="tiny ghost" data-role="reject">Отклонить</button>
+      </div>
+    </div>`).join('');
+}
+
+// Правки в полях живут в DOM: перед действием переносим их в состояние, иначе
+// «Добавить все» отправило бы первоначальные варианты, а не вписанные.
+function syncSuggestionTargets() {
+  document.querySelectorAll('#suggestions-list .suggestion').forEach((card) => {
+    const index = Number(card.dataset.index);
+    const input = card.querySelector('[data-role="target"]');
+    const item = state.suggestions[index];
+    if (input && item) state.suggestions[index] = { ...item, target: input.value.trim() };
+  });
+}
+
+async function findSuggestions() {
+  const text = $('text-body').value.trim();
+  const errorBox = $('suggestions-error');
+  showAlert(errorBox, '');
+  if (!text) {
+    resetSuggestions();
+    $('suggestions-empty').hidden = false;
+    showAlert(errorBox, 'Введите текст — искать слова не в чем');
+    return;
+  }
+  const button = $('btn-find-suggestions');
+  const status = $('suggestions-status');
+  button.disabled = true;
+  status.textContent = 'ищу…';
+  $('suggestions-empty').hidden = true;
+  $('suggestions-list').innerHTML = '<div class="muted" style="padding:6px 0">Прогоняю текст по стадиям…</div>';
+  try {
+    const data = await api('/api/pronunciation/suggestions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, engine: suggestionsEngineId() }),
+    });
+    state.suggestions = data.candidates;
+    renderSuggestions();
+    if (!state.suggestions.length) {
+      $('suggestions-empty').hidden = false;
+      $('suggestions-empty').textContent =
+        `Слов для уточнения не найдено: просмотрено ${data.considered} — все либо уже `
+        + 'в словаре, либо однозначны.';
+    }
+  } catch (error) {
+    resetSuggestions();
+    $('suggestions-empty').hidden = true;
+    showAlert(errorBox, error.message);
+  } finally {
+    button.disabled = false;
+    status.textContent = '';
+  }
+}
+
+// Общее для подтверждения, отклонения и «добавить все»: запись идёт в тот же
+// словарь, что и вкладка 04, поэтому после неё обновляются и словарь, и список.
+async function saveSuggestion(payload) {
+  await api('/api/pronunciation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ whole_word: true, case_sensitive: false, ...payload }),
+  });
+}
+
+async function confirmSuggestion(index) {
+  syncSuggestionTargets();
+  const item = state.suggestions[index];
+  if (!item) return;
+  showAlert($('suggestions-error'), '');
+  if (!item.target) {
+    showAlert($('suggestions-error'), 'Впишите замену — пустое правило ничего не меняет');
+    return;
+  }
+  const button = document.querySelector(`.suggestion[data-index="${index}"] [data-role="add"]`);
+  if (button) button.disabled = true;
+  try {
+    await saveSuggestion({
+      source: item.word, target: item.target, enabled: true, note: CONFIRMED_NOTE,
+    });
+  } catch (error) {
+    showAlert($('suggestions-error'), error.message);
+    if (button) button.disabled = false;
+    return;
+  }
+  await loadDictionary().catch(() => {});
+  await findSuggestions();
+}
+
+async function rejectSuggestion(index) {
+  syncSuggestionTargets();
+  const item = state.suggestions[index];
+  if (!item) return;
+  if (!confirm(`Отклонить «${item.word}»? Оно больше не будет предлагаться, `
+    + 'но останется в словаре выключенным правилом — его можно включить на вкладке «Словарь».')) {
+    return;
+  }
+  showAlert($('suggestions-error'), '');
+  try {
+    // Замена обязана быть непустой: у редкого слова её может не быть — берём само слово.
+    await saveSuggestion({
+      source: item.word,
+      target: item.target || item.word,
+      enabled: false,
+      note: REJECTED_NOTE,
+    });
+  } catch (error) {
+    showAlert($('suggestions-error'), error.message);
+    return;
+  }
+  await loadDictionary().catch(() => {});
+  await findSuggestions();
+}
+
+async function addAllSuggestions() {
+  syncSuggestionTargets();
+  const ready = state.suggestions.filter((item) => item.target);
+  const skipped = state.suggestions.length - ready.length;
+  const errorBox = $('suggestions-error');
+  showAlert(errorBox, '');
+  if (!ready.length) {
+    showAlert(errorBox, 'Ни у одного предложения нет готовой замены — заполните их вручную');
+    return;
+  }
+  const button = $('btn-add-all-suggestions');
+  const status = $('suggestions-status');
+  button.disabled = true;
+  status.textContent = 'добавляю…';
+  try {
+    // Последовательно, без промежуточной перерисовки: иначе индексы карточек
+    // разъехались бы с обновлённым списком.
+    for (const item of ready) {
+      await saveSuggestion({
+        source: item.word, target: item.target, enabled: true, note: CONFIRMED_NOTE,
+      });
+    }
+    await loadDictionary().catch(() => {});
+    await findSuggestions();
+    if (skipped > 0) {
+      showAlert(
+        errorBox,
+        `Пропущено предложений без замены: ${skipped} — у редких слов её нужно вписать вручную`,
+        'info',
+      );
+    }
+  } catch (error) {
+    showAlert(errorBox, error.message);
+    await loadDictionary().catch(() => {});
+  } finally {
+    button.disabled = false;
+    status.textContent = '';
+  }
 }
 
 // --- голоса -------------------------------------------------------------------
@@ -3781,6 +4003,18 @@ function bindEvents() {
   });
   $('text-rms').addEventListener('input', (e) => {
     $('text-rms-label').textContent = fmtRms(parseFloat(e.target.value));
+  });
+
+  // --- предложения для словаря (вкладка «Сплошной текст») ---
+  $('btn-find-suggestions').addEventListener('click', findSuggestions);
+  $('btn-add-all-suggestions').addEventListener('click', addAllSuggestions);
+  $('suggestions-list').addEventListener('click', (event) => {
+    const card = event.target.closest('.suggestion');
+    const button = event.target.closest('button');
+    if (!card || !button) return;
+    const index = Number(card.dataset.index);
+    if (button.dataset.role === 'add') confirmSuggestion(index);
+    if (button.dataset.role === 'reject') rejectSuggestion(index);
   });
 
   // --- вкладка «Словарь» ---

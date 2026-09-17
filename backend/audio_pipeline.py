@@ -27,7 +27,7 @@ from .settings_resolution import (
     resolve_synthesis_settings,
     split_values,
 )
-from .text_preprocess import normalize, normalize_report
+from .text_preprocess import normalize, normalize_stages
 from .transcribe import transcribe_audio, word_error_rate
 from .voices_store import Voice, get_store
 
@@ -480,14 +480,17 @@ class TextStages:
     ничего не изменила, её результат равен предыдущей — по этому равенству видно,
     что шаг сработал вхолостую (например, словарь без совпадений).
 
-    `matches` — отчёт словаря из того же прохода, что дал `dictionary`: preview не
-    может показать правило, которого не было, или пропустить сработавшее.
-    `accents_applied` — пытались ли вообще ставить ударения (RUAccent поднимается
-    только когда его просят и когда движок понимает «+»).
+    `yo` — отдельная стадия восстановления «ё»: она стоит между нормализацией и
+    словарём и видна пользователю, потому что замена «е» на «ё» меняет звучание, а
+    не только написание. `matches` — отчёт словаря из того же прохода, что дал
+    `dictionary`: preview не может показать правило, которого не было, или
+    пропустить сработавшее. `accents_applied` — пытались ли вообще ставить ударения
+    (RUAccent поднимается только когда его просят и когда движок понимает «+»).
     """
 
     original: str
     normalized: str
+    yo: str
     dictionary: str
     accentized: str
     final: str
@@ -510,11 +513,15 @@ def preview_text(
     реально уходит в движок, — совпадение обеспечено конструкцией, а не дисциплиной
     двух реализаций.
 
-    Порядок важен и повторяет план фазы 6: нормализация → пользовательский словарь
-    → RUAccent. Правила словаря берутся из сервиса (снимок в памяти, не чтение базы
-    на каждый кусок), а флаг `supports_accents` решает, дойдут ли «+» из замены до
-    движка: XTTS прочитала бы знак как отдельный символ, поэтому для неё словарь
-    отдаёт замену без разметки.
+    Порядок важен и повторяет план фаз 6–8: нормализация → восстановление «ё» →
+    пользовательский словарь → RUAccent. Правила словаря берутся из сервиса (снимок
+    в памяти, не чтение базы на каждый кусок), а флаг `supports_accents` решает,
+    дойдут ли «+» из замены до движка: XTTS прочитала бы знак как отдельный символ,
+    поэтому для неё словарь отдаёт замену без разметки.
+
+    Все стадии — срезы одного прохода `normalize_stages`: отдельные прогоны однажды
+    разошлись бы, и preview показал бы не то, что ушло в модель. «Ё» здесь
+    детерминированное и неоднозначные омографы не трогает — их разрешает словарь.
 
     RUAccent получает уже развёрнутые числа: «12» должно стать «двена́дцать», а не
     остаться цифрами. Ударения — только у движков, которые их понимают
@@ -524,19 +531,17 @@ def preview_text(
     """
     if rules is None:
         rules = active_rules()
-    normalized = normalize(text)
-    dictionary, matches = normalize_report(
-        text, rules, supports_accents=supports_accents
-    )
+    stages = normalize_stages(text, rules, supports_accents=supports_accents)
     accents_applied = bool(auto_accent and supports_accents)
-    accentized = accentuate(dictionary) if accents_applied else dictionary
+    accentized = accentuate(stages.result) if accents_applied else stages.result
     return TextStages(
         original=text,
-        normalized=normalized,
-        dictionary=dictionary,
+        normalized=stages.normalized,
+        yo=stages.yo,
+        dictionary=stages.result,
         accentized=accentized,
         final=accentized,
-        matches=matches,
+        matches=stages.matches,
         supports_accents=supports_accents,
         accents_applied=accents_applied,
     )

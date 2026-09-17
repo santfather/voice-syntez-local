@@ -20,23 +20,28 @@ from .numbers import (
     expand_phones,
     expand_roman,
 )
-from .pipeline import normalize, normalize_report
-from .pronunciation import PronunciationRule, apply_pronunciation
+from .pipeline import NormalizeStages, normalize, normalize_report, normalize_stages
+from .pronunciation import PronunciationRule, apply_pronunciation, coverage_predicate
+from .yo_restoration import restore_yo
 
 __all__ = [
     "YEAR_CASE_BY_TAIL",
     "YEAR_RANGE",
+    "NormalizeStages",
     "PronunciationRule",
     "agree",
     "agree_decimal",
     "apply_pronunciation",
     "cardinal",
+    "coverage_predicate",
     "expand_numbers",
     "expand_phones",
     "expand_roman",
     "normalize",
     "normalize_report",
+    "normalize_stages",
     "numeral_case",
     "ordinal",
     "plural_form",
+    "restore_yo",
 ]
