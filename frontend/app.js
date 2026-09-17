@@ -9,6 +9,7 @@ const state = {
   project: null,       // проект диалога: исходный текст, спикеры, реплики и варианты
   sourceDirty: false,  // исходный текст правили после последнего разбора
   openDetails: {},     // индекс реплики -> раскрыт ли блок «ещё настройки»
+  preparedDetails: {}, // индекс реплики -> раскрыт ли блок «подготовленный текст»
   speakerDetails: {},  // ключ спикера -> раскрыт ли блок «ещё настройки голоса»
   replicaBusy: null,   // индекс реплики, которая синтезируется прямо сейчас
   replicaJobId: null,  // задача этого пересинтеза — по ней работает отмена
@@ -3391,10 +3392,75 @@ function replicaCardHtml(replica) {
         ${replicaSliderHtml(replica, 'target_rms', 'Целевая громкость (RMS)', PARAM_RANGES.target_rms)}
       </details>
 
+      ${replicaPreparedHtml(replica)}
+
       ${takesHtml(replica)}
 
       ${replicaPreviewHtml(replica)}
     </div>`;
+}
+
+// Подготовленный текст реплики: то, что реально уйдёт в модель, и предупреждения.
+// Отдельно от панели «Что услышит модель»: та считает стадии заново (полезно при
+// подборе параметров), а здесь — **сохранённый** результат анализа, по которому и
+// пойдёт рендер. Разойтись они не могут, но показывают разное: preview отвечает
+// «что будет», этот блок — «что уже зафиксировано».
+const REPLICA_ANALYSIS_LABELS = {
+  pending: 'ждёт анализа',
+  done: 'подготовлено',
+  error: 'ошибка подготовки',
+};
+
+function replicaPreparedHtml(replica) {
+  const status = replica.analysis_status || 'pending';
+  const label = REPLICA_ANALYSIS_LABELS[status] || status;
+  const candidates = replica.pronunciation_candidates || [];
+  const matches = replica.dictionary_matches || [];
+  const warnings = [];
+  if (status === 'error') {
+    warnings.push(replica.analysis_error || 'реплику не удалось подготовить');
+  }
+  if (status === 'done' && replica.auto_accent && replica.supports_accents === false) {
+    warnings.push(
+      `движок «${engineLabel(replica.engine)}» не поддерживает ударения — текст уйдёт без разметки`
+    );
+  }
+  if (candidates.length) {
+    warnings.push(
+      `слов на проверку: ${candidates.length} (${candidates.map((item) => item.word).join(', ')})`
+    );
+  }
+  const stage = (title, body) => `
+    <p class="eyebrow" style="margin:10px 0 4px">${title}</p>
+    <blockquote class="ref-phrase">${esc(body || '—')}</blockquote>`;
+  const final = replica.final_text || '';
+  const body = status === 'pending'
+    ? '<p class="hint muted" style="margin-top:6px">Реплика ещё не проанализирована: нажмите «Анализировать диалог». Рендер её не возьмёт.</p>'
+    : status === 'error'
+    ? '<p class="hint muted" style="margin-top:6px">Подготовка не удалась — текста для модели нет. '
+      + 'Устраните причину и запустите анализ ещё раз.</p>'
+    : stage('Исходный текст', replica.source_text || replica.text)
+      + stage('Нормализация', replica.normalized_text)
+      + stage('Восстановление ё', replica.yo_text)
+      + stage('Словарь произношения', replica.dictionary_text)
+      + stage(
+          replica.supports_accents ? 'Ударения' : 'Ударения (движок не поддерживает)',
+          replica.accentized_text
+        )
+      + stage('Уйдёт в модель', final)
+      + (matches.length
+        ? `<div class="tag-row" style="margin-top:6px">${matches.map((match) => (
+            `<span class="tag">${esc(match.source)} → ${esc(match.target)} ×${match.count}</span>`
+          )).join('')}</div>`
+        : '<p class="hint muted" style="margin-top:6px">Словарь эту реплику не менял.</p>');
+  return `
+    <details class="advanced prepared"${state.preparedDetails[replica.index] ? ' open' : ''}>
+      <summary>Подготовленный текст: ${esc(label)}</summary>
+      ${warnings.length
+        ? `<div class="alert info">${warnings.map((item) => esc(item)).join('<br />')}</div>`
+        : ''}
+      ${body}
+    </details>`;
 }
 
 // --- прослушивание вариантов реплик -------------------------------------------
@@ -4320,7 +4386,11 @@ function bindReplicaCards() {
   box.addEventListener('toggle', (event) => {
     const details = event.target.closest('.replica-card details.advanced');
     if (!details) return;
-    state.openDetails[details.closest('.replica-card').dataset.index] = details.open;
+    const index = details.closest('.replica-card').dataset.index;
+    // У блока подготовки своё состояние раскрытия: общий флаг открывал бы вместе
+    // с ним и «ещё настройки» — два разных вопроса с одним ответом.
+    if (details.classList.contains('prepared')) state.preparedDetails[index] = details.open;
+    else state.openDetails[index] = details.open;
   }, true);
 
   const takePlayer = $('take-player');
