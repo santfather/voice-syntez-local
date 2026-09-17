@@ -1837,8 +1837,49 @@ Gold-корпус (фаза 2 из 7) лежит в `benchmarks/russian_linguist
 ollama --version           # демон и CLI
 ollama list                # что уже скачано
 ./venv/bin/python tools/build_llm_dataset.py --check   # корпус: spans и категории
-./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py tests/test_llm_benchmark_metrics.py tests/test_llm_benchmark_memory.py tests/test_llm_benchmark_runner.py -q
+./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py tests/test_llm_benchmark_metrics.py tests/test_llm_benchmark_memory.py tests/test_llm_benchmark_runner.py tests/test_llm_benchmark_cli.py -q
 ```
+
+Прогон benchmark'а (фаза 5 из 7) — одним CLI `tools/llm_benchmark.py`:
+
+```bash
+# верхняя граница без моделей и сети: проверяет gold, prompt, метрики и отчёты
+./venv/bin/python tools/llm_benchmark.py --dry-run
+
+# smoke на 15 кейсах: модели отвечают, память в норме, JSON стабилен
+./venv/bin/python tools/llm_benchmark.py --smoke
+
+# полный прогон четырёх обязательных моделей (с продолжением после сбоя)
+./venv/bin/python tools/llm_benchmark.py --full --resume
+
+# выбрать одну модель, категорию или ограничить объём
+./venv/bin/python tools/llm_benchmark.py --model qwen3:8b --category yo,homograph --limit 40
+
+# baseline для будущих сравнений: сохранить и потом сравнивать
+./venv/bin/python tools/llm_benchmark.py --full --save-baseline --baseline-model qwen3:8b
+./venv/bin/python tools/llm_benchmark.py --full --compare-baseline
+```
+
+Результаты полного прогона, smoke и `--dry-run` лежат в разных подкаталогах
+(`benchmarks/russian_linguistics/results/{full,smoke,dry-run}/`), поэтому smoke не портит
+baseline. В каталоге модели — `raw.jsonl` (сырые ответы, они же состояние для `--resume`),
+`metrics.json` (метрики + паспорт прогона) и `run.json` (версии, git-коммит, ОС, чип,
+память, версия Ollama, тег и digest модели, контекст, temperature, seed); сводка по всем
+моделям — `benchmark.json`. Код возврата неполного прогона (модель отсутствует, память
+запретила запуск, HARD STOP) — 1, ошибки запуска — 2, поэтому автоматика не примет
+частичный прогон за полный.
+
+`--dry-run` идёт через подставной клиент и **не поднимает моделей**: политика памяти к нему
+не применяется, иначе проверка gold зависела бы от того, что ещё запущено на машине. Ответ
+идеальной модели обязан давать ровно 100 % по всем метрикам — это проверка gold и метрик,
+а не модели; тест `test_benchmark_dry_run_full_corpus_is_a_clean_upper_bound` прогоняет так
+весь корпус (339 кейсов × 4 модели) и уже нашёл одну ошибку в gold.
+
+Пороги памяти можно поднять/опустить без правки кода: `LLM_MEMORY_NORMAL_MAX_PERCENT`,
+`LLM_MEMORY_WARNING_PERCENT`, `LLM_MEMORY_CRITICAL_PERCENT`, `LLM_MEMORY_HARD_STOP_PERCENT`,
+`LLM_MEMORY_RESERVE_GB`, `LLM_MEMORY_RESERVE_MIN_GB`. Список кейсов, которые должен
+подтвердить человек до полного прогона, генерируется в
+`benchmarks/russian_linguistics/expected/review.md`.
 
 ## API
 

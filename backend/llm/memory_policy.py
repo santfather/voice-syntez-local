@@ -310,6 +310,29 @@ def read_sensors() -> dict:
     }
 
 
+def bypass_decision(reason: str, *, thresholds: MemoryThresholds | None = None) -> MemoryDecision:
+    """Решение «проверка памяти не применяется».
+
+    Нужно там, где тяжёлая модель не поднимается вовсе — например, `--dry-run`
+    benchmark'а (подставной клиент) или проверка gold. Гонять такую проверку через
+    политику памяти значило бы делать её результат зависимым от того, что ещё
+    запущено на машине, а модели при этом никто не грузит.
+    """
+    return MemoryDecision(
+        level=LEVEL_NORMAL,
+        reason=reason,
+        allow_heavy_start=True,
+        allow_llm_start=True,
+        unload_recommended=False,
+        log_growth=False,
+        system_percent=0.0,
+        available_gb=0.0,
+        pressure=PRESSURE_UNKNOWN,
+        thresholds=thresholds or MemoryThresholds(),
+        sensor_ok=False,
+    )
+
+
 def decide_current(
     *,
     model_size_gb: float | None = None,

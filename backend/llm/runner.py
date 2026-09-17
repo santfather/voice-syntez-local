@@ -160,6 +160,7 @@ class BenchmarkRunner:
         thresholds: memory.MemoryThresholds | None = None,
         sensor: memory.Sensor | None = None,
         max_repairs: int = DEFAULT_MAX_REPAIRS,
+        check_memory: bool = True,
         dataset_version: str = "1",
         on_progress: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -178,6 +179,10 @@ class BenchmarkRunner:
         self.thresholds = thresholds or memory.thresholds_from_env()
         self.sensor = sensor
         self.max_repairs = max_repairs
+        # `check_memory=False` — только для путей без настоящей модели (--dry-run):
+        # там политика памяти не защищает ни от чего, зато делает результат
+        # зависимым от загрузки машины.
+        self.check_memory = check_memory
         self.dataset_version = dataset_version
         self.on_progress = on_progress or (lambda message: logger.info("%s", message))
         self.clock = clock
@@ -264,9 +269,15 @@ class BenchmarkRunner:
             self.on_progress(f"{model}: пропуск — {exc}")
             return ModelRunResult(model=model, status="missing", reason=str(exc))
 
-        decision = memory.decide_current(
-            model_size_gb=info.size_gb, thresholds=self.thresholds, sensor=self.sensor
-        )
+        if self.check_memory:
+            decision = memory.decide_current(
+                model_size_gb=info.size_gb, thresholds=self.thresholds, sensor=self.sensor
+            )
+        else:
+            decision = memory.bypass_decision(
+                "проверка памяти отключена: модели не поднимаются (dry-run)",
+                thresholds=self.thresholds,
+            )
         self.on_progress(f"{model}: память {decision.level} — {decision.reason}")
         if not decision.allow_llm_start:
             # HARD STOP останавливает весь benchmark: если памяти нет сейчас, её не
@@ -312,7 +323,7 @@ class BenchmarkRunner:
                         run = self._run_case(model, case, repeat_index, cancel=cancel)
                         reports.append(run)
                         self._append_jsonl(raw_path, run.to_dict())
-                    sample = self._sample_memory()
+                    sample = self._sample_memory() if self.check_memory else {}
                     memory_samples.append(sample)
                     peak_rss = max(peak_rss, float(sample.get("rss_mb") or 0.0))
                     peak_percent = max(peak_percent, float(sample.get("system_percent") or 0.0))
@@ -320,7 +331,10 @@ class BenchmarkRunner:
                         pressure_events += 1
                     # Модель уже загружена: если память ушла в CRITICAL/HARD STOP,
                     # дальше не идём — иначе прогон начнёт влиять на свои же замеры.
-                    if sample.get("level") in (memory.LEVEL_CRITICAL, memory.LEVEL_HARD_STOP):
+                    if sample.get("level") in (
+                        memory.LEVEL_CRITICAL,
+                        memory.LEVEL_HARD_STOP,
+                    ):
                         self.on_progress(
                             f"{model}: прогон остановлен на кейсе {case.id} — "
                             + f"{sample.get('reason')}"
@@ -348,7 +362,8 @@ class BenchmarkRunner:
             "peak_process_memory": round(peak_rss, 1),
             "peak_system_memory_percent": round(peak_percent, 1),
             "memory_pressure_events": pressure_events,
-            "samples": len(memory_samples),
+            # Считаются только реальные замеры: при dry-run их нет вовсе.
+            "samples": sum(1 for sample in memory_samples if sample),
             "decision": decision.to_dict(),
         }
         # Метрики считаются по всем ответам модели (в том числе дописанным в
@@ -610,7 +625,12 @@ def _process_rss_mb() -> float:
         return 0.0
 
 
-def dry_run_client(cases: Sequence[s.DatasetCase], **kwargs) -> FakeOllamaClient:
+def dry_run_client(
+    cases: Sequence[s.DatasetCase],
+    *,
+    model_tags: Iterable[str] | None = None,
+    **kwargs,
+) -> FakeOllamaClient:
     """Клиент для `--dry-run`: отвечает gold без моделей и сети.
 
     Он повторяет **идеальную** модель: gold-аннотации и gold-класс реплики. Это
@@ -624,6 +644,16 @@ def dry_run_client(cases: Sequence[s.DatasetCase], **kwargs) -> FakeOllamaClient
         for case in cases
         if case.expected_utterance
     }
+    if model_tags is not None:
+        # Для memory policy у подставных моделей должен быть правдоподобный
+        # размер: иначе dry-run проверял бы не тот путь решения о памяти.
+        kwargs.setdefault(
+            "models",
+            [
+                OllamaModel(tag=tag, digest=f"dry-run-{index}", size_bytes=4 * 1024**3)
+                for index, tag in enumerate(model_tags)
+            ],
+        )
     return FakeOllamaClient(
         gold_by_replica=gold, utterance_by_replica=utterances, **kwargs
     )
