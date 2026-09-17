@@ -11,7 +11,8 @@ from __future__ import annotations
 import pytest
 from conftest import F5_VOICE, XTTS_VOICE  # noqa: F401 — общие идентификаторы голосов
 
-from backend import audio_pipeline, config, short_utterance as su
+from backend import audio_pipeline, config
+from backend import short_utterance as su
 from backend.dialogue_parser import Replica
 
 
@@ -422,3 +423,97 @@ def test_synthesis_input_is_logged_with_full_context(caplog, voices):
     # Текст реплики попадает в лог отпечатком: длина, sha1 и короткая выжимка.
     assert "Прив+ет!" in line
     assert "sha1" in line
+
+
+# --- Phase 5: short QA и ограниченный повтор ------------------------------------
+def _tone(seconds: float, amplitude: float = 0.2):
+    import numpy as np
+
+    timeline = np.arange(int(audio_pipeline.SAMPLE_RATE * seconds), dtype=np.float32)
+    timeline = timeline / audio_pipeline.SAMPLE_RATE
+    return (amplitude * np.sin(2 * np.pi * 180.0 * timeline)).astype(np.float32)
+
+
+def test_short_audio_empty_result_is_rejected():
+    """Пустое аудио — провал, а не «короткая реплика»."""
+    import numpy as np
+
+    verdict = su.check_chunk(np.zeros(0, dtype=np.float32), "Да.")
+    assert verdict.ok is False
+    assert su.REASON_EMPTY in verdict.reasons
+    assert "пустое аудио" in su.describe_short_reasons(list(verdict.reasons))
+
+
+def test_short_audio_silence_and_tiny_duration_are_rejected():
+    import numpy as np
+
+    silence = su.check_chunk(np.zeros(audio_pipeline.SAMPLE_RATE // 2, dtype=np.float32), "Да.")
+    assert silence.ok is False
+    assert su.REASON_SILENCE in silence.reasons
+
+    tiny = su.check_chunk(_tone(0.05), "Да.")
+    assert tiny.ok is False
+    assert su.REASON_DURATION_SHORT in tiny.reasons
+
+
+def test_short_audio_repetition_is_detected():
+    """«Да, да, да…» — главный дефект короткой реплики, и он виден по расшифровке."""
+    verdict = su.check_chunk(_tone(1.2), "Да.", transcription="Да, да, да!")
+    assert verdict.ok is False
+    assert su.REASON_REPETITION in verdict.reasons
+    assert su.REASON_DURATION_LONG in verdict.reasons
+
+
+def test_short_audio_missing_and_extra_words_are_detected():
+    missing = su.check_chunk(_tone(0.4), "До встречи!", transcription="Встречи!")
+    assert su.REASON_MISSING_WORDS in missing.reasons
+
+    extra = su.check_chunk(_tone(0.4), "Да.", transcription="Да, конечно, хорошо")
+    assert su.REASON_EXTRA_WORDS in extra.reasons
+
+
+def test_short_audio_normal_result_passes():
+    assert su.check_chunk(_tone(0.45), "Да.").ok is True
+    assert su.check_chunk(_tone(0.45), "Да.", transcription="Да.").ok is True
+    # Ожидаемая длительность считается от текста, а не задана одним числом.
+    assert su.expected_duration(3) < su.expected_duration(12)
+
+
+def test_short_long_audio_for_tiny_phrase_is_rejected():
+    """Растянутое аудио для «Да.» — тоже дефект, а не «богатая интонация»."""
+    verdict = su.check_chunk(_tone(3.0), "Да.", transcription="Да.")
+    assert su.REASON_DURATION_LONG in verdict.reasons
+
+
+def test_short_failed_qa_can_retry():
+    failed = su.check_chunk(_tone(3.0), "Да.", transcription="Да.")
+    assert su.should_retry_short(attempt=1, max_attempts=2, verdict=failed) is True
+
+
+def test_short_successful_qa_does_not_retry():
+    passed = su.check_chunk(_tone(0.45), "Да.")
+    assert su.should_retry_short(attempt=1, max_attempts=3, verdict=passed) is False
+
+
+def test_short_retry_is_limited():
+    """Повтор ограничен: генерация «десятков вариантов» — не решение (§18)."""
+    failed = su.check_chunk(_tone(3.0), "Да.", transcription="Да.")
+    assert su.should_retry_short(attempt=1, max_attempts=2, verdict=failed) is True
+    assert su.should_retry_short(attempt=2, max_attempts=2, verdict=failed) is False
+    assert su.should_retry_short(attempt=5, max_attempts=2, verdict=failed) is False
+    # Без вердикта повтора нет: проверка не гонялась — повторять нечего.
+    assert su.should_retry_short(attempt=1, max_attempts=3, verdict=None) is False
+    # Нулевой лимит не превращается в бесконечный цикл.
+    assert su.should_retry_short(attempt=0, max_attempts=0, verdict=failed) is False
+
+
+def test_best_attempt_is_chosen_by_reasons_then_wer():
+    """Из попыток берётся лучшая: меньше причин, затем ниже WER."""
+    good = su.ShortVerdict(ok=True, reasons=(), wer=0.0)
+    bad_two = su.ShortVerdict(ok=False, reasons=(su.REASON_REPETITION, su.REASON_DURATION_LONG))
+    bad_one = su.ShortVerdict(ok=False, reasons=(su.REASON_REPETITION,))
+    assert su.best_verdict([bad_two, good, bad_one]) == 1
+    assert su.best_verdict([bad_two, bad_one]) == 1  # у одной причины приоритет
+    close_a = su.ShortVerdict(ok=False, reasons=(su.REASON_REPETITION,), wer=0.5)
+    close_b = su.ShortVerdict(ok=False, reasons=(su.REASON_REPETITION,), wer=0.1)
+    assert su.best_verdict([close_a, close_b]) == 1

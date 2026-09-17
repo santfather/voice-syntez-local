@@ -31,6 +31,8 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 
+import numpy as np
+
 from . import config
 
 logger = logging.getLogger(__name__)
@@ -572,3 +574,172 @@ def resolve_strategy(engine_id: str, requested: str) -> str:
     if requested not in STRATEGIES:
         raise ValueError(f"Неизвестная стратегия короткой реплики: {requested}")
     return requested
+
+
+# --- short QA (§20, §21) ------------------------------------------------------
+# Причины повтора — коды, а не фразы: их читает и лог, и интерфейс (переводит в
+# подписи), и тесты (сравнивают точно).
+REASON_EMPTY = "empty"
+REASON_SILENCE = "silence"
+REASON_DURATION_SHORT = "duration_short"
+REASON_DURATION_LONG = "duration_long"
+REASON_REPETITION = "repetition"
+REASON_MISSING_WORDS = "missing_words"
+REASON_EXTRA_WORDS = "extra_words"
+
+# Русские подписи — для лога и сообщения в интерфейсе.
+REASON_TITLES = {
+    REASON_EMPTY: "движок вернул пустое аудио",
+    REASON_SILENCE: "почти вся реплика — тишина",
+    REASON_DURATION_SHORT: "слишком короткое аудио для этого текста",
+    REASON_DURATION_LONG: "слишком длинное аудио: речь растянута или повторяется",
+    REASON_REPETITION: "слово повторяется в озвучке",
+    REASON_MISSING_WORDS: "в озвучке не слышно части слов",
+    REASON_EXTRA_WORDS: "в озвучке слышны лишние слова",
+    # Причины отбора `qa_screening` приходят как есть: они уже названы.
+    "too_short": "аудио короче нижней границы",
+    "level": "уровень вне допустимого диапазона",
+    "clipping": "перегруз: пик упирается в потолок",
+}
+
+
+def describe_short_reasons(reasons: list[str]) -> str:
+    """Причины одной строкой по-русски."""
+    return ", ".join(REASON_TITLES.get(reason, reason) for reason in reasons)
+
+
+def expected_duration(chars: int, *, chars_per_sec: float | None = None) -> float:
+    """Ожидаемая длительность реплики по длине текста.
+
+    Одно число на все короткие реплики неверно: «Да.» и «До встречи!» различаются
+    втрое. Скорость берётся из того же ориентира, что у отбора кусков
+    (`QA_SCREEN_CHARS_PER_SEC`), — второй ориентир однажды разошёлся бы с первым.
+    """
+    rate = chars_per_sec or config.SHORT_UTTERANCE_CHARS_PER_SEC
+    return max(chars, 1) / max(rate, 1.0)
+
+
+@dataclass(frozen=True)
+class ShortVerdict:
+    """Вердикт короткой реплики: годна ли она и почему нет."""
+
+    ok: bool
+    reasons: tuple[str, ...] = ()
+    duration_sec: float = 0.0
+    expected_sec: float = 0.0
+    wer: float | None = None
+    transcription: str = ""
+
+    @property
+    def score(self) -> tuple[int, float]:
+        """Ключ выбора лучшей попытки: меньше причин, затем ниже WER.
+
+        Знаки у обоих слагаемых отрицательные, потому что выбирается максимум:
+        «−причины» и «−WER» — так больше значит лучше.
+        """
+        return (-len(self.reasons), -(self.wer if self.wer is not None else 1.0))
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "reasons": list(self.reasons),
+            "duration_sec": round(self.duration_sec, 3),
+            "expected_sec": round(self.expected_sec, 3),
+            "wer": self.wer,
+        }
+
+
+def _words(text: str) -> list[str]:
+    """Слова для сравнения «что просили» и «что услышали»."""
+    return [word.lower() for word in _WORD_RE.findall(_without_accents(text))]
+
+
+def check_chunk(
+    chunk: np.ndarray,
+    expected_text: str,
+    *,
+    transcription: str | None = None,
+    wer: float | None = None,
+    min_duration_sec: float | None = None,
+) -> ShortVerdict:
+    """Короткая реплика: дешёвый отбор + проверки, специфичные для короткого текста.
+
+    Почему не хватает обычного QA. На «Да.» одна ошибка распознавания даёт WER 1.0,
+    и порог по WER либо валит нормальную реплику, либо пропускает «Да, да, да…»;
+    поэтому причины проверяются отдельно и по-человечески: пустое аудио, тишина,
+    аномальная длительность (в любую сторону), повтор слова, потерянные и лишние
+    слова. Расшифровка не обязательна: без неё проверяются waveform и длительность,
+    а с ней — ещё и слова. Это позволяет обойтись без лишнего запуска Whisper там,
+    где он не нужен (см. `_synthesize_checked`).
+
+    Порог длительности считается от текста, а не задаётся одним числом для всех
+    реплик: «Да.» и «До встречи!» должны иметь разные границы.
+    """
+    from . import qa_screening
+
+    y = np.asarray(chunk, dtype=np.float32).reshape(-1)
+    duration = y.size / 24000.0
+    expected = expected_duration(count_chars(expected_text))
+    reasons: list[str] = []
+
+    screening = qa_screening.screen_chunk(y, expected_text)
+    for reason in screening.reasons:
+        if reason == qa_screening.REASON_REPEAT:
+            reasons.append(REASON_REPETITION)
+        else:
+            reasons.append(reason)
+
+    floor = config.SHORT_UTTERANCE_MIN_DURATION_SEC if min_duration_sec is None else min_duration_sec
+    lower = max(floor, expected * config.SHORT_UTTERANCE_MIN_DURATION_RATIO)
+    if duration < lower and REASON_DURATION_SHORT not in reasons and REASON_EMPTY not in reasons:
+        reasons.append(REASON_DURATION_SHORT)
+    if duration > expected * config.QA_SCREEN_LONG_RATIO and REASON_DURATION_LONG not in reasons:
+        reasons.append(REASON_DURATION_LONG)
+
+    if transcription is not None and transcription.strip():
+        target_words = _words(expected_text)
+        heard_words = _words(transcription)
+        heard_set = set(heard_words)
+        target_set = set(target_words)
+        if any(word not in heard_set for word in target_words):
+            reasons.append(REASON_MISSING_WORDS)
+        if any(word not in target_set for word in heard_words):
+            reasons.append(REASON_EXTRA_WORDS)
+        # «Да, да, да…»: слово, которое в тексте встречается один раз, а в озвучке
+        # повторяется — самый частый дефект коротких реплик.
+        for word in target_words:
+            if heard_words.count(word) >= 3 and target_words.count(word) <= 1:
+                reasons.append(REASON_REPETITION)
+                break
+
+    # Порядок причин стабилен: один и тот же дефект даёт одну и ту же строку.
+    unique = tuple(dict.fromkeys(reasons))
+    return ShortVerdict(
+        ok=not unique,
+        reasons=unique,
+        duration_sec=duration,
+        expected_sec=expected,
+        wer=wer,
+        transcription=transcription or "",
+    )
+
+
+def should_retry_short(*, attempt: int, max_attempts: int, verdict: ShortVerdict | None) -> bool:
+    """Нужен ли повтор короткой реплики (§19).
+
+    Повтор даётся только на проваленном вердикте и только в пределах лимита:
+    генерация «десятков вариантов» запрещена — это не решение проблемы, а её
+    маскировка (`§18`).
+    """
+    if verdict is None or verdict.ok:
+        return False
+    # Попытки нумеруются с единицы: «повтор после нулевой» смысла не имеет, а
+    # нулевой лимит не должен превращаться в бесконечный цикл.
+    return 1 <= attempt < max(1, max_attempts)
+
+
+def best_verdict(candidates: list[ShortVerdict]) -> int:
+    """Индекс лучшей попытки: меньше причин, затем ниже WER."""
+    if not candidates:
+        raise ValueError("Нет ни одной попытки")
+    return max(range(len(candidates)), key=lambda index: candidates[index].score)

@@ -505,7 +505,9 @@ def test_cancelled_worker_job_is_not_reported_as_crash(worker_env, voices, monke
     """Отмена пользователем — не падение процесса: тип CANCELLED, воркер жив."""
     monkeypatch.setattr(config, "WORKER_CRASH_RETRIES", 0)
     store = get_projects_store()
-    texts = tuple(f"Реплика номер {index}" for index in range(1, 8))
+    # Вторая реплика «тормозит» (заглушка спит три секунды): отмена успевает
+    # прийти между кусками детерминированно, а не гонкой с мгновенным синтезом.
+    texts = (FIRST, "Реплика номер два slow", THIRD, "Реплика номер четыре")
 
     async def scenario():
         queue = JobQueue()
