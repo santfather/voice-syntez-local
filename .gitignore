@@ -17,3 +17,6 @@ __pycache__/
 .voice_syntez.pid
 # Артефакт оболочки, к проекту не относится.
 :memory:.ses
+# Результаты benchmark'а LLM: сырые ответы моделей и метрики конкретного прогона —
+# артефакт запуска, а не часть проекта. Baseline хранится отдельно и явно.
+/benchmarks/russian_linguistics/results/
