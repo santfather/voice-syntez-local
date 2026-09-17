@@ -379,7 +379,7 @@ def test_preview_final_equals_render_input(voices, stub, monkeypatch):
     _run(scenario)
 
 
-def test_regenerate_uses_saved_final_text(voices, stub, monkeypatch):
+def test_regenerate_uses_same_final_text(voices, stub, monkeypatch):
     """Пересинтез реплики идёт по тому же сохранённому тексту."""
 
     async def scenario():
@@ -510,11 +510,42 @@ def test_speaker_markers_removed_before_preprocessing(voices, stub, monkeypatch)
             await analyze_project(client, project["id"])
             replicas = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"]
 
+            assert replicas, "маркеры обязаны дать хотя бы одну реплику"
             for replica in replicas:
-                assert "speed=" not in replica["source_text"]
                 assert "(1)" not in replica["source_text"]
-                assert "speed=" not in replica["final_text"]
+                assert "АРТЕМ" not in replica["source_text"]
                 assert "АРТЕМ" not in replica["final_text"]
+
+    _run(scenario)
+
+
+def test_inline_slot_metadata_not_sent_to_tts(voices, stub, monkeypatch):
+    """Параметры из маркера становятся ручками реплики, а не текстом для модели."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            text = "АРТЕМ(1): Привет! (1 speed=1.2 cfg=2.5 nfe=16) Как дела?"
+            project = await _create_project(client, text=text)
+            await client.patch(
+                f"/api/projects/{project['id']}",
+                json={"speakers": {"#1": {"voice_id": F5_VOICE}}},
+            )
+            await analyze_project(client, project["id"])
+            replicas = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"]
+
+            for replica in replicas:
+                for marker in ("speed=", "cfg=", "nfe=", "1.2", "2.5"):
+                    assert marker not in replica["final_text"], (marker, replica["final_text"])
+            # Параметры при этом не потеряны: маркер переключает ручки для того,
+            # что идёт после него, поэтому они лежат у соответствующей реплики и
+            # уходят в движок отдельным словарём, а не текстом.
+            tuned = [replica for replica in replicas if replica["overrides"]]
+            assert tuned, "маркер с параметрами обязан дать реплику с правками"
+            assert tuned[0]["overrides"].get("speed") == 1.2
+            assert tuned[0]["overrides"].get("cfg_strength") == 2.5
+            assert tuned[0]["effective_engine_params"].get("speed") == 1.2
+            # А до маркера реплика идёт без правок: маркер действует вперёд, не назад.
+            assert replicas[0]["overrides"] == {}
 
     _run(scenario)
 
