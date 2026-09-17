@@ -1,4 +1,9 @@
-"""Таблица словаря произношения: пользовательские правила чтения терминов.
+"""Таблицы словаря произношения: пользовательские правила чтения терминов.
+
+Один репозиторий обслуживает оба словаря — глобальный и уровня проекта: таблицы
+отличаются именем и наличием `project_id`, а вся логика чтения и записи одна и та
+же. Второй класс с копией запросов разошёлся бы с первым на первой же правке
+(например, на сортировке «длинный источник раньше короткого»).
 
 Репозиторий, как и остальные, ничего не знает про транзакции и кеш: он принимает
 открытое соединение и работает в его рамках. Снимок активных правил и сброс кеша —
@@ -31,15 +36,28 @@ def _row_to_entry(row: sqlite3.Row) -> dict:
 
 
 class PronunciationRepository:
-    """CRUD правил словаря. Уникальность — по (`source`, `case_sensitive`)."""
+    """CRUD правил словаря. Уникальность — по (`source`, `case_sensitive`).
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    `project_id` переключает репозиторий на словарь уровня проекта: тот же набор
+    операций, но с фильтром по проекту. Глобальный словарь вызывается без него.
+    """
+
+    GLOBAL_TABLE = "pronunciation_entries"
+    PROJECT_TABLE = "project_pronunciation_entries"
+
+    def __init__(self, connection: sqlite3.Connection, project_id: str | None = None) -> None:
         self._conn = connection
+        self.project_id = project_id
+        self._table = self.PROJECT_TABLE if project_id else self.GLOBAL_TABLE
+        self._scope = " AND project_id = ?" if project_id else ""
+        self._scope_args: tuple = (project_id,) if project_id else ()
 
     def list_all(self) -> list[dict]:
         """Все правила, включая выключенные: список в интерфейсе показывает их тоже."""
         rows = self._conn.execute(
-            "SELECT * FROM pronunciation_entries ORDER BY source COLLATE NOCASE, id"
+            f"SELECT * FROM {self._table} WHERE 1 = 1{self._scope}"
+            " ORDER BY source COLLATE NOCASE, id",
+            self._scope_args,
         ).fetchall()
         return [_row_to_entry(row) for row in rows]
 
@@ -51,22 +69,24 @@ class PronunciationRepository:
         развалилось бы на «OpenAI» + «API».
         """
         rows = self._conn.execute(
-            "SELECT * FROM pronunciation_entries WHERE enabled = 1"
-            " ORDER BY LENGTH(source) DESC, id"
+            f"SELECT * FROM {self._table} WHERE enabled = 1{self._scope}"
+            " ORDER BY LENGTH(source) DESC, id",
+            self._scope_args,
         ).fetchall()
         return [_row_to_entry(row) for row in rows]
 
     def get(self, entry_id: int) -> dict | None:
         row = self._conn.execute(
-            "SELECT * FROM pronunciation_entries WHERE id = ?", (entry_id,)
+            f"SELECT * FROM {self._table} WHERE id = ?{self._scope}",
+            (entry_id, *self._scope_args),
         ).fetchone()
         return None if row is None else _row_to_entry(row)
 
     def find(self, source: str, case_sensitive: bool) -> dict | None:
         """Правило с тем же источником и режимом регистра — цель повторного добавления."""
         row = self._conn.execute(
-            "SELECT * FROM pronunciation_entries WHERE source = ? AND case_sensitive = ?",
-            (source, int(bool(case_sensitive))),
+            f"SELECT * FROM {self._table} WHERE source = ? AND case_sensitive = ?{self._scope}",
+            (source, int(bool(case_sensitive)), *self._scope_args),
         ).fetchone()
         return None if row is None else _row_to_entry(row)
 
@@ -80,20 +100,24 @@ class PronunciationRepository:
         note: str = "",
     ) -> dict:
         now = _now()
+        columns = "source, target, case_sensitive, whole_word, enabled, note, created_at, updated_at"
+        values: tuple = (
+            source,
+            target,
+            int(bool(case_sensitive)),
+            int(bool(whole_word)),
+            int(bool(enabled)),
+            note,
+            now,
+            now,
+        )
+        if self.project_id:
+            columns = f"project_id, {columns}"
+            values = (self.project_id, *values)
+        placeholders = ", ".join("?" for _ in range(len(values)))
         cursor = self._conn.execute(
-            "INSERT INTO pronunciation_entries"
-            " (source, target, case_sensitive, whole_word, enabled, note, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                source,
-                target,
-                int(bool(case_sensitive)),
-                int(bool(whole_word)),
-                int(bool(enabled)),
-                note,
-                now,
-                now,
-            ),
+            f"INSERT INTO {self._table} ({columns}) VALUES ({placeholders})",
+            values,
         )
         return self.get(int(cursor.lastrowid))  # type: ignore[return-value]
 
@@ -109,8 +133,8 @@ class PronunciationRepository:
         values["updated_at"] = _now()
         assignments = ", ".join(f"{key} = ?" for key in values)
         cursor = self._conn.execute(
-            f"UPDATE pronunciation_entries SET {assignments} WHERE id = ?",
-            (*values.values(), entry_id),
+            f"UPDATE {self._table} SET {assignments} WHERE id = ?{self._scope}",
+            (*values.values(), entry_id, *self._scope_args),
         )
         if cursor.rowcount == 0:
             return None
@@ -118,6 +142,7 @@ class PronunciationRepository:
 
     def delete(self, entry_id: int) -> bool:
         cursor = self._conn.execute(
-            "DELETE FROM pronunciation_entries WHERE id = ?", (entry_id,)
+            f"DELETE FROM {self._table} WHERE id = ?{self._scope}",
+            (entry_id, *self._scope_args),
         )
         return cursor.rowcount > 0

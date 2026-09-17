@@ -46,51 +46,81 @@ def _clean_target(target: object) -> str:
     return target.strip()
 
 
+def _rule_from_row(row: dict) -> PronunciationRule:
+    """Строка базы → правило пайплайна (включая признак «выключено»)."""
+    return PronunciationRule(
+        source=row["source"],
+        target=row["target"],
+        case_sensitive=row["case_sensitive"],
+        whole_word=row["whole_word"],
+        enabled=row["enabled"],
+    )
+
+
 class PronunciationStore:
-    """Правила словаря: чтение, запись и кеш активного снимка."""
+    """Правила словаря: чтение, запись и кеш активного снимка.
+
+    Словарей два: глобальный и уровня проекта. Приоритет задаётся порядком
+    слияния — правила проекта идут первыми, поэтому при совпадении источника
+    выигрывает проектное правило (`rules_for`). Всё остальное — те же операции.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._cache: tuple[Path, list[PronunciationRule]] | None = None
+        # Кеш снимков: ключ — (путь к базе, project_id или ""). Раньше ключом был
+        # только путь, и правила проекта пришлось бы перечитывать на каждый кусок.
+        self._cache: dict[tuple[Path, str], list[PronunciationRule]] = {}
 
     # -- чтение ----------------------------------------------------------------
-    def list_entries(self) -> list[dict]:
+    def list_entries(self, project_id: str | None = None) -> list[dict]:
         """Все правила, включая выключенные: список в интерфейсе показывает их тоже."""
         with transaction() as connection:
-            return PronunciationRepository(connection).list_all()
+            return PronunciationRepository(connection, project_id).list_all()
 
-    def get(self, entry_id: int) -> dict | None:
+    def get(self, entry_id: int, project_id: str | None = None) -> dict | None:
         with transaction() as connection:
-            return PronunciationRepository(connection).get(entry_id)
+            return PronunciationRepository(connection, project_id).get(entry_id)
 
     def active_rules(self) -> list[PronunciationRule]:
-        """Снимок включённых правил для пайплайна — с кешем по пути к базе."""
-        path = config.DB_PATH
-        with self._lock:
-            if self._cache is not None and self._cache[0] == path:
-                return self._cache[1]
-        rules = self._read_active()
-        with self._lock:
-            self._cache = (path, rules)
-        return rules
+        """Снимок включённых глобальных правил для пайплайна — с кешем по базе."""
+        return self.rules_for(None)
 
-    def _read_active(self) -> list[PronunciationRule]:
+    def rules_for(
+        self, project_id: str | None = None, *, include_disabled: bool = False
+    ) -> list[PronunciationRule]:
+        """Правила для проекта: сначала проектные, затем глобальные.
+
+        Выключенные нужны проверке «слово уже покрыто»: это память об отклонённом
+        предложении. Применение же само пропускает выключенные (`compile_rules`),
+        поэтому один снимок годится и для анализа, и для синтеза — расходиться им
+        нечем.
+        """
+        key = (config.DB_PATH, project_id or "")
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached is None:
+            cached = self._read_rules(project_id)
+            with self._lock:
+                self._cache[key] = cached
+        if include_disabled:
+            return cached
+        return [rule for rule in cached if rule.enabled]
+
+    def _read_rules(self, project_id: str | None) -> list[PronunciationRule]:
+        """Снимок правил: проектные первыми, потому что они приоритетнее."""
         with transaction() as connection:
-            rows = PronunciationRepository(connection).list_enabled()
-        return [
-            PronunciationRule(
-                source=row["source"],
-                target=row["target"],
-                case_sensitive=row["case_sensitive"],
-                whole_word=row["whole_word"],
-            )
-            for row in rows
-        ]
+            rows: list[dict] = []
+            if project_id:
+                rows.extend(
+                    PronunciationRepository(connection, project_id).list_all()
+                )
+            rows.extend(PronunciationRepository(connection).list_all())
+        return [_rule_from_row(row) for row in rows]
 
     def invalidate(self) -> None:
-        """Сбрасывает снимок: следующее чтение снова заглянет в базу."""
+        """Сбрасывает все снимки: следующее чтение снова заглянет в базу."""
         with self._lock:
-            self._cache = None
+            self._cache.clear()
 
     # -- запись ----------------------------------------------------------------
     def create(
@@ -101,18 +131,21 @@ class PronunciationStore:
         whole_word: bool = True,
         enabled: bool = True,
         note: str = "",
+        project_id: str | None = None,
     ) -> dict:
         """Создаёт правило; повторное добавление того же источника его обновляет.
 
         Выбран update, а не ошибка: пользователь, дважды отправивший форму, ждёт
         исправленную замену, а не 409. Уникальность — по (`source`, `case_sensitive`)
-        (см. миграцию 3).
+        (см. миграцию 3), а с `project_id` — внутри проекта: то же слово может
+        читаться по-разному в разных диалогах, и проектное правило важнее
+        глобального (см. `rules_for`).
         """
         source = _clean_source(source)
         target = _clean_target(target)
         case_sensitive = bool(case_sensitive)
         with transaction() as connection:
-            repository = PronunciationRepository(connection)
+            repository = PronunciationRepository(connection, project_id)
             existing = repository.find(source, case_sensitive)
             if existing is None:
                 entry = repository.create(
@@ -123,7 +156,12 @@ class PronunciationStore:
                     enabled=bool(enabled),
                     note=str(note or ""),
                 )
-                logger.info("Словарь: добавлено правило «%s» → «%s»", source, target)
+                logger.info(
+                    "Словарь%s: добавлено правило «%s» → «%s»",
+                    f" проекта {project_id}" if project_id else "",
+                    source,
+                    target,
+                )
             else:
                 entry = repository.update(
                     existing["id"],
@@ -136,7 +174,7 @@ class PronunciationStore:
         self.invalidate()
         return entry  # type: ignore[return-value]
 
-    def update(self, entry_id: int, **fields) -> dict:
+    def update(self, entry_id: int, *, project_id: str | None = None, **fields) -> dict:
         """Меняет поля правила. Неизвестный id — `KeyError`, конфликт — `PronunciationConflict`."""
         allowed = {"source", "target", "case_sensitive", "whole_word", "enabled", "note"}
         patch: dict[str, object] = {
@@ -154,7 +192,7 @@ class PronunciationStore:
 
         try:
             with transaction() as connection:
-                repository = PronunciationRepository(connection)
+                repository = PronunciationRepository(connection, project_id)
                 if repository.get(entry_id) is None:
                     raise KeyError(entry_id)
                 entry = repository.update(entry_id, **patch)
@@ -167,9 +205,9 @@ class PronunciationStore:
         self.invalidate()
         return entry
 
-    def delete(self, entry_id: int) -> bool:
+    def delete(self, entry_id: int, *, project_id: str | None = None) -> bool:
         with transaction() as connection:
-            deleted = PronunciationRepository(connection).delete(entry_id)
+            deleted = PronunciationRepository(connection, project_id).delete(entry_id)
         if deleted:
             self.invalidate()
             logger.info("Словарь: правило %s удалено", entry_id)

@@ -31,6 +31,16 @@ def _run(scenario) -> None:
     asyncio.run(scenario())
 
 
+def _unstressed(text: str) -> str:
+    """Текст без знаков ударения: сравнивать чтение, а не разметку.
+
+    Ударения ставит RUAccent (в этом окружении он настоящий), и «пагада» вполне
+    законно становится «паг+ада». Проверять надо слово, а не то, где именно
+    оказался «+».
+    """
+    return (text or "").replace("+", "")
+
+
 async def _analyzed(client, project: dict, **body) -> dict:
     """Один прогон анализа — сырое состояние, без прохода review."""
     response = await client.post(f"/api/projects/{project['id']}/analyze", json=body or {})
@@ -323,12 +333,12 @@ def test_render_uses_saved_final_text(voices, stub, monkeypatch):
                 ]
             ]
 
-            # Словарь меняется ПОСЛЕ анализа: рендер обязан остаться на сохранённом
-            # тексте, иначе в модель ушло бы то, чего пользователь не подтверждал.
-            created = await client.post(
-                "/api/pronunciation", json={"source": "погода", "target": "пагода"}
+            # Акцентуатор меняется ПОСЛЕ анализа: если бы рендер считал текст
+            # заново, в модель ушёл бы другой текст. Он обязан взять сохранённый —
+            # тот, который пользователь видел и подтверждал.
+            monkeypatch.setattr(
+                audio_pipeline, "accentuate", lambda text: f"[{text}]"
             )
-            assert created.status_code in (200, 201), created.text
 
             stub.calls.clear()
             accepted = await client.post(f"/api/projects/{project['id']}/render", json={})
@@ -336,7 +346,7 @@ def test_render_uses_saved_final_text(voices, stub, monkeypatch):
             await _wait_job(client, accepted.json()["job_id"])
 
             assert [call["text"] for call in stub.calls] == saved
-            assert all("пагода" not in call["text"] for call in stub.calls)
+            assert all(not call["text"].startswith("[") for call in stub.calls)
 
     _run(scenario)
 
@@ -605,5 +615,151 @@ def test_legacy_generate_still_renders_without_analysis(voices, stub, monkeypatc
             assert accepted.status_code == 202, accepted.text
             await _wait_job(client, accepted.json()["job_id"])
             assert [call["text"] for call in stub.calls], "разовый рендер не дошёл до движка"
+
+    _run(scenario)
+
+
+# --- 11. Область словаря: проект важнее глобального ------------------------------
+def test_project_dictionary_overrides_global(voices, stub, monkeypatch):
+    """Правило проекта побеждает глобальное: одно слово может читаться по-разному."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            global_rule = await client.post(
+                "/api/pronunciation", json={"source": "погода", "target": "пагада"}
+            )
+            assert global_rule.status_code in (200, 201), global_rule.text
+            project = await _project_with_voice(client, F5_VOICE)
+            local_rule = await client.post(
+                "/api/pronunciation",
+                # Замена проекта не должна содержать исходное слово: правила
+                # применяются по очереди, и глобальное правило сработало бы уже
+                # на результате проектного — это порядок, а не приоритет.
+                json={"source": "погода", "target": "погодушка", "project_id": project["id"]},
+            )
+            assert local_rule.status_code in (200, 201), local_rule.text
+
+            await analyze_project(client, project["id"])
+            replica = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"][0]
+            assert "погодушка" in _unstressed(replica["final_text"])
+            assert "пагада" not in _unstressed(replica["final_text"])
+
+            # Глобальный словарь при этом не изменился — правило проекта живёт отдельно.
+            listed = await client.get("/api/pronunciation")
+            assert [item["target"] for item in listed.json()["entries"]] == ["пагада"]
+
+    _run(scenario)
+
+
+def test_global_dictionary_used_when_no_project_override(voices, stub, monkeypatch):
+    """Без правила проекта работает глобальное — приоритет не отменяет общий словарь."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            created = await client.post(
+                "/api/pronunciation", json={"source": "погода", "target": "пагада"}
+            )
+            assert created.status_code in (200, 201), created.text
+            project = await _project_with_voice(client, F5_VOICE)
+            await analyze_project(client, project["id"])
+            replica = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"][0]
+            assert "пагада" in _unstressed(replica["final_text"])
+
+    _run(scenario)
+
+
+def test_dictionary_change_reanalyzes_affected_replicas(voices, stub, monkeypatch):
+    """Правка словаря устаревает ровно те реплики, где встретилось слово."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            project = await _project_with_voice(
+                client, F5_VOICE, text="ИВАН: Сегодня хорошая погода.\nМАРГО: И я рад тебя видеть."
+            )
+            await analyze_project(client, project["id"])
+
+            created = await client.post(
+                "/api/pronunciation", json={"source": "погода", "target": "пагада"}
+            )
+            assert created.status_code in (200, 201), created.text
+            assert created.json()["affected"], "правило обязано устаревать затронутые реплики"
+
+            state = (await client.get(f"/api/projects/{project['id']}/analysis")).json()
+            assert state["status"] == config.PROJECT_ANALYSIS_RAW
+            # Слово есть только в первой реплике — вторая остаётся подготовленной.
+            assert state["replicas_pending"] == 1
+            assert state["replicas_done"] == 1
+            assert "словарь" in (state["analysis_error"] or "")
+
+            refused = await client.post(f"/api/projects/{project['id']}/render", json={})
+            assert refused.status_code == 409, refused.text
+
+            # Повторный анализ подхватывает правило, и проект снова готов.
+            await analyze_project(client, project["id"])
+            replica = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"][0]
+            assert "пагада" in _unstressed(replica["final_text"])
+
+    _run(scenario)
+
+
+def test_review_accepts_into_project_scope(voices, stub, monkeypatch):
+    """Review умеет принять слово только для проекта — и не трогает общий словарь."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            project = await _project_with_voice(client, F5_VOICE, text=AMBIGUOUS)
+            report = await _analyzed(client, project)
+            candidate = report["candidates"][0]
+            assert candidate["word"] == "все"
+
+            reviewed = await client.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={
+                    "source": candidate["word"],
+                    "target": candidate["target"],
+                    "scope": "project",
+                    "replica_index": candidate["replica_index"],
+                },
+            )
+            assert reviewed.status_code == 200, reviewed.text
+            assert reviewed.json()["analysis"]["status"] == config.PROJECT_ANALYSIS_READY
+            replica = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"][0]
+            assert "всё" in _unstressed(replica["final_text"])
+
+            # Глобальный словарь пуст: решение принято для проекта.
+            assert (await client.get("/api/pronunciation")).json()["entries"] == []
+            # А в проектном словаре правило есть.
+            local = await client.get(f"/api/pronunciation?project_id={project['id']}")
+            assert [item["source"] for item in local.json()["entries"]] == ["все"]
+
+    _run(scenario)
+
+
+def test_review_skip_does_not_change_pronunciation(voices, stub, monkeypatch, fake_accent):
+    """Пропуск в review — выключенное правило: слово не меняется и не предлагается снова."""
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            project = await _project_with_voice(client, F5_VOICE, text=AMBIGUOUS)
+            report = await _analyzed(client, project)
+            candidate = report["candidates"][0]
+
+            skipped = await client.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={
+                    "source": candidate["word"],
+                    "target": candidate["target"],
+                    "scope": "project",
+                    "enabled": False,
+                    "replica_index": candidate["replica_index"],
+                },
+            )
+            assert skipped.status_code == 200, skipped.text
+            state = skipped.json()["analysis"]
+            assert state["status"] == config.PROJECT_ANALYSIS_READY
+            assert state["candidates"] == []
+            replica = (await client.get(f"/api/projects/{project['id']}")).json()["replicas"][0]
+            assert "все" in _unstressed(replica["final_text"])
+            assert "всё" not in _unstressed(replica["final_text"])
 
     _run(scenario)

@@ -2568,8 +2568,9 @@ function renderReviewPanel() {
   $('review-title').textContent =
     `Слова для проверки: ${candidates.length}. Пока они не решены, синтез недоступен.`;
   $('review-note').textContent =
-    'Подтверждение добавляет правило в общий словарь произношения — оно подействует на все проекты. '
-    + 'Пропуск оставляет слово как есть и больше его не предлагает.';
+    '«Только в этот проект» — правило подействует здесь и не изменит другие диалоги: омограф '
+    + 'почти всегда зависит от контекста. «Во все проекты» — для терминов и брендов, которые '
+    + 'читаются одинаково везде. Пропуск оставляет слово как есть и больше его не предлагает.';
   list.innerHTML = candidates
     .map(
       (item, index) => `
@@ -2580,7 +2581,8 @@ function renderReviewPanel() {
         </div>
         <div class="muted review-reason">${esc(item.reason || '')}</div>
         <div class="row">
-          <button class="tiny primary" data-review="accept" data-index="${index}">Добавить в словарь</button>
+          <button class="tiny primary" data-review="project" data-index="${index}">Только в этот проект</button>
+          <button class="tiny ghost" data-review="global" data-index="${index}">Во все проекты</button>
           <button class="tiny ghost" data-review="skip" data-index="${index}">Пропустить</button>
         </div>
       </div>`
@@ -2591,26 +2593,25 @@ function renderReviewPanel() {
 async function reviewCandidate(index, action) {
   const item = (state.analysis.candidates || [])[index];
   if (!item) return;
-  const accepted = action === 'accept' && Boolean((item.target || '').trim());
+  const accepted = action !== 'skip' && Boolean((item.target || '').trim());
   try {
-    await api('/api/pronunciation', {
+    // Решение уходит одним запросом: правило нужной области создаётся, затронутые
+    // реплики помечаются устаревшими, а пересчитываются только они — слово
+    // встретилось именно в этой реплике.
+    await api(`/api/projects/${state.project.id}/pronunciation/review`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         source: item.word,
         target: item.target || item.word,
+        scope: action === 'global' ? 'global' : 'project',
         enabled: accepted,
-        note: accepted ? '' : 'пропущено при подготовке диалога',
+        replica_index: item.replica_index,
       }),
-    });
-    // Пересчитываем только затронутую реплику: слово встретилось в ней.
-    await api(`/api/projects/${state.project.id}/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ indexes: [item.replica_index] }),
     });
     await applyProject(await api(`/api/projects/${state.project.id}`), { analysis: false });
     await refreshAnalysis();
+    if (typeof loadDictionary === 'function') loadDictionary().catch(() => {});
   } catch (error) {
     showAlert($('analyze-error'), error.message);
   }

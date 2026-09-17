@@ -68,6 +68,7 @@ from .pronunciation import get_store as get_pronunciation_store
 from .pronunciation_suggest import build_suggestions
 from .resource_guard import ResourceGuard
 from .text_normalization import PronunciationRule, normalize_stages
+from .text_normalization.pronunciation import compile_rule
 from .voices_store import ALLOWED_AUDIO_SUFFIXES, MAX_AUDIO_BYTES, Voice, get_store
 
 logging.basicConfig(
@@ -958,6 +959,9 @@ class PronunciationEntryRequest(BaseModel):
     whole_word: bool = True
     enabled: bool = True
     note: str = ""
+    # Словарь уровня проекта: правило действует только в нём и важнее глобального.
+    # Без поля правило становится общим — как и было до появления области.
+    project_id: str | None = None
 
 
 class PronunciationUpdateRequest(BaseModel):
@@ -969,6 +973,23 @@ class PronunciationUpdateRequest(BaseModel):
     whole_word: bool | None = None
     enabled: bool | None = None
     note: str | None = None
+
+
+class ProjectReviewRequest(BaseModel):
+    """Решение по предложенному слову: принять (в проект или глобально) или пропустить.
+
+    Область — часть решения, а не деталь: омограф в конкретном диалоге почти
+    всегда надо фиксировать **для проекта**, иначе правило уедет во все будущие
+    тексты и сломает там другое чтение. `global` оставлен для терминов и брендов,
+    которые читаются одинаково везде.
+    """
+
+    source: str
+    target: str = ""
+    scope: Literal["project", "global"] = "project"
+    enabled: bool = True
+    replica_index: int | None = None
+    note: str = ""
 
 
 class PronunciationPreviewRequest(BaseModel):
@@ -1005,35 +1026,119 @@ class TextPreviewRequest(BaseModel):
 
 
 @app.get("/api/pronunciation")
-async def list_pronunciation() -> dict:
-    """Правила словаря целиком, включая выключенные: интерфейс показывает и их."""
-    entries = get_pronunciation_store().list_entries()
-    return {"entries": entries, "count": len(entries)}
+async def list_pronunciation(project_id: str | None = None) -> dict:
+    """Правила словаря целиком, включая выключенные: интерфейс показывает и их.
+
+    С `project_id` отдаются правила проекта: у них приоритет над глобальными, и
+    интерфейсу нужно показывать их отдельно, а не в общем списке.
+    """
+    entries = get_pronunciation_store().list_entries(project_id)
+    return {"entries": entries, "count": len(entries), "project_id": project_id}
 
 
 @app.post("/api/pronunciation", status_code=201)
 async def create_pronunciation(payload: PronunciationEntryRequest) -> dict:
-    """Добавляет правило; если источник уже есть — обновляет его, а не плодит дубли."""
+    """Добавляет правило; если источник уже есть — обновляет его, а не плодит дубли.
+
+    Правило меняет текст, который уходит в модель, поэтому реплики с этим словом
+    помечаются как требующие повторной подготовки: иначе рендер молча возьмёт
+    текст, собранный по прежнему словарю.
+    """
+    if payload.project_id and get_projects_store().get_project(payload.project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
     try:
-        return get_pronunciation_store().create(
+        entry = get_pronunciation_store().create(
             source=payload.source,
             target=payload.target,
             case_sensitive=payload.case_sensitive,
             whole_word=payload.whole_word,
             enabled=payload.enabled,
             note=payload.note,
+            project_id=payload.project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    affected = _invalidate_for_rule(
+        PronunciationRule(
+            source=entry["source"],
+            target=entry["target"],
+            case_sensitive=entry["case_sensitive"],
+            whole_word=entry["whole_word"],
+            enabled=entry["enabled"],
+        ),
+        project_id=payload.project_id,
+    )
+    return {**entry, "affected": affected}
+
+
+@app.post("/api/projects/{project_id}/pronunciation/review")
+async def review_project_pronunciation(
+    project_id: str, payload: ProjectReviewRequest
+) -> dict:
+    """Решение по предложенному слову: принять (в проект или глобально) или пропустить.
+
+    Отдельного хранилища у решений нет: принятое — обычное правило словаря (проекта
+    или общего), пропущенное — выключенное правило. Поэтому после решения достаточно
+    пересчитать затронутые реплики, и слово больше не появится в предложениях.
+    """
+    _project_or_404(project_id)
+    if payload.replica_index is not None:
+        _replica_or_404(_project_or_404(project_id), payload.replica_index)
+    scope = project_id if payload.scope == "project" else None
+    try:
+        entry = get_pronunciation_store().create(
+            source=payload.source,
+            target=payload.target or payload.source,
+            enabled=payload.enabled and bool(payload.target.strip()),
+            note=payload.note
+            or ("принято при подготовке диалога" if payload.target.strip() else "пропущено при подготовке диалога"),
+            project_id=scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    affected = _invalidate_for_rule(
+        PronunciationRule(
+            source=entry["source"],
+            target=entry["target"],
+            case_sensitive=entry["case_sensitive"],
+            whole_word=entry["whole_word"],
+            enabled=entry["enabled"],
+        ),
+        project_id=scope,
+    )
+    indexes = [payload.replica_index] if payload.replica_index is not None else None
+    summary = await asyncio.to_thread(
+        _analyze_project, get_projects_store().get_project(project_id), indexes, None
+    )
+    get_projects_store().save_analysis(project_id, summary)
+    state = await project_analysis_state(project_id)
+    return {"entry": entry, "affected": affected, "analysis": state}
 
 
 @app.patch("/api/pronunciation/{entry_id}")
-async def update_pronunciation(entry_id: int, payload: PronunciationUpdateRequest) -> dict:
-    """Меняет поля правила, в том числе `enabled`, не удаляя его из словаря."""
+async def update_pronunciation(
+    entry_id: int, payload: PronunciationUpdateRequest, project_id: str | None = None
+) -> dict:
+    """Меняет поля правила, в том числе `enabled`, не удаляя его из словаря.
+
+    `project_id` в запросе выбирает словарь: правила проекта и глобальные живут в
+    разных таблицах и могут иметь одинаковые идентификаторы.
+    """
     try:
-        return get_pronunciation_store().update(
-            entry_id, **payload.model_dump(exclude_unset=True)
+        entry = get_pronunciation_store().update(
+            entry_id, project_id=project_id, **payload.model_dump(exclude_unset=True)
         )
+        _invalidate_for_rule(
+            PronunciationRule(
+                source=entry["source"],
+                target=entry["target"],
+                case_sensitive=entry["case_sensitive"],
+                whole_word=entry["whole_word"],
+                enabled=entry["enabled"],
+            ),
+            project_id=project_id,
+        )
+        return entry
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Правило словаря не найдено") from exc
     except PronunciationConflict as exc:
@@ -1043,10 +1148,28 @@ async def update_pronunciation(entry_id: int, payload: PronunciationUpdateReques
 
 
 @app.delete("/api/pronunciation/{entry_id}")
-async def delete_pronunciation(entry_id: int) -> dict:
-    if not get_pronunciation_store().delete(entry_id):
+async def delete_pronunciation(entry_id: int, project_id: str | None = None) -> dict:
+    """Удаляет правило. `project_id` выбирает словарь — проектный или глобальный."""
+    store = get_pronunciation_store()
+    existing = store.get(entry_id, project_id)
+    if existing is None:
         raise HTTPException(status_code=404, detail="Правило словаря не найдено")
-    return {"deleted": entry_id}
+    if not store.delete(entry_id, project_id=project_id):
+        raise HTTPException(status_code=404, detail="Правило словаря не найдено")
+    # Удаление возвращает текст к автоматическому чтению — это тоже изменение
+    # подготовки. Правило берётся из снятой записи: после удаления его источник
+    # искать уже негде, а реплики с этим словом надо пометить.
+    affected = _invalidate_for_rule(
+        PronunciationRule(
+            source=existing["source"],
+            target=existing["target"],
+            case_sensitive=existing["case_sensitive"],
+            whole_word=existing["whole_word"],
+            enabled=True,
+        ),
+        project_id=project_id,
+    )
+    return {"deleted": entry_id, "affected": affected}
 
 
 @app.post("/api/pronunciation/preview")
@@ -1972,23 +2095,12 @@ def _rules_for_project(project_id: str):
     это память об отклонённом предложении. Без них отклонённое слово возвращалось
     бы в панель предложений на каждом анализе.
 
-    Словарь уровня проекта (таблица `project_pronunciation_entries` из миграции 5)
-    встанет сюда **первым** слоем: приоритет «проект → глобальный → автоматика».
-    Слияние обязано жить в одном месте: анализ, preview и рендер должны видеть
-    одни и те же правила, иначе подготовленный текст разойдётся с тем, что уходит
-    в модель.
+    Словарь уровня проекта идёт первым слоем: приоритет «проект → глобальный →
+    автоматика». Слияние живёт в одном месте (`pronunciation.rules_for`): анализ,
+    preview и рендер должны видеть одни и те же правила, иначе подготовленный
+    текст разойдётся с тем, что уходит в модель.
     """
-    del project_id  # project-scope появится здесь; пока словарь только глобальный
-    return [
-        PronunciationRule(
-            source=row["source"],
-            target=row["target"],
-            case_sensitive=row["case_sensitive"],
-            whole_word=row["whole_word"],
-            enabled=row["enabled"],
-        )
-        for row in get_pronunciation_store().list_entries()
-    ]
+    return get_pronunciation_store().rules_for(project_id, include_disabled=True)
 
 
 def _replica_speaker(project: dict, replica: dict) -> dict | None:
@@ -2003,6 +2115,53 @@ def _effective_voice(project: dict, replica: dict, voices: dict) -> Voice | None
     speaker = _replica_speaker(project, replica)
     voice_id = str(replica.get("voice_id") or (speaker or {}).get("voice_id") or "")
     return _resolved_voice(voice_id, voices)
+
+
+def _invalidate_for_rule(rule: PronunciationRule, *, project_id: str | None) -> list[dict]:
+    """Помечает реплики, которых коснулось правило словаря.
+
+    Правило меняет текст, который уходит в модель, поэтому подготовленные реплики
+    с этим словом устарели — иначе рендер молча возьмёт текст, собранный по
+    прежнему словарю. Выключенное правило (отклонённое предложение) не меняет
+    ничего и подготовку не сбрасывает.
+
+    Проверяются только проекты, которых правило может касаться: проектное — один,
+    глобальное — все. Отбор идёт тем же шаблоном, что и замена (`compile_rule`),
+    а не «похожим» поиском подстроки.
+    """
+    if not rule.enabled:
+        return []
+    compiled = compile_rule(rule)
+    if compiled is None:
+        return []
+    store = get_projects_store()
+    ids = [project_id] if project_id else [item["id"] for item in store.list_projects()]
+    affected: list[dict] = []
+    for current in ids:
+        if current is None:
+            continue
+        project = store.get_project(current)
+        if project is None:
+            continue
+        hits = [
+            int(replica["index"])
+            for replica in project["replicas"]
+            if compiled.pattern.search(replica["text"] or "") is not None
+        ]
+        if not hits:
+            continue
+        store.invalidate_analysis(
+            current,
+            indexes=hits,
+            reason=f"изменён словарь произношения: правило «{rule.source}»",
+        )
+        affected.append({"project_id": current, "indexes": hits})
+    if affected:
+        logger.info(
+            "Словарь: правило «%s» устарело подготовку в %s проектах",
+            rule.source, len(affected),
+        )
+    return affected
 
 
 def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool | None):
