@@ -115,11 +115,73 @@ _MIGRATION_4 = """
 ALTER TABLE takes ADD COLUMN quality TEXT;
 """
 
+# Обязательная подготовка диалога перед синтезом: состояние анализа у проекта и
+# стадии подготовки каждой реплики.
+#
+# Состояние анализа живёт отдельной колонкой, а не в `projects.status`: `status`
+# отвечает за рендер («идёт сборка», «готово»), а `analysis_status` — за готовность
+# текста («сырой», «анализируется», «нужно подтверждение», «готов»). Смешав их,
+# нельзя было бы отличить «рендер идёт» от «текст ещё не подготовлен», а именно
+# это различие и запрещает запускать синтез по сырому тексту.
+#
+# Стадии реплики хранятся колонками, а не одним JSON: по ним интерфейс показывает
+# «что услышит модель» по шагам, а рендер обязан брать ровно `final_text`.
+# `source_text` отдельной колонкой не заводится — это уже существующий
+# `replicas.text`; вторая копия стала бы вторым источником правды, который рано
+# или поздно разойдётся с первым. Наружу реплика отдаёт и `text`, и `source_text`.
+#
+# Словарь произношения уровня проекта — отдельной таблицей, а не колонкой
+# `project_id` в глобальной: в SQLite NULL-ы в UNIQUE не конфликтуют между собой,
+# и глобальные правила перестали бы быть уникальными по источнику. Отдельная
+# таблица оставляет глобальному словарю его инвариант, а приоритет
+# «проект → глобальный → автоматика» задаётся порядком слияния при чтении.
+_MIGRATION_5 = """
+ALTER TABLE projects ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'raw';
+ALTER TABLE projects ADD COLUMN analysis_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN analysis_error TEXT;
+ALTER TABLE projects ADD COLUMN analysis_started_at TEXT;
+ALTER TABLE projects ADD COLUMN analysis_finished_at TEXT;
+
+ALTER TABLE replicas ADD COLUMN normalized_text TEXT;
+ALTER TABLE replicas ADD COLUMN yo_text TEXT;
+ALTER TABLE replicas ADD COLUMN dictionary_text TEXT;
+ALTER TABLE replicas ADD COLUMN accentized_text TEXT;
+ALTER TABLE replicas ADD COLUMN final_text TEXT;
+ALTER TABLE replicas ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE replicas ADD COLUMN analysis_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE replicas ADD COLUMN analysis_error TEXT;
+ALTER TABLE replicas ADD COLUMN dictionary_matches TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE replicas ADD COLUMN pronunciation_candidates TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE replicas ADD COLUMN supports_accents INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE replicas ADD COLUMN auto_accent INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE replicas ADD COLUMN effective_engine_params TEXT NOT NULL DEFAULT '{}';
+
+CREATE INDEX IF NOT EXISTS idx_replicas_analysis ON replicas(project_id, analysis_status);
+
+CREATE TABLE IF NOT EXISTS project_pronunciation_entries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source         TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    case_sensitive INTEGER NOT NULL DEFAULT 0,
+    whole_word     INTEGER NOT NULL DEFAULT 1,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE (project_id, source, case_sensitive)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_pronunciation
+    ON project_pronunciation_entries(project_id, enabled);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
+    (5, _MIGRATION_5),
 )
 
 
