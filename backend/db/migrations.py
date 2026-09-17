@@ -176,12 +176,49 @@ CREATE INDEX IF NOT EXISTS idx_project_pronunciation
     ON project_pronunciation_entries(project_id, enabled);
 """
 
+# Падения процесса-синтеза (creash_report). Отдельная таблица, а не поля реплики:
+# падение относится к процессу и движку, случается вне проекта (разовые задачи) и
+# ценно историей — «падало три раза на этой машине» и «упало на этой реплике»
+# разные вопросы. Тексты реплик сюда не пишутся: только индекс, движок, причина и
+# коды — диагностика не должна превращаться во второй архив пользовательского
+# текста (см. worker_protocol.text_fingerprint для логов).
+_MIGRATION_6 = """
+CREATE TABLE IF NOT EXISTS worker_crashes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     TEXT NOT NULL,
+    job_id         TEXT NOT NULL DEFAULT '',
+    project_id     TEXT,
+    replica_id     INTEGER,
+    replica_index  INTEGER,
+    engine         TEXT NOT NULL DEFAULT '',
+    error_type     TEXT NOT NULL DEFAULT '',
+    message        TEXT NOT NULL DEFAULT '',
+    pid            INTEGER,
+    exit_code      INTEGER,
+    signal         INTEGER,
+    signal_name    TEXT,
+    reason         TEXT NOT NULL DEFAULT '',
+    retry_count    INTEGER NOT NULL DEFAULT 0,
+    attempt        INTEGER NOT NULL DEFAULT 1,
+    started_at     TEXT,
+    interrupted_at TEXT,
+    memory_percent REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_crashes_created ON worker_crashes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_crashes_job ON worker_crashes(job_id);
+-- Осиротевшие `*.part` (недописанное аудио) ищутся по каталогам, а не по базе;
+-- индекс нужен только для отчёта «что падало у этой реплики».
+CREATE INDEX IF NOT EXISTS idx_worker_crashes_replica ON worker_crashes(project_id, replica_index);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
+    (6, _MIGRATION_6),
 )
 
 

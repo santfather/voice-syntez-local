@@ -493,6 +493,25 @@ async def status() -> dict:
     }
 
 
+@app.get("/api/diagnostics/worker")
+async def worker_diagnostics(limit: int = 20, project_id: str | None = None) -> dict:
+    """Диагностика процесса синтеза: состояние воркеров и последние падения.
+
+    Отдельный роут, а не поля в `/api/status`: статус спрашивают часто и он
+    лёгкий, а история падений — это чтение базы и разбор инцидента. Параметр
+    `project_id` сужает выборку до одного проекта: вопрос «почему упало здесь»
+    задаётся именно так.
+    """
+    return {
+        "isolation": config.worker_isolation_enabled(),
+        # Состояние читается из памяти супервизора: роут не ждёт ни модель, ни
+        # текущий инференс — иначе диагностика была бы недоступна ровно тогда,
+        # когда она нужна (воркер мёртв или занят).
+        "workers": get_supervisor().status(),
+        "crashes": get_projects_store().list_worker_crashes(limit, project_id),
+    }
+
+
 @app.get("/api/engines")
 async def list_engines() -> dict:
     """Паспорта движков: подписи, описания и границы ручек для интерфейса.

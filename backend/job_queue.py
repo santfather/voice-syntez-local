@@ -21,6 +21,7 @@ from .audio_pipeline import (
 )
 from .db.store import get_projects_store
 from .dialogue_parser import Replica
+from .engines import worker_protocol as proto
 from .engines.base import STATE_LOADING, STATE_READY
 from .engines.registry import created_engine
 from .voices_store import Voice
@@ -30,6 +31,32 @@ logger = logging.getLogger(__name__)
 MAX_KEPT_JOBS = 50
 # Как часто перепроверять системную память, пока задача ждёт своей очереди.
 MEMORY_WAIT_RETRY_SEC = 5.0
+
+# Метка варианта, сохранённого из прерванного рендера: по ней видно, что это
+# остаток незавершённой сборки, а не обычный результат (creash_report §13).
+PARTIAL_TAKE_LABEL = "прерванный рендер"
+
+
+class _RenderFailed(RuntimeError):
+    """Рендер не удалось восстановить: попытки исчерпаны (внутреннее исключение).
+
+    Нужно, чтобы «задача упала из-за падения воркера» отличалось от «задача упала
+    из-за ошибки модели»: у первого есть тип отказа, число попыток и готовые
+    куски, у второго — только текст ошибки.
+    """
+
+    def __init__(
+        self,
+        cause: BaseException,
+        partial: "audio_pipeline.RenderPartial | None",
+        error_type: str,
+        attempts: int,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.partial = partial
+        self.error_type = error_type
+        self.attempts = attempts
 
 # Приоритеты очереди (фаза 11). Воркер по-прежнему один: приоритет меняет только
 # порядок, в котором задачи доходят до модели, а не число одновременных
@@ -80,6 +107,11 @@ class Job:
     output_format: str = "wav"
     message: str = "В очереди"
     error: str | None = None
+    # Машинный тип ошибки (creash_report): `WORKER_CRASH`, `WORKER_TIMEOUT`,
+    # `TTS_ERROR`, `CANCELLED`, `WATCHDOG`, `INTERRUPTED`. Отдельно от текста:
+    # интерфейс по нему решает, что предложить («повторить» или «подождать»), а
+    # логи — по чему группировать. Пустая строка — ошибки не было.
+    error_type: str = ""
     output_path: Path | None = None
     duration_sec: float | None = None
     eta_sec: float | None = None
@@ -144,6 +176,10 @@ class Job:
             "current_voice": self.current_voice,
             "message": self.message,
             "error": self.error,
+            "error_type": self.error_type or None,
+            # Человеческий заголовок категории: интерфейсу не нужно знать
+            # таксономию, а показывать пользователю `WORKER_CRASH` нельзя.
+            "error_title": proto.ERROR_TITLES.get(self.error_type) if self.error_type else None,
             "cancel_requested": self.cancel_requested,
             "duration_sec": round(self.duration_sec, 2) if self.duration_sec else None,
             "eta_sec": round(self.eta_sec, 1) if self.eta_sec else None,
@@ -626,12 +662,14 @@ class JobQueue:
             reason = job.abort_reason or "нехватка памяти"
             job.status = JobStatus.ERROR
             job.error = reason
+            job.error_type = proto.ERROR_WATCHDOG
             job.message = "Прервано"
             job.regenerating = None
             self._discard_partial(job)
             self._mark_project(project_id, config.PROJECT_STATUS_ERROR, job.id, reason)
             logger.warning("Задача %s прервана watchdog'ом: %s", job.id, reason)
             return
+        job.error_type = proto.ERROR_CANCELLED
         self._mark_cancelled(job)
         self._mark_project(project_id, config.PROJECT_STATUS_DRAFT, job.id)
         logger.info("Задача %s отменена пользователем", job.id)
@@ -783,18 +821,7 @@ class JobQueue:
         tracker = eta.get_tracker()
         job.eta_sec = await asyncio.to_thread(tracker.estimate, plan)
         try:
-            result = await audio_pipeline.render_dialogue(
-                job_id=job.id,
-                replicas=payload.replicas,
-                speakers=payload.speakers,
-                settings=payload.settings,
-                on_progress=self._progress_callback(job, plan, tracker),
-                should_abort=lambda: self._cancelled(job.id),
-                wait_for_memory=lambda: self._wait_for_memory(job.id),
-                on_note=self._note_callback(job),
-                on_engine_loaded=self._engine_loaded_callback(tracker),
-                on_chunk_timing=self._timing_callback(job, plan, tracker),
-            )
+            result = await self._render_with_recovery(job, payload, plan, tracker)
             job.output_path = result.output_path
             job.duration_sec = result.duration_sec
             # Метаданные кусков нужны, чтобы задним числом заменить одну реплику.
@@ -818,6 +845,20 @@ class JobQueue:
             job.cancel_requested = True
             self._discard_partial(job)
             raise
+        except _RenderFailed as failed:
+            # Воркер падал, попытки кончились. Диагностика и статус прерванной
+            # реплики записаны в `_render_with_recovery`, готовые куски — тоже.
+            job.status = JobStatus.ERROR
+            job.error_type = failed.error_type
+            job.error = str(failed.cause)
+            job.message = "Прервано: процесс синтеза не удержался"
+            self._mark_project(
+                payload.project_id, config.PROJECT_STATUS_ERROR, job.id, str(failed.cause)
+            )
+            logger.error(
+                "Задача %s: синтез прерван (%s), попыток %d: %s",
+                job.id, failed.error_type, failed.attempts, failed.cause,
+            )
         except audio_pipeline.JobCancelledError:
             # Отмена пользователя — `cancelled`, прерывание watchdog'ом — ошибка
             # с причиной; различает их `_finish_interrupted`.
@@ -825,18 +866,229 @@ class JobQueue:
         except audio_pipeline.JobAbortedError as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
+            job.error_type = proto.ERROR_WATCHDOG
             job.message = "Прервано"
             self._mark_project(payload.project_id, config.PROJECT_STATUS_ERROR, job.id, str(exc))
             logger.warning("Задача %s прервана watchdog'ом: %s", job.id, exc)
         except Exception as exc:
+            # Ошибку мог вернуть сам движок (модель ответила отказом) — тогда тип
+            # известен; всё остальное считаем ошибкой синтеза. Готовые куски при
+            # этом не выбрасываем: рендер мог упасть на последней реплике.
+            partial = getattr(exc, "partial_render", None)
+            if payload.project_id and partial is not None and partial.failed_index is not None:
+                # Реплика прервана и здесь: статус `rendering`, оставшийся навсегда,
+                # скрыл бы от пользователя, что попытка была и не удалась.
+                self._set_replica_status(
+                    payload.project_id, partial.failed_index, config.REPLICA_STATUS_INTERRUPTED
+                )
+            await self._save_partial_takes(job, payload, partial, str(exc))
             job.status = JobStatus.ERROR
             job.error = str(exc)
+            job.error_type = getattr(exc, "error_type", proto.ERROR_TTS)
             job.message = "Ошибка"
             self._mark_project(payload.project_id, config.PROJECT_STATUS_ERROR, job.id, str(exc))
             logger.exception("Задача %s упала", job.id)
         finally:
             self._current_job_id = None
             job.finished_at = _now_iso()
+
+    async def _render_with_recovery(
+        self,
+        job: Job,
+        payload: JobPayload,
+        plan: list[eta.EtaStep],
+        tracker: eta.EtaTracker,
+    ) -> audio_pipeline.RenderResult:
+        """Рендер с восстановлением после отказа воркера (creash_report §12–§14).
+
+        Отказ процесса синтеза не отменяет задачу сразу: супервизор уже поднял
+        замену, а готовые куски лежат в памяти (`RenderPartial`). Пока позволяет
+        бюджет попыток (`TTS_WORKER_CRASH_RETRIES`), рендер продолжается с
+        прерванной реплики — уже синтезированное не пересоздаётся и не теряется.
+        Когда попытки кончились, готовое сохраняется вариантами реплик, а задача
+        завершается ошибкой с типом отказа: «доделать как-нибудь» здесь означало
+        бы скрыть, что сборка неполная.
+
+        Повтор не делается, если движок переведён супервизором в `DEGRADED`:
+        немедленная попытка упёрлась бы в тот же отказ, а пользователю нужен не
+        цикл, а понятное «подождите» (см. `WorkerUnavailableError`).
+        """
+        kwargs = {
+            "on_progress": self._progress_callback(job, plan, tracker, payload.project_id),
+            "should_abort": lambda: self._cancelled(job.id),
+            "wait_for_memory": lambda: self._wait_for_memory(job.id),
+            "on_note": self._note_callback(job),
+            "on_engine_loaded": self._engine_loaded_callback(tracker),
+            "on_chunk_timing": self._timing_callback(job, plan, tracker),
+        }
+        resume: audio_pipeline.RenderPartial | None = None
+        attempt = 0
+        while True:
+            try:
+                return await audio_pipeline.render_dialogue(
+                    job_id=job.id,
+                    replicas=payload.replicas,
+                    speakers=payload.speakers,
+                    settings=payload.settings,
+                    resume=resume,
+                    **kwargs,
+                )
+            except (proto.WorkerFailure, audio_pipeline.ChunkTimeoutError) as exc:
+                attempt += 1
+                partial = getattr(exc, "partial_render", None)
+                error_type = getattr(exc, "error_type", proto.ERROR_WORKER_TIMEOUT)
+                self._note_worker_failure(
+                    job,
+                    payload.project_id,
+                    exc,
+                    index=None if partial is None else partial.failed_index,
+                    attempt=attempt,
+                    error_type=error_type,
+                )
+                if not self._can_retry(job, exc, attempt):
+                    await self._save_partial_takes(job, payload, partial, str(exc))
+                    raise _RenderFailed(exc, partial, error_type, attempt) from exc
+                resume = partial if partial is not None and partial.done else None
+                done = 0 if resume is None else resume.done
+                job.message = (
+                    f"Процесс синтеза упал: перезапущен, продолжаю с реплики {done + 1}"
+                    if done
+                    else "Процесс синтеза упал: перезапущен, повторяю сначала"
+                )
+                logger.warning(
+                    "Задача %s: %s — повтор %d из %d (готово реплик: %d)",
+                    job.id, error_type, attempt, config.WORKER_CRASH_RETRIES + 1, done,
+                )
+
+    def _can_retry(self, job: Job, exc: BaseException, attempt: int) -> bool:
+        """Есть ли смысл в повторе: бюджет, состояние движка и отмена."""
+        if attempt > config.WORKER_CRASH_RETRIES:
+            return False
+        if isinstance(exc, proto.WorkerUnavailableError):
+            return False
+        return not self._cancelled(job.id)
+
+    def _note_worker_failure(
+        self,
+        job: Job,
+        project_id: str | None,
+        exc: BaseException,
+        *,
+        index: int | None,
+        attempt: int,
+        error_type: str,
+    ) -> None:
+        """Помечает прерванную реплику и записывает диагностику падения.
+
+        Запись идёт **до** повтора: если повтор удастся, пользователь всё равно
+        должен увидеть, что процесс падал и на какой реплике, — иначе «тихое»
+        восстановление скрыло бы нестабильность движка (creash_report §8).
+        """
+        if project_id is not None and index is not None:
+            self._set_replica_status(project_id, index, config.REPLICA_STATUS_INTERRUPTED)
+        details = dict(getattr(exc, "details", {}) or {})
+        engine = str(getattr(exc, "engine", "") or "")
+        try:
+            memory_percent = float(resource_guard.snapshot()["system_mem_percent"])
+        except Exception:  # noqa: BLE001 — метрика не повод терять запись о падении
+            memory_percent = None
+        try:
+            get_projects_store().record_worker_crash(
+                job_id=job.id,
+                project_id=project_id,
+                replica_index=index,
+                engine=engine,
+                error_type=error_type,
+                message=str(exc),
+                pid=details.get("pid"),
+                exit_code=details.get("exit_code"),
+                signal_number=details.get("signal"),
+                signal_name=details.get("signal_name"),
+                reason=str(details.get("reason") or ""),
+                retry_count=config.WORKER_CRASH_RETRIES,
+                attempt=attempt,
+                started_at=job.started_at,
+                interrupted_at=_now_iso(),
+                memory_percent=memory_percent,
+            )
+        except Exception as store_exc:  # noqa: BLE001 — база не важнее задачи
+            logger.warning("Задача %s: не удалось записать диагностику падения (%s)", job.id, store_exc)
+        title = proto.ERROR_TITLES.get(error_type, "Синтез прерван")
+        where = "" if index is None else f" на реплике {index + 1}"
+        job.error_type = error_type
+        job.message = f"{title}{where}"
+
+    @staticmethod
+    def _set_replica_status(project_id: str, index: int, status: str) -> None:
+        """Статус реплики проекта. Ошибка записи задачу не губит (см. `_mark_project`)."""
+        try:
+            get_projects_store().set_replica_status(project_id, index, status)
+        except Exception as exc:  # noqa: BLE001 — фоновая запись, задача важнее
+            logger.warning(
+                "Проект %s: не удалось записать статус реплики %s (%s)", project_id, index + 1, exc
+            )
+
+    async def _save_partial_takes(
+        self,
+        job: Job,
+        payload: JobPayload,
+        partial: audio_pipeline.RenderPartial | None,
+        error: str,
+    ) -> None:
+        """Сохраняет куски прерванного рендера вариантами реплик проекта.
+
+        До этого момента готовые куски жили только в памяти: падение процесса их
+        не теряло, а вот перезапуск приложения потерял бы. Поэтому перед тем как
+        признать рендер неудачным, сделанное кладётся на диск — и становится
+        текущим звучанием готовых реплик, а проект при этом **не** помечается
+        `rendered`: сборка не завершена.
+        """
+        project_id = payload.project_id
+        if not project_id or partial is None or not partial.pieces:
+            return
+        try:
+            paths = await asyncio.to_thread(
+                audio_pipeline.export_partial_takes, project_id, partial.pieces
+            )
+            takes: list[dict] = []
+            count = min(len(paths), len(partial.pieces), len(payload.replicas), len(partial.segments))
+            for index in range(count):
+                replica = payload.replicas[index]
+                speaker = payload.speakers.get(replica.voice)
+                start, end = partial.segments[index]
+                takes.append(
+                    {
+                        "index": index,
+                        "audio_path": str(paths[index]),
+                        "label": f"рендер {job.id} · {PARTIAL_TAKE_LABEL}",
+                        "seed": partial.seeds[index] if index < len(partial.seeds) else None,
+                        "engine": audio_pipeline.voice_engine(
+                            speaker.voice_id if speaker else ""
+                        ),
+                        "parameters": audio_pipeline.chunk_parameters(replica, speaker)
+                        if speaker
+                        else {},
+                        "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
+                        "qa": partial.qa[index].to_dict()
+                        if index < len(partial.qa) and partial.qa[index] is not None
+                        else None,
+                        "quality": partial.qualities[index].to_dict()
+                        if index < len(partial.qualities) and partial.qualities[index] is not None
+                        else None,
+                    }
+                )
+            await asyncio.to_thread(
+                get_projects_store().save_partial_takes, project_id, job.id, takes
+            )
+            logger.warning(
+                "Задача %s: сохранено %d кусков прерванного рендера (%s)",
+                job.id, len(takes), error,
+            )
+        except Exception as exc:  # noqa: BLE001 — диагностика важнее, файл уже не собран
+            logger.warning(
+                "Проект %s: не удалось сохранить куски прерванного рендера (%s: %s)",
+                project_id, type(exc).__name__, exc,
+            )
 
     @staticmethod
     def _mark_project(
@@ -971,7 +1223,29 @@ class JobQueue:
             job.regen_error = "Отменено"
             job.message = f"Реплика {task.index + 1}: перегенерация отменена"
             logger.info("Задача %s: перегенерация реплики %s отменена", job.id, task.index + 1)
+        except (proto.WorkerFailure, audio_pipeline.ChunkTimeoutError) as exc:
+            # Падение процесса при пересборке одной реплики: прежнее звучание
+            # цело (файл не переписан), новая версия не появилась. Автоповтора
+            # здесь нет намеренно: пересборка одной реплики — действие по
+            # требованию, и решение «пробовать ещё» остаётся за пользователем.
+            error_type = getattr(exc, "error_type", proto.ERROR_WORKER_TIMEOUT)
+            self._note_worker_failure(
+                job,
+                job.payload.project_id if job.payload else None,
+                exc,
+                index=task.index,
+                attempt=1,
+                error_type=error_type,
+            )
+            job.error_type = error_type
+            job.regen_error = proto.ERROR_TITLES.get(error_type, str(exc))
+            job.message = f"Реплика {task.index + 1}: процесс синтеза упал"
+            logger.error(
+                "Задача %s: перегенерация реплики %s прервана (%s)",
+                job.id, task.index + 1, exc,
+            )
         except Exception as exc:
+            job.error_type = getattr(exc, "error_type", proto.ERROR_TTS)
             job.regen_error = str(exc)
             job.message = "Перегенерация не удалась"
             logger.exception("Задача %s: перегенерация реплики %s упала", job.id, task.index + 1)
@@ -1029,6 +1303,9 @@ class JobQueue:
         try:
             if speaker is None:
                 raise ValueError(f"Для «{task.replica.label}» не найден голос")
+            # Реплика помечается занятой до передачи воркеру: после падения видно,
+            # какую именно реплику собирали (creash_report §7).
+            self._set_replica_status(task.project_id, task.index, config.REPLICA_STATUS_RENDERING)
             prepared, seed, qa_outcome, quality = await audio_pipeline.synthesize_replica(
                 replica=task.replica,
                 speaker=speaker,
@@ -1100,9 +1377,32 @@ class JobQueue:
             else:
                 self._mark_cancelled(job)
                 logger.info("Проект %s: пересинтез реплики %s отменён", task.project_id, task.index + 1)
+        except (proto.WorkerFailure, audio_pipeline.ChunkTimeoutError) as exc:
+            # Падение процесса при пересинтезе реплики проекта: в проект ничего
+            # не записано (вариант сохраняется последним шагом), поэтому данные
+            # проекта согласованы, а реплика помечается прерванной и объясняется
+            # в `regen_error` — повтор остаётся за пользователем.
+            error_type = getattr(exc, "error_type", proto.ERROR_WORKER_TIMEOUT)
+            self._note_worker_failure(
+                job,
+                task.project_id,
+                exc,
+                index=task.index,
+                attempt=1,
+                error_type=error_type,
+            )
+            job.status = JobStatus.ERROR
+            job.error_type = error_type
+            job.error = str(exc)
+            job.message = f"Реплика {task.index + 1}: процесс синтеза упал"
+            logger.error(
+                "Проект %s: пересинтез реплики %s прерван (%s)",
+                task.project_id, task.index + 1, exc,
+            )
         except Exception as exc:
             job.status = JobStatus.ERROR
             job.error = str(exc)
+            job.error_type = getattr(exc, "error_type", proto.ERROR_TTS)
             job.message = f"Реплика {task.index + 1}: не удалось перегенерировать"
             logger.exception(
                 "Проект %s: пересинтез реплики %s упал", task.project_id, task.index + 1
@@ -1286,6 +1586,7 @@ class JobQueue:
         job: Job,
         plan: list[eta.EtaStep] | None = None,
         tracker: eta.EtaTracker | None = None,
+        project_id: str | None = None,
     ) -> ProgressCallback:
         """Ход рендера: текущая реплика и оценка остатка по плану.
 
@@ -1293,12 +1594,22 @@ class JobQueue:
         `_timing_callback` по факту законченного куска. Прежнее «среднее по
         длительности аудио × число реплик» убрано: одно число на все реплики
         не различало ни движки, ни длину текста, ни холодный старт, ни проверку.
+
+        Заодно здесь реплика помечается `rendering` в базе: колбэк вызывается
+        ровно перед передачей куска движку, и после падения воркера видно, на
+        какой реплике остановился рендер (creash_report §7). Продолжение рендера
+        (`resume`) пропускает готовые реплики и, значит, не переписывает их
+        статус задним числом.
         """
 
         def on_progress(index: int, total: int, label: str) -> None:
             job.current_replica = index - 1
             job.current_voice = label
             job.message = f"Реплика {index} из {total} — {label}"
+            if project_id:
+                JobQueue._set_replica_status(
+                    project_id, index - 1, config.REPLICA_STATUS_RENDERING
+                )
             if plan and tracker is not None:
                 # Index у пайплайна с единицы: закончены куски до index - 1.
                 job.eta_sec = tracker.estimate(plan[index - 1 :])

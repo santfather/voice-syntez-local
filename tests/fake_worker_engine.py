@@ -33,6 +33,15 @@ SECONDS_PER_CHAR = 0.01
 SLOW_SECONDS = 3.0
 HANG_SECONDS = 120.0
 
+# Журнал вызовов: одна строка на каждый ушедший в модель текст. Нужен тестам
+# восстановления — «продолжили с упавшей реплики, а не начали заново» проверяется
+# именно по числу вызовов на реплику, а не по косвенным признакам.
+CALL_LOG_ENV = "TTS_FAKE_CALL_LOG"
+# Файл-маркер разового сбоя: если задан, падение случается один раз (после него
+# маркер создан), а повтор проходит. Так проверяется сценарий «упало →
+# перезапуск → продолжили» без вмешательства в код очереди.
+CRASH_ONCE_ENV = "TTS_FAKE_CRASH_ONCE"
+
 
 class FakeWorkerEngine(SynthesisEngine):
     """Заглушка с управляемым поведением (см. модульную строку документации)."""
@@ -55,13 +64,39 @@ class FakeWorkerEngine(SynthesisEngine):
         self.loads += 1
         self._mark(STATE_READY)
 
+    @staticmethod
+    def _log_call(text: str) -> None:
+        path = os.environ.get(CALL_LOG_ENV, "")
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\t{text}\n")
+        except OSError:
+            pass  # журнал — инструмент теста, а не часть движка
+
+    @staticmethod
+    def _crash() -> None:
+        """Падает нативно — один раз, если задан маркер разового сбоя."""
+        once = os.environ.get(CRASH_ONCE_ENV, "")
+        if not once:
+            os.abort()
+        if os.path.exists(once):
+            return
+        with open(once, "w", encoding="utf-8") as handle:
+            handle.write("crashed\n")
+        os.abort()
+
     def _synthesize(self, text, ref_audio_path, ref_text, speed, params):
         self.synthesizes += 1
-        lowered = text.lower()
+        self._log_call(text)
+        # Знаки ударения (`+` от RUAccent) не должны мешать опознавать маркер:
+        # до движка текст доходит уже с разметкой.
+        lowered = text.lower().replace("+", "")
         if "crash" in lowered or "краш" in lowered:
             # Нативное падение: исключение поймать нельзя, и это ровно тот
             # сценарий, ради которого воркер вынесен в отдельный процесс.
-            os.abort()
+            self._crash()
         if "segv" in lowered:
             import ctypes
 

@@ -214,6 +214,46 @@ class RenderResult:
 
 
 @dataclass
+class RenderPartial:
+    """Что успело получиться до прерывания рендера (creash_report).
+
+    Состояние прикрепляется к исключению, а не заворачивает его: типы исключений
+    (отмена, таймаут, ошибка движка, падение воркера) значимы для вызывающего, и
+    подмена их общей обёрткой сломала бы разбор ошибок в очереди. Очередь читает
+    это состояние через `getattr(exc, "partial_render", None)` и решает:
+    сохранить готовые куски вариантами и продолжить с упавшей реплики или
+    завершить задачу ошибкой, не потеряв сделанное.
+
+    Куски здесь **подготовленные** (края, тембр, RMS), но не финализированные:
+    нормализация громкости считается по всему треку, а трека ещё нет. При
+    продолжении рендера они встают в начало сборки как есть, поэтому итоговый
+    файл всё равно получает общую нормализацию.
+    """
+
+    pieces: list[np.ndarray]
+    segments: list[tuple[int, int]]
+    seeds: list[int | None]
+    qa: list[QaOutcome | None]
+    qualities: list[take_quality.TakeQuality]
+    # Индекс реплики (с нуля), на которой прервалось; `None` — все реплики
+    # синтезированы, а сбой случился на сборке (склейка, запись файла).
+    failed_index: int | None
+    error: str
+
+    @property
+    def done(self) -> int:
+        """Сколько реплик готово — подряд, с начала диалога."""
+        return len(self.pieces)
+
+    def to_dict(self) -> dict:
+        return {
+            "replicas_done": self.done,
+            "failed_index": self.failed_index,
+            "error": self.error,
+        }
+
+
+@dataclass
 class ChunkVariant:
     """Сохранённый вариант куска: файл для прослушивания, сид и подпись.
 
@@ -745,8 +785,9 @@ async def _synthesize_chunk(
         ) from exc
     if failure is not None:
         logger.error(
-            "Реплика %s (%s): движок %s упал (%s)",
-            position, label, engine.id, type(failure).__name__, exc_info=failure,
+            "Реплика %s (%s): движок %s упал (%s), %s",
+            position, label, engine.id, type(failure).__name__, _text_fingerprint_text(text),
+            exc_info=failure,
         )
         raise failure
     assert outcome is not None  # при пустом failure результат синтеза всегда есть
@@ -991,6 +1032,7 @@ async def render_dialogue(
     on_note: NoteCallback | None = None,
     on_engine_loaded: EngineLoadedCallback | None = None,
     on_chunk_timing: ChunkTimingCallback | None = None,
+    resume: RenderPartial | None = None,
 ) -> RenderResult:
     """Синтезирует реплики строго по одной и склеивает их в один файл.
 
@@ -1004,6 +1046,11 @@ async def render_dialogue(
 
     `on_engine_loaded` и `on_chunk_timing` — фактические времена для статистики
     ETA; без них поведение прежнее (оба колбэка необязательны).
+
+    `resume` — продолжение прерванного рендера (creash_report): готовые куски
+    встают в начало сборки, синтез идёт с первой неготовой реплики. Это не
+    «второй пайплайн»: тот же цикл, тот же движок, та же склейка и та же общая
+    нормализация громкости — пропускается только уже сделанная работа.
     """
     replicas = list(replicas)
     if not replicas:
@@ -1051,65 +1098,99 @@ async def render_dialogue(
         per_replica[index] = tuning_for(voice, base, replica.overrides)
     engines = await _load_engines(list(resolved.values()), on_loaded=on_engine_loaded)
 
-    pieces: list[np.ndarray] = []
-    segments: list[tuple[int, int]] = []
-    seeds: list[int | None] = []
-    checks: list[QaOutcome | None] = []
-    qualities: list[take_quality.TakeQuality] = []
+    pieces: list[np.ndarray] = list(resume.pieces) if resume else []
+    segments: list[tuple[int, int]] = list(resume.segments) if resume else []
+    seeds: list[int | None] = list(resume.seeds) if resume else []
+    checks: list[QaOutcome | None] = list(resume.qa) if resume else []
+    qualities: list[take_quality.TakeQuality] = list(resume.qualities) if resume else []
     total = len(replicas)
-    cursor = 0
-    for index, replica in enumerate(replicas, start=1):
-        if should_abort and should_abort():
-            # Отмена пользователя и прерывание watchdog'ом приходят одним
-            # сигналом: различить их — дело вызывающего (job_queue), а пайплайн
-            # обязан просто остановиться между кусками, не убивая поток внутри
-            # вызова модели.
-            raise JobCancelledError(f"Прервано на реплике {index} из {total}")
-        if on_progress:
-            on_progress(index, total, replica.label)
-        settings_for_replica = per_replica[index - 1]
-        voice = resolved[settings_for_replica.voice_id]
-        engine = engines[voice.engine]
+    cursor = segments[-1][1] if segments else 0
+    # Сколько реплик уже готово: их не синтезируем заново — в этом смысл
+    # продолжения. Проверка «не больше, чем реплик» стоит здесь, а не у
+    # вызывающего: продолжение с чужим набором реплик дало бы файл, в котором
+    # куски не соответствуют тексту.
+    done_before = len(pieces)
+    if done_before > total:
+        raise ValueError(
+            f"Продолжение рендера противоречит диалогу: готово {done_before} кусков, "
+            f"а реплик {total}"
+        )
+    # Индекс реплики, на которой прервалось: нужен очереди, чтобы пометить
+    # конкретную реплику `interrupted` и назвать её в диагностике.
+    current_index: int | None = None
 
-        started = time.monotonic()
-        chunk, seed, qa_outcome = await _synthesize_checked(
-            engine,
-            voice,
-            replica,
-            settings_for_replica,
-            settings,
-            position=f"{index} из {total}",
-            label=replica.label,
-            wait_for_memory=wait_for_memory,
-            on_note=on_note,
-        )
-        seeds.append(seed)
-        checks.append(qa_outcome)
-        pause = _pause_samples(settings_for_replica, settings)
-        if pieces and pause:
-            pieces.append(np.zeros(pause, dtype=np.float32))
-            cursor += pause
-        prepared = await asyncio.to_thread(_prepare_chunk, chunk, settings_for_replica)
-        # Диагностика считается по подготовленному куску — по тому, что реально
-        # попадёт в файл, а не по сырому выходу модели.
-        qualities.append(
-            await asyncio.to_thread(
-                take_quality.measure, prepared, replica.text, qa=qa_outcome, raw=chunk
+    try:
+        for index, replica in enumerate(replicas, start=1):
+            if index <= done_before:
+                continue
+            current_index = index - 1
+            if should_abort and should_abort():
+                # Отмена пользователя и прерывание watchdog'ом приходят одним
+                # сигналом: различить их — дело вызывающего (job_queue), а пайплайн
+                # обязан просто остановиться между кусками, не убивая поток внутри
+                # вызова модели.
+                raise JobCancelledError(f"Прервано на реплике {index} из {total}")
+            if on_progress:
+                on_progress(index, total, replica.label)
+            settings_for_replica = per_replica[index - 1]
+            voice = resolved[settings_for_replica.voice_id]
+            engine = engines[voice.engine]
+
+            started = time.monotonic()
+            chunk, seed, qa_outcome = await _synthesize_checked(
+                engine,
+                voice,
+                replica,
+                settings_for_replica,
+                settings,
+                position=f"{index} из {total}",
+                label=replica.label,
+                wait_for_memory=wait_for_memory,
+                on_note=on_note,
             )
-        )
-        segments.append((cursor, cursor + prepared.size))
-        cursor += prepared.size
-        pieces.append(prepared)
-        # Время уходит наружу после подготовки куска: это ровно тот интервал,
-        # который прожил пользователь, включая подготовку, и он же ляжет в
-        # статистику — иначе оценка систематически недосчитывала бы кусок.
-        if on_chunk_timing:
-            on_chunk_timing(
-                index - 1,
-                time.monotonic() - started,
-                prepared.size / SAMPLE_RATE,
-                qa_outcome,
+            seeds.append(seed)
+            checks.append(qa_outcome)
+            pause = _pause_samples(settings_for_replica, settings)
+            if pieces and pause:
+                pieces.append(np.zeros(pause, dtype=np.float32))
+                cursor += pause
+            prepared = await asyncio.to_thread(_prepare_chunk, chunk, settings_for_replica)
+            # Диагностика считается по подготовленному куску — по тому, что реально
+            # попадёт в файл, а не по сырому выходу модели.
+            qualities.append(
+                await asyncio.to_thread(
+                    take_quality.measure, prepared, replica.text, qa=qa_outcome, raw=chunk
+                )
             )
+            segments.append((cursor, cursor + prepared.size))
+            cursor += prepared.size
+            pieces.append(prepared)
+            # Время уходит наружу после подготовки куска: это ровно тот интервал,
+            # который прожил пользователь, включая подготовку, и он же ляжет в
+            # статистику — иначе оценка систематически недосчитывала бы кусок.
+            if on_chunk_timing:
+                on_chunk_timing(
+                    index - 1,
+                    time.monotonic() - started,
+                    prepared.size / SAMPLE_RATE,
+                    qa_outcome,
+                )
+    except BaseException as exc:
+        # Готовое не теряем: состояние уходит наверх вместе с исключением
+        # (creash_report). `current_index` обнуляется ниже, когда цикл дошёл до
+        # конца, — иначе сбой на сборке пометил бы `interrupted` последнюю
+        # реплику, аудио которой уже синтезировано.
+        exc.partial_render = RenderPartial(
+            pieces=pieces,
+            segments=segments,
+            seeds=seeds,
+            qa=checks,
+            qualities=qualities,
+            failed_index=current_index,
+            error=str(exc),
+        )
+        raise
+    current_index = None
 
     final = await asyncio.to_thread(np.concatenate, pieces)
     final = await asyncio.to_thread(_finalize_track, final)
@@ -1307,6 +1388,28 @@ def export_project_chunks(
     for index, (start, end) in enumerate(segments, start=1):
         target = directory / f"r{index}-{uuid.uuid4().hex[:8]}.wav"
         _write_audio(target, np.asarray(audio[start:end], dtype=np.float32), "wav")
+        paths.append(target)
+    return paths
+
+
+def export_partial_takes(project_id: str, pieces: Iterable[np.ndarray]) -> list[Path]:
+    """Сохраняет куски **прерванного** рендера отдельными wav.
+
+    Трека ещё нет, поэтому куски лежат в памяти подготовленными, но не
+    финализированными вместе. Каждый финализируется сам по себе — ровно как
+    вариант куска (см. `save_chunk_variant`): без этого сохранённое звучало бы
+    тише готового файла, а сравнение с прежними вариантами превращалось бы в
+    сравнение громкости.
+
+    Имена отличаются от кусков обычного рендера (`r-part-…`): по ним видно, что
+    это остаток прерванной сборки, и они не путаются с вырезками готового файла.
+    """
+    directory = config.PROJECTS_OUTPUT_DIR / project_id
+    directory.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for piece in pieces:
+        target = directory / f"r-part-{uuid.uuid4().hex[:8]}.wav"
+        _write_audio(target, _finalize_track(np.asarray(piece, dtype=np.float32)), "wav")
         paths.append(target)
     return paths
 

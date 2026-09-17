@@ -14,6 +14,7 @@ from pathlib import Path
 from .. import config
 from ..dialogue_parser import parse_dialogue, voice_label
 from .connection import transaction
+from .repositories.crashes import WorkerCrashesRepository
 from .repositories.projects import ProjectsRepository
 from .repositories.replicas import ReplicasRepository
 from .repositories.takes import TakesRepository
@@ -316,6 +317,57 @@ class ProjectsStore:
             replicas.set_overrides(int(replica["id"]), overrides)
         return self.get_project(project_id)  # type: ignore[return-value]
 
+    def set_replica_status(self, project_id: str, index: int, status: str) -> bool:
+        """Статус одной реплики: `rendering` перед синтезом, `interrupted` при срыве.
+
+        Без обновления проекта: у рендера и у анализа свои статусы, и трогать
+        проект из очереди по поводу одной реплики значило бы гасить более общий
+        сигнал («идёт рендер») ради частного. `False` — реплики с таким индексом
+        нет (разовая задача без проекта).
+        """
+        if status not in config.REPLICA_STATUSES:
+            raise ValueError(f"Неизвестный статус реплики: {status}")
+        with transaction() as connection:
+            replica = ReplicasRepository(connection).by_index(project_id, index)
+            if replica is None:
+                return False
+            return ReplicasRepository(connection).set_status(int(replica["id"]), status)
+
+    # -- диагностика падений воркера (creash_report) ---------------------------
+    def record_worker_crash(
+        self,
+        *,
+        job_id: str = "",
+        project_id: str | None = None,
+        replica_index: int | None = None,
+        **fields,
+    ) -> dict:
+        """Записывает падение процесса синтеза. Возвращает сохранённую запись.
+
+        `replica_id` разрешается здесь, а не вызывающим: очередь знает индекс
+        реплики, а идентификатор строки — деталь схемы, и тащить её в очередь
+        незачем. Ошибка записи не должна губить задачу: диагностика вторична по
+        отношению к уже готовому аудио (см. `_mark_project` в очереди).
+        """
+        with transaction() as connection:
+            replica_id = None
+            if project_id is not None and replica_index is not None:
+                replica = ReplicasRepository(connection).by_index(project_id, int(replica_index))
+                if replica is not None:
+                    replica_id = int(replica["id"])
+            return WorkerCrashesRepository(connection).add(
+                job_id=job_id,
+                project_id=project_id,
+                replica_id=replica_id,
+                replica_index=None if replica_index is None else int(replica_index),
+                **fields,
+            )
+
+    def list_worker_crashes(self, limit: int = 20, project_id: str | None = None) -> list[dict]:
+        """Последние падения — от свежих к старым (для диагностики и интерфейса)."""
+        with transaction() as connection:
+            return WorkerCrashesRepository(connection).list_recent(limit, project_id)
+
     # -- подготовка текста (анализ) --------------------------------------------
     def save_analysis(self, project_id: str, summary) -> dict:
         """Сохраняет результаты анализа проекта одной транзакцией.
@@ -571,6 +623,36 @@ class ProjectsStore:
                 job_id=job_id,
                 last_error=None,
             )
+
+    def save_partial_takes(self, project_id: str, job_id: str, takes: list[dict]) -> None:
+        """Сохраняет куски **прерванного** рендера вариантами реплик.
+
+        Отличие от `save_render_takes` ровно одно и принципиальное: проект не
+        помечается `rendered`. Рендер не завершился, и «готово» здесь было бы
+        ложью, из-за которой следующий запуск не отличил бы целый проект от
+        наполовину собранного. Готовые реплики при этом становятся текущими
+        вариантами: работа не пропадает, её можно послушать и продолжить.
+        """
+        with transaction() as connection:
+            replicas = ReplicasRepository(connection)
+            takes_repo = TakesRepository(connection)
+            by_index = {int(item["index"]): item for item in replicas.list_for_project(project_id)}
+            for item in takes:
+                replica = by_index.get(int(item["index"]))
+                if replica is None:
+                    continue
+                take = takes_repo.add(
+                    replica_id=int(replica["id"]),
+                    audio_path=str(item["audio_path"]),
+                    label=str(item.get("label", "")),
+                    seed=item.get("seed"),
+                    engine=str(item.get("engine", "")),
+                    parameters=item.get("parameters") or {},
+                    duration_sec=float(item.get("duration_sec") or 0.0),
+                    qa=item.get("qa"),
+                    quality=item.get("quality"),
+                )
+                replicas.select_take(int(replica["id"]), int(take["id"]))
 
     def set_project_status(
         self, project_id: str, status: str, job_id: str | None = None, error: str | None = None

@@ -9,8 +9,8 @@ FastAPI, и воркер очереди (он уводит синтез в от�
 import logging
 import sqlite3
 import threading
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from .. import config

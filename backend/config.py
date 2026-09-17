@@ -61,6 +61,20 @@ PROJECT_STATUS_RENDERED = "rendered"
 PROJECT_STATUS_ERROR = "error"
 REPLICA_STATUS_PENDING = "pending"
 REPLICA_STATUS_RENDERED = "rendered"
+# Реплика прямо сейчас синтезируется. Отдельный статус, а не «pending»: после
+# падения приложения видно, на какой реплике процесс остановился, — иначе
+# «зависшие» реплики не отличить от тех, что ещё не начинали.
+REPLICA_STATUS_RENDERING = "rendering"
+# Синтез реплики прерван падением воркера или перезапуском приложения: аудио нет
+# (или есть не полностью), и это не «pending» — попытку уже делали, и причина
+# записана в диагностике (worker_crashes, projects.last_error).
+REPLICA_STATUS_INTERRUPTED = "interrupted"
+REPLICA_STATUSES = (
+    REPLICA_STATUS_PENDING,
+    REPLICA_STATUS_RENDERING,
+    REPLICA_STATUS_RENDERED,
+    REPLICA_STATUS_INTERRUPTED,
+)
 
 # Готовность текста — отдельная ось от статуса рендера. `PROJECT_STATUS_*`
 # отвечает на «что с аудио» (идёт сборка, готово, упало), а `PROJECT_ANALYSIS_*`
