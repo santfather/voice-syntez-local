@@ -52,6 +52,7 @@ class FakeOllamaClient:
         responder: Callable[[dict], str] | None = None,
         responses_by_model: dict[str, str] | None = None,
         gold_by_replica: dict[int, list[dict]] | None = None,
+        utterance_by_replica: dict[int, str] | None = None,
         available: bool = True,
         error: str = "",
         latency_sec: float = 0.0,
@@ -60,6 +61,7 @@ class FakeOllamaClient:
     ) -> None:
         self._responses = dict(responses_by_model or {})
         self._gold = dict(gold_by_replica or {})
+        self._utterance = dict(utterance_by_replica or {})
         if models is not None:
             self._models = list(models)
         elif self._responses:
@@ -78,6 +80,10 @@ class FakeOllamaClient:
         self.calls: list[dict] = []
         self.unloaded: list[str] = []
         self._loaded: list[str] = []
+        # Пик одновременно загруженных моделей: тест последовательного прогона
+        # проверяет именно его — на 18 GB вторая модель не должна подниматься,
+        # пока первая в памяти.
+        self.max_loaded = 0
 
     # -- совместимость с настоящим клиентом -------------------------------------
     def version(self) -> str:
@@ -156,6 +162,7 @@ class FakeOllamaClient:
             # Настоящая Ollama держит модель загруженной после запроса — здесь это
             # тоже видно, чтобы memory policy проверялась на честном состоянии.
             self._loaded.append(model)
+        self.max_loaded = max(self.max_loaded, len(set(self._loaded)))
 
         case = _case_from_messages(messages, self._responses)
         text = self._respond_for(model, case)
@@ -177,13 +184,17 @@ class FakeOllamaClient:
         preset = self._responses.get(model)
         if preset is not None:
             return _shape_response(preset, case)
-        gold = case.get("expected") or self._gold.get(int(case.get("replica_id") or -1), [])
+        replica_id = int(case.get("replica_id") or -1)
+        gold = case.get("expected") or self._gold.get(replica_id, [])
         return json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
                 "replica_id": case.get("replica_id", 0),
                 "items": gold,
-                "utterance": {"class": "NORMAL", "context_dependency": "LOW"},
+                "utterance": {
+                    "class": self._utterance.get(replica_id, "NORMAL"),
+                    "context_dependency": "LOW",
+                },
             },
             ensure_ascii=False,
         )

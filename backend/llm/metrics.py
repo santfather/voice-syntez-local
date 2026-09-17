@@ -379,19 +379,21 @@ def percentile(values: Sequence[float], fraction: float) -> float | None:
     return round(ordered[index], 4)
 
 
-def _ratio(numerator: int, denominator: int) -> float:
-    """Отношение; при пустом знаменателе — 0.0, а не «нет данных».
+def _ratio(numerator: int, denominator: int) -> float | None:
+    """Отношение; при пустом знаменателе — None («мерить нечего»).
 
-    Иначе модель, не ответившая ни разу, выглядела бы нейтрально по precision.
+    None печатается в отчёте как «—» и не путается с честным нулём: у категории,
+    где в gold нет ни одной правки, recall не «провален», его просто нет. При
+    этом кейс без ответа даёт ноль, а не None, — там знаменатель есть.
     """
     if denominator <= 0:
-        return 0.0
+        return None
     return round(numerator / denominator, 4)
 
 
-def _f1(precision: float, recall: float) -> float:
-    if precision + recall <= 0:
-        return 0.0
+def _f1(precision: float | None, recall: float | None) -> float | None:
+    if precision is None or recall is None or precision + recall <= 0:
+        return 0.0 if None not in (precision, recall) else None
     return round(2 * precision * recall / (precision + recall), 4)
 
 
@@ -427,6 +429,10 @@ def aggregate(scores: Sequence[CaseScore]) -> dict:
 
     return {
         "cases": total,
+        # Сколько кейсов стоит за precision и recall: по этим числам видно, можно
+        # ли вообще доверять метрике в данной категории.
+        "positive_cases": len(positive),
+        "negative_cases": len(negative),
         "gold_annotations": gold_annotations,
         "predicted_annotations": predicted_annotations,
         "matched_annotations": sum(score.matched for score in scores),

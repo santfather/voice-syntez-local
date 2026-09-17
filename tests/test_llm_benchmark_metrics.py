@@ -169,10 +169,12 @@ def test_metrics_yo_precision_recall():
     assert report["metrics"]["yo_precision"] == 0.0
     assert report["metrics"]["yo_recall"] == 0.0
 
+    # Модель не предложила ни одной «ё»: точности нет (нечего оценивать), а
+    # полнота честно нулевая.
     report = m.score_run([case, negative], [missing, _respond(negative)])
-    assert report["metrics"]["yo_precision"] == 0.0
+    assert report["metrics"]["yo_precision"] is None
     assert report["metrics"]["yo_recall"] == 0.0
-    assert report["metrics"]["yo_f1"] == 0.0
+    assert report["metrics"]["yo_f1"] is None
 
 
 def test_metrics_false_positive_rate():
@@ -190,7 +192,10 @@ def test_metrics_false_positive_rate():
     report = m.score_run(cases, [invented, _respond(cases[1]), _respond(cases[2])])
     assert report["metrics"]["false_positive_rate"] == 0.3333
     assert report["metrics"]["issue_precision"] == 0.0
-    assert report["metrics"]["issue_recall"] == 0.0
+    # В gold нет ни одной правки — recall мерить не на чем, и это «—», а не 0.0:
+    # иначе чистый корпус выглядел бы как провал по полноте.
+    assert report["metrics"]["issue_recall"] is None
+    assert report["metrics"]["issue_f1"] is None
 
 
 def test_metrics_valid_json_rate():
@@ -351,6 +356,20 @@ def test_metrics_issue_and_utterance_and_categories():
     assert report["metrics"]["utterance_accuracy"] == 1.0
 
 
+def test_metrics_undefined_per_category_is_dash_not_zero():
+    """В категории без gold-правок precision/recall не «ноль», а «—»."""
+    text = "На кухне пахло свежим хлебом и корицей."
+    clean = _gold("no_issue-0001", text, s.CATEGORY_NEGATIVE, ())
+    report = m.score_run([clean], [_respond(clean)])
+    category = report["categories"][s.CATEGORY_NEGATIVE]
+    assert category["issue_precision"] is None
+    assert category["issue_recall"] is None
+    assert category["false_positive_rate"] == 0.0
+    assert report["metrics"]["false_positive_rate"] == 0.0
+    assert m._format_value(category["issue_precision"]) == "—"
+    assert m._format_value(category["false_positive_rate"]) == "0"
+
+
 def test_metrics_missing_response_is_a_failure_not_a_gap():
     """Кейс без ответа — это результат модели (ноль), а не пропуск в отчёте."""
     text = "Он все понял без лишних слов."
@@ -419,6 +438,14 @@ def test_metrics_known_metric_names_are_declared():
         [_respond(case, (_item(CASTLE, "замка", s.TYPE_HOMOGRAPH, meaning="строение"),))],
     )
     for name in report["metrics"]:
-        if name in {"cases", "gold_annotations", "predicted_annotations", "matched_annotations", "latency_max"}:
+        if name in {
+            "cases",
+            "positive_cases",
+            "negative_cases",
+            "gold_annotations",
+            "predicted_annotations",
+            "matched_annotations",
+            "latency_max",
+        }:
             continue
         assert name in m.HIGHER_IS_BETTER, name

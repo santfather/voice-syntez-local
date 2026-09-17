@@ -611,8 +611,19 @@ def _process_rss_mb() -> float:
 
 
 def dry_run_client(cases: Sequence[s.DatasetCase], **kwargs) -> FakeOllamaClient:
-    """Клиент для `--dry-run`: отвечает gold-аннотациями без моделей и сети."""
-    gold = {
-        case.replica_id: [item.to_dict() for item in case.expected] for case in cases
+    """Клиент для `--dry-run`: отвечает gold без моделей и сети.
+
+    Он повторяет **идеальную** модель: gold-аннотации и gold-класс реплики. Это
+    верхняя граница метрик, и она проверяема: если идеальный ответ не даёт 100 %
+    по метрике, значит ошибка в gold или в самой метрике, а не в модели. Именно
+    так был найден омограф у слова «Да» в диалоговом кейсе.
+    """
+    gold = {case.replica_id: [item.to_dict() for item in case.expected] for case in cases}
+    utterances = {
+        case.replica_id: case.expected_utterance
+        for case in cases
+        if case.expected_utterance
     }
-    return FakeOllamaClient(gold_by_replica=gold, **kwargs)
+    return FakeOllamaClient(
+        gold_by_replica=gold, utterance_by_replica=utterances, **kwargs
+    )

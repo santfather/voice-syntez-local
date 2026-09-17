@@ -66,15 +66,16 @@ def _cases(count: int = 3) -> list[s.DatasetCase]:
 
 
 class RecordingClient(FakeOllamaClient):
-    """Подставной клиент, который следит за конкурентной загрузкой моделей."""
+    """Подставной клиент, который дополнительно помнит порядок вызовов.
+
+    Пик одновременной загрузки (`max_loaded`) считает сам fake-клиент.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.max_loaded = 0
         self.loaded_sequence: list[str] = []
 
     def chat(self, model, messages, **kwargs):
-        self.max_loaded = max(self.max_loaded, len(set(self._loaded) | {model}))
         self.loaded_sequence.append(model)
         return super().chat(model, messages, **kwargs)
 
@@ -343,3 +344,70 @@ def test_benchmark_metrics_and_raw_are_separate_files(tmp_path):
     metrics = json.loads((model_dir / "metrics.json").read_text(encoding="utf-8"))
     assert "raw_text" not in json.dumps(metrics)[:200]
     assert metrics["planned_cases"] == 2
+
+
+def test_benchmark_dry_run_full_corpus_is_a_clean_upper_bound(tmp_path):
+    """`--dry-run` на всём корпусе: идеальный ответ обязан дать ровно 100 %.
+
+    Это проверка не модели, а всей цепочки: prompt → схема → клиент → разбор →
+    метрики → отчёты. Если идеальный ответ теряет хоть процент, ошибка в gold или
+    в метрике — и настоящий прогон покажет то же самое, только её будет не видно
+    за реальными ошибками моделей. Именно так нашлась аннотация-омограф у слова
+    «Да» в диалоговом кейсе.
+    """
+    corpus = s.load_dataset(
+        Path(__file__).resolve().parent.parent
+        / "benchmarks"
+        / "russian_linguistics"
+        / "dataset.v1.jsonl"
+    )
+    tags = [
+        "qwen3:4b-instruct-2507-q4_K_M",
+        "qwen3:4b-instruct-2507-q8_0",
+        "qwen3:8b",
+        "gemma3:4b",
+    ]
+    models = [
+        OllamaModel(tag=tag, digest=f"dry{i}", size_bytes=1024**3)
+        for i, tag in enumerate(tags)
+    ]
+    # Клиент получает gold, а prompt модели — нет: как в настоящем прогоне.
+    client = runner_mod.dry_run_client(corpus, models=models)
+    runner = runner_mod.BenchmarkRunner(
+        client=client,
+        cases=corpus,
+        output_dir=tmp_path,
+        sensor=lambda: {"system_percent": 45.0, "available_gb": 11.0, "pressure": "green"},
+        on_progress=lambda message: None,
+    )
+    report = runner.run(tags, resume=True)
+    assert len(client.calls) == len(corpus) * len(tags)
+
+    for tag in tags:
+        metrics = report["models"][tag]["metrics"]["metrics"]
+        assert report["models"][tag]["status"] == "ok"
+        assert metrics["schema_valid_rate"] == 1.0
+        assert metrics["source_preservation_rate"] == 1.0
+        assert metrics["issue_precision"] == 1.0
+        assert metrics["issue_recall"] == 1.0
+        assert metrics["issue_f1"] == 1.0
+        assert metrics["false_positive_rate"] == 0.0
+        assert metrics["homograph_accuracy"] == 1.0
+        assert metrics["yo_precision"] == 1.0
+        assert metrics["yo_recall"] == 1.0
+        assert metrics["needs_review_precision"] == 1.0
+        assert metrics["span_accuracy"] == 1.0
+        assert metrics["utterance_accuracy"] == 1.0
+        assert metrics["critical_error_rate"] == 0.0
+        assert report["models"][tag]["metrics"]["critical_errors"]["count"] == 0
+        # Ни одна модель не загружалась одновременно с другой.
+        assert report["models"][tag]["unload_confirmed"] is True
+    assert client.max_loaded == 1
+
+    # Категории, где правки вообще есть, тоже обязаны быть идеальными.
+    for category, values in report["models"]["qwen3:8b"]["metrics"]["categories"].items():
+        assert values["positive_cases"] + values["negative_cases"] == values["cases"], category
+        if values["positive_cases"]:
+            assert values["issue_recall"] == 1.0, category
+        if values["negative_cases"]:
+            assert values["false_positive_rate"] == 0.0, category

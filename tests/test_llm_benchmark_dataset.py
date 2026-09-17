@@ -216,13 +216,23 @@ def test_benchmark_utterance_classes_are_valid(dataset):
         assert case.context_before or case.context_after, case.id
     short_ids = {case.id for case in dataset if case.category == s.CATEGORY_SHORT}
     assert short_ids <= {case.id for case in with_class}
-    dialogue_ambiguous = [
-        case
-        for case in dataset
-        if case.category == s.CATEGORY_DIALOGUE and case.ambiguous
+    # Диалоговые кейсы без правок — это «текст менять не надо», а не спорная
+    # разметка: иначе список на проверку человеком пухнет от кейсов, где и так всё
+    # ясно, и внимание уходит не туда.
+    dialogue_clean = [
+        case for case in dataset if case.category == s.CATEGORY_DIALOGUE and not case.expected
     ]
-    assert dialogue_ambiguous
-    assert all(case.expected_utterance for case in dialogue_ambiguous)
+    assert dialogue_clean
+    assert all(case.expected_utterance for case in dialogue_clean)
+    assert all(case.expect_no_issue for case in dialogue_clean)
+    assert not any(case.ambiguous for case in dialogue_clean)
+    dialogue_homographs = [
+        case for case in dataset if case.category == s.CATEGORY_DIALOGUE and case.expected
+    ]
+    assert dialogue_homographs
+    for case in dialogue_homographs:
+        assert case.expected[0].meaning, case.id
+        assert case.expected_utterance, case.id
 
 
 def test_benchmark_files_are_present_and_parse():
