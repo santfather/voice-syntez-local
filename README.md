@@ -1787,13 +1787,37 @@ Gold-корпус (фаза 2 из 7) лежит в `benchmarks/russian_linguist
 - короткие реплики (`short_replica`) хранят контекст, но не правки: ожидаемый ответ —
   класс реплики (`CONFIRMATION`, `NEGATION`, `QUESTION`, …), а не переписанный текст.
 
+Метрики прогона (фаза 3 из 7) живут в `backend/llm/metrics.py`:
+
+- качество: `homograph_accuracy`, `yo_precision/recall/f1`, `issue_precision/recall/f1`,
+  `span_accuracy`, `utterance_accuracy`, `needs_review_precision`;
+- риск: `false_positive_rate` (лишние правки на чистых текстах) и
+  `critical_error_rate` — изменение смысла, уверенный неверный омограф, выдуманное
+  имя/число/произношение, правка вне разрешённого span, ответ про чужую реплику,
+  уверенный ответ там, где gold требует проверки, и невалидный JSON, который не спас
+  даже повторный запрос;
+- надёжность протокола: `valid_json_rate`, `schema_valid_rate`, `source_preservation_rate`;
+- ресурсы: `latency_p50/p95`, `tokens_per_second`, `peak_process_memory`,
+  `peak_system_memory_percent`, `memory_pressure_events`.
+
+Единого score нет намеренно: у моделей разный компромисс качества, скорости и памяти, и
+одна свёртка спрятала бы именно то, ради чего benchmark делается. Омограф считается
+распознанным только при верном **чтении** (по ключевым словам значения в gold), а не
+только по верному месту: для TTS опасна именно уверенная неверная постановка. Чтение
+сравнивается по основам слов, чтобы «строение» в gold совпадало со «строении» в ответе.
+
+Каждый ответ оценивается отдельно (это же даёт `--repeat`): кейс без ответа — ноль по
+всем метрикам, а не пропуск в отчёте. Схема ответа теперь закрыта и на лишние поля:
+попытка вернуть `final_text` или `normalized` отвергает ответ целиком
+(`unknown_field`), потому что «свободный rewrite» не должен возвращаться через чёрный ход.
+
 Проверка Ollama и моделей:
 
 ```bash
 ollama --version           # демон и CLI
 ollama list                # что уже скачано
 ./venv/bin/python tools/build_llm_dataset.py --check   # корпус: spans и категории
-./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py -q
+./venv/bin/python -m pytest tests/test_llm_benchmark_dataset.py tests/test_llm_benchmark_infra.py tests/test_llm_benchmark_metrics.py -q
 ```
 
 ## API

@@ -277,6 +277,33 @@ def test_llm_response_rejects_bad_confidence():
     assert errors == [s.ERROR_CONFIDENCE_RANGE]
 
 
+def test_llm_response_rejects_rewritten_text_field():
+    """Попытка вернуть переписанный текст не проходит валидацию.
+
+    Схема ответа поля для текста не содержит, но модель может добавить его сама.
+    Такой ответ обязан быть отвергнут целиком — иначе однажды чужой код возьмёт
+    текст из ответа модели, и «свободный rewrite» вернётся через чёрный ход.
+    """
+    for field in ("text", "final_text", "normalized"):
+        broken = json.loads(_valid_response())
+        broken[field] = "Он сменил замок на входной двери."
+        analysis, errors = s.parse_analysis(
+            json.dumps(broken, ensure_ascii=False), expected_replica_id=17, target_text=TARGET
+        )
+        assert analysis is None, field
+        assert errors == [s.ERROR_UNKNOWN_FIELD], field
+
+
+def test_llm_response_rejects_unknown_item_and_utterance_fields():
+    broken = json.loads(_valid_response())
+    broken["items"][0]["replacement"] = "замо́к"
+    broken["utterance"]["tone"] = "calm"
+    _, errors = s.parse_analysis(
+        json.dumps(broken, ensure_ascii=False), expected_replica_id=17, target_text=TARGET
+    )
+    assert errors == [s.ERROR_UNKNOWN_FIELD]
+
+
 def test_analysis_rejects_conflicting_overlapping_patches():
     """Две аннотации на один и тот же участок — конфликт, а не «две правки»."""
     broken = json.loads(_valid_response())

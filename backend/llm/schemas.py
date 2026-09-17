@@ -137,6 +137,41 @@ ERROR_EMPTY_SOURCE = "empty_source"
 ERROR_CONFIDENCE_RANGE = "confidence_range"
 ERROR_OVERLAP = "overlap"
 ERROR_UNKNOWN_UTTERANCE_CLASS = "unknown_utterance_class"
+ERROR_UNKNOWN_FIELD = "unknown_field"
+
+# Поля, которые модели разрешено возвращать. Список закрытый: схема ответа и так
+# не содержит поля для текста, но модель может добавить его «от себя» — и тогда
+# невнимательный код однажды возьмёт текст из ответа. Поэтому лишнее поле — это
+# ошибка ответа, а не безобидный мусор.
+RESPONSE_FIELDS: tuple[str, ...] = ("schema_version", "replica_id", "items", "utterance")
+ANNOTATION_FIELDS: tuple[str, ...] = (
+    "span_start",
+    "span_end",
+    "source",
+    "type",
+    "meaning",
+    "suggested_form",
+    "confidence",
+    "needs_review",
+    "reason_code",
+)
+UTTERANCE_FIELDS: tuple[str, ...] = ("class", "context_dependency", "relevant_replica_ids")
+# Ключи, которыми модель чаще всего пытается вернуть переписанный текст. Выделены
+# отдельно: метрики считают такую попытку критической ошибкой (`text_change`).
+REWRITE_FIELDS: tuple[str, ...] = (
+    "text",
+    "final_text",
+    "source_text",
+    "normalized",
+    "normalized_text",
+    "rewritten",
+    "rewritten_text",
+    "corrected",
+    "corrected_text",
+    "output",
+    "result",
+    "translation",
+)
 
 CONFIDENCE_MIN = 0.0
 CONFIDENCE_MAX = 1.0
@@ -283,6 +318,16 @@ def _extract_json(raw_text: str) -> tuple[dict | None, list[str]]:
     return payload, []
 
 
+def extract_json_object(raw_text: str) -> tuple[dict | None, list[str]]:
+    """Публичный разбор JSON-объекта из ответа — нужен метрикам.
+
+    Метрики считают `valid_json_rate` и проверяют попытку вернуть переписанный
+    текст. Для этого нужен **сырой** объект ответа, в том числе когда валидация
+    его целиком отвергла.
+    """
+    return _extract_json(raw_text)
+
+
 def parse_analysis(
     raw_text: str,
     *,
@@ -304,6 +349,8 @@ def parse_analysis(
 
     errors = []
     allowed = set(allowed_types)
+    if set(payload) - set(RESPONSE_FIELDS):
+        errors.append(ERROR_UNKNOWN_FIELD)
     version = str(payload.get("schema_version") or SCHEMA_VERSION)
     if check_schema_version and version != SCHEMA_VERSION:
         errors.append(ERROR_SCHEMA_VERSION)
@@ -321,6 +368,8 @@ def parse_analysis(
         if not isinstance(raw_item, dict):
             errors.append(ERROR_NOT_OBJECT)
             continue
+        if set(raw_item) - set(ANNOTATION_FIELDS):
+            errors.append(ERROR_UNKNOWN_FIELD)
         item = Annotation.from_dict(raw_item)
         if item.type not in allowed:
             errors.append(ERROR_UNKNOWN_TYPE)
@@ -343,7 +392,10 @@ def parse_analysis(
         if current.span_start < previous.span_end:
             errors.append(ERROR_OVERLAP)
 
-    utterance = UtteranceHint.from_dict(payload.get("utterance"))
+    utterance_raw = payload.get("utterance")
+    if isinstance(utterance_raw, dict) and set(utterance_raw) - set(UTTERANCE_FIELDS):
+        errors.append(ERROR_UNKNOWN_FIELD)
+    utterance = UtteranceHint.from_dict(utterance_raw)
     if utterance.cls not in UTTERANCE_CLASSES:
         errors.append(ERROR_UNKNOWN_UTTERANCE_CLASS)
     if utterance.context_dependency not in CONTEXT_DEPENDENCIES:

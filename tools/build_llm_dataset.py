@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.llm.metrics import reading_keywords, reading_stem
 from backend.llm.schemas import (
     ANNOTATION_TYPES,
     CATEGORY_ABBREVIATION,
@@ -227,11 +228,13 @@ HOMOGRAPH_PAIRS: list[tuple[str, str, str, str, str, str, str]] = [
 ]
 # Внутри пары наборы ключевых слов обязаны не пересекаться: иначе ответ модели
 # засчитался бы как оба чтения сразу, и метрика перестала бы что-либо измерять.
+# Сравниваются основы — ровно так же, как в metrics.reading_matches, иначе guard
+# пропустил бы пару, которую метрика считает неразличимой.
 for _word, _keys_a, _source_a, _sentence_a, _keys_b, _source_b, _sentence_b in HOMOGRAPH_PAIRS:
-    _set_a = {part.strip().lower() for part in _keys_a.split(",")}
-    _set_b = {part.strip().lower() for part in _keys_b.split(",")}
+    _set_a = {reading_stem(part) for part in reading_keywords(_keys_a)}
+    _set_b = {reading_stem(part) for part in reading_keywords(_keys_b)}
     if _set_a & _set_b:
-        raise SystemExit(f"омограф «{_word}»: ключевые слова чтений пересекаются: {_set_a & _set_b}")
+        raise SystemExit(f"омограф «{_word}»: основы ключевых слов чтений совпадают: {_set_a & _set_b}")
 
 for (
     _word,
