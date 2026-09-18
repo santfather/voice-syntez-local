@@ -19,12 +19,25 @@
 несколько фраз в один прогон, и разрезать результат «примерно по времени» нельзя —
 только по реальным границам слов (short_utterances §11, §31). Таймстемпы берутся у
 того же Whisper, поэтому новая зависимость не появляется.
+
+**Язык задаётся явно** (`ASR_LANGUAGE`, по умолчанию `ru`, переменная
+`TTS_ASR_LANGUAGE`). Whisper — многоязычная модель и на коротких репликах
+определяет язык по 0.3–0.5 с звука: «Почему?» и «Стой!» распознавались как
+`thank you`, «Ты опоздал.» — как `tiap`. Проверка качества считала это провалом
+синтеза и отправляла реплику на повтор, хотя модель произносила русский текст
+правильно (UPDATE 2 §13: это ложный дефект измерения, а не обрыв). Приложение
+русскоязычное целиком (prompt, корпус, интерфейс), поэтому автоопределение здесь
+не даёт ничего, кроме ошибок на коротких кусках.
 """
 
 import json
+import os
 import sys
 
 ASR_MODEL_ID = "openai/whisper-large-v3-turbo"
+# Язык распознавания. Читается из окружения в момент запуска воркера (см. докстринг):
+# автоопределение на коротких репликах ошибается и превращает верный синтез в «провал QA».
+ASR_LANGUAGE = os.environ.get("TTS_ASR_LANGUAGE", "ru").strip()
 FULL_FLAG = "--full"
 WORDS_FLAG = "--words"
 
@@ -32,6 +45,19 @@ WORDS_FLAG = "--words"
 def _log(*args) -> None:
     """Служебный вывод — только в stderr, чтобы не ломать JSON в stdout."""
     print(*args, file=sys.stderr, flush=True)
+
+
+def asr_generate_kwargs(language: str | None = None) -> dict:
+    """Аргументы генерации Whisper: задача и **явный** язык.
+
+    Выделено отдельной функцией, чтобы это можно было проверить тестом без
+    загрузки модели: именно отсутствие языка давало ложные провалы проверки на
+    коротких репликах (см. докстринг модуля).
+    """
+    chosen = ASR_LANGUAGE if language is None else str(language).strip()
+    if not chosen:
+        return {"task": "transcribe"}
+    return {"task": "transcribe", "language": chosen}
 
 
 def main() -> int:
@@ -72,7 +98,9 @@ def main() -> int:
         effective_path,
         chunk_length_s=30,
         batch_size=8,
-        generate_kwargs={"task": "transcribe"},
+        # Язык задаётся явно (см. докстринг): без него короткие реплики
+        # распознаются как английский, и проверка качества валит верный синтез.
+        generate_kwargs=asr_generate_kwargs(),
         return_timestamps="word" if words else False,
     )
     ref_text = str(result.get("text") or "").strip()

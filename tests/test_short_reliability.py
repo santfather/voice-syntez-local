@@ -352,3 +352,24 @@ def test_normal_utterance_keeps_existing_pipeline(stub):
     _render([long_text], short=True)
     assert len(stub.calls) == 1
     assert stub.calls[0]["text"] == long_text or long_text in stub.calls[0]["text"]
+
+
+# --- Язык распознавания -------------------------------------------------------
+def test_asr_worker_requests_russian_explicitly():
+    """Whisper получает явный язык: иначе короткая реплика уходит в «английский».
+
+    На 0.3–0.5 с звука автоопределение языка ошибается («Почему?» и «Стой!»
+    распознавались как `thank you`, «Ты опоздал.» — как `tiap`), и проверка
+    качества считала верный синтез провалом, отправляя реплику на повтор.
+    """
+    from backend import transcribe_worker
+
+    assert transcribe_worker.asr_generate_kwargs()["language"] == "ru"
+    assert transcribe_worker.asr_generate_kwargs("ru")["language"] == "ru"
+    # Пустая настройка возвращает автоопределение осознанно, а не по недосмотру.
+    assert "language" not in transcribe_worker.asr_generate_kwargs("")
+    assert transcribe_worker.asr_generate_kwargs()["task"] == "transcribe"
+
+    # Значение из окружения читается при старте воркера (модуль живёт в отдельном
+    # процессе), поэтому проверяется значение по умолчанию, а не подмена env.
+    assert transcribe_worker.ASR_LANGUAGE == "ru"

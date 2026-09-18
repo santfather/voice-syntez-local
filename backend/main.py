@@ -2225,7 +2225,6 @@ def _replica_payload(project: dict, index: int, voices: dict | None = None) -> d
             "source": _emotion_source(project),
             "dialogue_act": replica["dialogue_act"],
             "context_dependency": replica["context_dependency"],
-            "catalog": _emotion_catalog(voice),
         },
         # Что реально ушло в движок последним синтезом этой реплики.
         "reference": {

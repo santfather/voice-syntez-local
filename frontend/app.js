@@ -3752,9 +3752,14 @@ const EMOTION_LABELS = {
 
 function replicaEmotionHtml(replica) {
   const emotion = replica.emotion || {};
-  const catalog = emotion.catalog && emotion.catalog.length
-    ? emotion.catalog
-    : [{ value: 'AUTO', title: 'Авто' }];
+  // Каталог доступных эмоций считается на голос, а не на реплику: у одного голоса
+  // набор один и тот же, и дублировать его в каждой карточке незачем.
+  const speaker = speakerByKey(replica.speaker);
+  const catalog = (speaker && speaker.emotions && speaker.emotions.length)
+    ? speaker.emotions
+    : (emotion.catalog && emotion.catalog.length
+      ? emotion.catalog
+      : [{ value: 'AUTO', title: 'Авто' }]);
   const selected = emotion.override || 'AUTO';
   const options = catalog
     .map((item) => `<option value="${esc(item.value)}"${item.value === selected ? ' selected' : ''}${item.available === false ? ' disabled' : ''}>${esc(item.title)}${item.available === false ? ' (нет референса)' : ''}</option>`)

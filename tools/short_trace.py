@@ -376,6 +376,12 @@ def main() -> int:
         help="режим проверки качества во время рендера (по умолчанию off: слушаем сам пайплайн)",
     )
     parser.add_argument("--asr", action="store_true", help="расшифровать raw/final по словам (Whisper)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="сколько первых реплик разбирать (по умолчанию все)",
+    )
     parser.add_argument("--pause-ms", type=int, default=400)
     parser.add_argument("--out", help="куда записать отчёт JSON (по умолчанию — рядом с трейсом)")
     parser.add_argument(
@@ -400,7 +406,7 @@ def main() -> int:
             raise SystemExit(f"В {trace_dir} нет trace.jsonl")
         if args.asr and not args.keep_model:
             _unload_engines()
-        report = _analyze(trace_dir, asr=args.asr)
+        report = _analyze(trace_dir, asr=args.asr, limit=args.limit)
         report["trace_dir"] = str(trace_dir)
         _print(report)
         target = Path(args.out) if args.out else trace_dir / "report.json"
@@ -470,7 +476,7 @@ def main() -> int:
         # Whisper для расшифровки — отдельный процесс на ~1.6 ГБ; модель уже
         # сделала свою работу, и держать их одновременно незачем.
         _unload_engines()
-    report = _analyze(trace_dir, asr=args.asr)
+    report = _analyze(trace_dir, asr=args.asr, limit=args.limit)
     report["job_id"] = job_id
     report["project_id"] = project["id"]
     report["voice"] = {"id": voice.id, "name": voice.name, "engine": voice.engine}
