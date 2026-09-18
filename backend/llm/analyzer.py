@@ -615,6 +615,9 @@ class LinguisticAnalyzer:
             expected_replica_id=payload["replica_id"],
             target_text=payload["target_text"],
             check_spans=False,
+            # Код причины — пояснение для интерфейса, а не решение о тексте:
+            # неизвестный код не должен стоить всей реплики.
+            check_reasons=False,
         )
         repairs = 0
         repair_messages = messages
@@ -654,6 +657,7 @@ class LinguisticAnalyzer:
                 expected_replica_id=payload["replica_id"],
                 target_text=payload["target_text"],
                 check_spans=False,
+                check_reasons=False,
             )
         return analysis, errors, repairs > 0
 

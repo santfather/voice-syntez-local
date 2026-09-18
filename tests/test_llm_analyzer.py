@@ -504,3 +504,53 @@ def test_locate_annotations_prefers_nearest_occurrence():
     # Первое вхождение («Замок» в начале) не должно выбираться: подсказка дальше.
     assert text.lower().index("замок") == 0
     assert text[items[0].span_start : items[0].span_end] == "замок"
+
+
+def test_unknown_reason_code_is_informational_not_fatal():
+    """Выдуманный `reason_code` не отвергает разбор: это пояснение, а не решение.
+
+    Постановка (§4) требует строго проверять JSON, версии, id, границы, `source`,
+    типы, уверенность и перекрытия; код причины — короткое пояснение. Модель иногда
+    выдумывает код, и терять из-за этого целую реплику нельзя: живой smoke так
+    потерял 12 из 110 разборов. В benchmark строгость осталась: там метрика меряет
+    следование контракту.
+    """
+    def responder(case):
+        return _response(
+            [
+                {
+                    "span_start": 25,
+                    "span_end": 30,
+                    "source": "замка",
+                    "type": "homograph",
+                    "meaning": "строение",
+                    "confidence": 0.9,
+                    "needs_review": False,
+                    "reason_code": "HOMOGRAPH_CONTEXT",  # такого кода нет в схеме
+                }
+            ],
+            replica_id=case["replica_id"],
+        )
+
+    analyzer, _ = _analyzer(responder)
+    result = analyzer.analyze_replica(replica_id=1, target_text=CASTLE)
+    assert result.status == llm.STATUS_READY
+    assert result.items[0].source == "замка"
+    assert result.items[0].reason_code == "", "неизвестный код сохраняется пустым"
+
+    # Строгий режим (benchmark) по-прежнему отвергает такой ответ.
+    payload = _response(
+        [
+            {
+                "span_start": 25,
+                "span_end": 30,
+                "source": "замка",
+                "type": "homograph",
+                "reason_code": "HOMOGRAPH_CONTEXT",
+            }
+        ],
+        replica_id=1,
+    )
+    strict, errors = s.parse_analysis(payload, expected_replica_id=1, target_text=CASTLE)
+    assert strict is None
+    assert s.ERROR_UNKNOWN_REASON in errors

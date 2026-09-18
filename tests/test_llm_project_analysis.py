@@ -754,3 +754,112 @@ def test_failed_replica_is_stored_and_visible(llm_env, voices, stub, monkeypatch
     assert state["failed"], "причина отказа должна быть в состоянии"
     assert "Timeout" in state["failed"][0]["error"] or "не ответила" in state["failed"][0]["error"]
     assert state["status"] == llm.STATUS_FAILED
+
+
+def test_render_blocked_when_required_llm_review_pending(llm_env, voices, stub, monkeypatch):
+    """Режим «LLM обязателен»: пока предложения не решены, рендер запрещён.
+
+    Это второй случай блокировки (первый — неудачный анализ): анализ прошёл, но
+    требует решения человека, и тихо рендерить «как получилось» нельзя.
+    """
+    def responder(case: dict) -> str:
+        text = case["target_text"]
+        word = "старого" if "старого" in text else text.split()[0]
+        start = text.index(word)
+        return json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replica_id": case["replica_id"],
+                "items": [
+                    {
+                        "span_start": start,
+                        "span_end": start + len(word),
+                        "source": word,
+                        "type": "ambiguous",
+                        "meaning": "не уверен в чтении",
+                        "confidence": 0.4,
+                        "needs_review": True,
+                    }
+                ],
+                "utterance": {"class": "NORMAL"},
+            },
+            ensure_ascii=False,
+        )
+
+    llm_env(responder=responder, required_for_render=True)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            # Решаем только детерминированные предложения: подготовка текста
+            # становится готовой, а предложение LLM остаётся нерешённым — именно
+            # этот случай и проверяет режим «LLM обязателен».
+            for _ in range(4):
+                state = (await api.get(f"/api/projects/{project['id']}/analysis")).json()
+                pending = [
+                    item
+                    for item in (state.get("candidates") or [])
+                    if item.get("source") != "llm"
+                ]
+                if not pending:
+                    break
+                for item in pending:
+                    await api.post(
+                        f"/api/projects/{project['id']}/pronunciation/review",
+                        json={
+                            "source": item.get("word") or "",
+                            "target": item.get("word") or "",
+                            "scope": "project",
+                            "enabled": False,
+                            "replica_index": item.get("replica_index"),
+                        },
+                    )
+            render = await api.post(f"/api/projects/{project['id']}/render", json={})
+            return {
+                "status": render.status_code,
+                "body": render.json(),
+                "llm": (
+                    await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+                ).json(),
+            }
+
+    result = asyncio.run(scenario())
+    assert result["llm"]["status"] == llm.STATUS_NEEDS_REVIEW, "предложение LLM ждёт решения"
+    assert result["status"] == 409
+    assert "обязателен" in result["body"]["detail"]
+
+
+def test_render_allowed_after_llm_review(llm_env, voices, stub, monkeypatch):
+    """После решения предложений рендер разрешён, и синтез берёт `final_text`.
+
+    Полный путь §21 на подставной модели: анализ → review → готовность → рендер.
+    """
+    llm_env(required_for_render=True)
+    clean = "ИВАН: Сегодня хорошая погода.\nМАРГО: И я рад тебя видеть."
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api, text=clean)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            final_state = (
+                await api.get(f"/api/projects/{project['id']}/analysis")
+            ).json()
+            llm_final = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+            render = await api.post(f"/api/projects/{project['id']}/render", json={})
+            full = (await api.get(f"/api/projects/{project['id']}")).json()
+            return {
+                "analysis": final_state,
+                "llm": llm_final,
+                "render_status": render.status_code,
+                "render": render.json() if render.status_code == 202 else {},
+                "final_texts": [row["final_text"] for row in full["replicas"]],
+            }
+
+    result = asyncio.run(scenario())
+    assert result["analysis"]["status"] == "ready", "после review проект готов"
+    assert result["llm"]["status"] == "READY"
+    assert result["render_status"] == 202, result["render"]
+    assert all(result["final_texts"]), "рендер идёт по подготовленному тексту"

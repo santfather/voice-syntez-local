@@ -280,18 +280,24 @@ def run(args: argparse.Namespace) -> dict:
         sampler.stop()
 
     llm = response.get("llm") or {}
+    run = llm.get("run") or {}
     report["analysis"] = {
         "status": llm.get("status"),
         "model": llm.get("model"),
-        "seconds": llm.get("seconds"),
+        # `run` — отчёт именно этого запуска: вызовы, кеш, время, неудачные реплики.
+        "seconds": run.get("seconds"),
         "wall_seconds": round(analyze_seconds, 2),
-        "replicas": llm.get("replicas"),
-        "from_cache": llm.get("from_cache"),
-        "calls": llm.get("calls"),
+        "replicas": run.get("replicas"),
+        "from_cache": run.get("from_cache"),
+        "calls": run.get("calls"),
+        "unloaded": run.get("unloaded"),
+        "replicas_failed": run.get("replicas_failed"),
+        "failed": run.get("failed"),
         "candidates_total": llm.get("candidates_total"),
         "needs_review_total": llm.get("needs_review_total"),
         "conflicts_total": llm.get("conflicts_total"),
-        "error": llm.get("error"),
+        "error": llm.get("error") or run.get("error") or "",
+        "blocked_reason": run.get("blocked_reason") or "",
         "memory": sampler.to_dict(),
     }
 

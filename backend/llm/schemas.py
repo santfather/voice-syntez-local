@@ -350,6 +350,7 @@ def parse_analysis(
     allowed_types: Iterable[str] = ANNOTATION_TYPES,
     check_schema_version: bool = True,
     check_spans: bool = True,
+    check_reasons: bool = True,
 ) -> tuple[LinguisticAnalysis | None, list[str]]:
     """Разбирает и валидирует ответ модели.
 
@@ -363,6 +364,13 @@ def parse_analysis(
     (benchmark показал, что модели почти не умеют считать символы). Решение о том,
     что делать с неверными границами, принимает `analyzer.locate_annotations`:
     найти слово самому или отбросить аннотацию с причиной.
+
+    `check_reasons=False` — `reason_code` становится справочным: в постановке (§4)
+    обязательны JSON, версии, id, границы, `source`, типы, уверенность и отсутствие
+    перекрытий, а код причины — короткое пояснение. Модель иногда выдумывает код
+    («HOMOGRAPH_CONTEXT»), и отвергать из-за этого весь разбор значит терять
+    реплику целиком: живой smoke так потерял 12 из 110. В benchmark строгость
+    осталась включённой: там метрика измеряет именно следование контракту.
     """
     payload, errors = _extract_json(raw_text)
     if payload is None:
@@ -396,7 +404,11 @@ def parse_analysis(
         if item.type not in allowed:
             errors.append(ERROR_UNKNOWN_TYPE)
         if item.reason_code and item.reason_code not in REASON_CODES:
-            errors.append(ERROR_UNKNOWN_REASON)
+            if check_reasons:
+                errors.append(ERROR_UNKNOWN_REASON)
+            else:
+                # Справочный код: сохраняем пустым, а не выдуманным.
+                item = replace(item, reason_code="")
         if not (CONFIDENCE_MIN <= item.confidence <= CONFIDENCE_MAX):
             errors.append(ERROR_CONFIDENCE_RANGE)
         if not item.source:
