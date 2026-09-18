@@ -585,6 +585,30 @@ details.advanced > summary::-webkit-details-marker { display: none; }
 .cache-row b { flex: 0 0 auto; font: 10px var(--mono); }
 .cache-row input:disabled { cursor: default; opacity: 0.5; }
 
+/* Сброс вкладки: кнопка одна, а ступеней две — выбор показан рядом с ней, потому
+   что цена ошибки у ступеней разная. Выбранная ступень подсвечена лаймом. */
+.reset-scope { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; }
+.reset-scope label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid #302d39;
+  border-radius: 4px;
+  color: #a5a3ad;
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+.reset-scope label:hover { border-color: #4a4656; }
+.reset-scope label:has(input:checked) { border-color: var(--lime); color: #d9d8dc; }
+.reset-scope input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--lime);
+  cursor: pointer;
+}
+
 /* Запись голоса: эталонную фразу нужно читать, поэтому она набрана как цитата */
 .ref-phrase {
   margin: 0 0 12px;

@@ -780,6 +780,277 @@ function bindCacheEvents() {
     loadCache().catch((error) => showAlert($('cache-error'), error.message));
   });
 }
+
+// --- сброс вкладки -------------------------------------------------------------
+// Одна кнопка на вкладку, ступень выбирается рядом с ней. Ступени разные по цене
+// ошибки — «только кеш» освобождает транзитные файлы, «полный сброс» уносит ещё и
+// то, с чем работала вкладка, — поэтому кнопки «стереть всё» без выбора здесь нет:
+// случайное нажатие одной кнопки не должно стоить проекта. Что именно удаляется,
+// решает бэкенд (`backend/app_reset.py`); клиент не может попросить больше, чем
+// разрешено списком ступеней, и в теле запроса перечисляет только выбор.
+const RESET_TABS = {
+  dialogue: {
+    scopeId: 'reset-scope',
+    buttonId: 'btn-reset',
+    errorId: 'reset-error',
+    noteId: 'reset-note',
+    hintId: 'reset-hint',
+    question: 'Полный сброс удалит открытый проект вместе с репликами, вариантами '
+      + 'озвучки и архивами диагностики. Остальные проекты не тронет. Продолжить?',
+    hints: {
+      cache: 'Освободит готовые файлы задач, результаты сравнения движков и временные '
+        + 'остатки. Диалог и настройки вкладки не тронет.',
+      full: 'Освободит то же, что «только кеш», и удалит открытый проект вместе с '
+        + 'репликами, вариантами озвучки и архивами диагностики. Остальные проекты, '
+        + 'голоса и словарь произношения остаются. Настройки анализатора вернутся к '
+        + 'значениям окружения.',
+    },
+  },
+  text: {
+    scopeId: 'text-reset-scope',
+    buttonId: 'btn-reset-text',
+    errorId: 'text-reset-error',
+    noteId: 'text-reset-note',
+    hintId: 'text-reset-hint',
+    question: 'Полный сброс очистит текст и настройки вкладки «Сплошной текст». '
+      + 'Голоса и словарь произношения останутся. Продолжить?',
+    hints: {
+      cache: 'Освободит готовые файлы задач, результаты сравнения движков и временные '
+        + 'остатки. Текст и настройки вкладки не тронет.',
+      full: 'Освободит то же, что «только кеш», и очистит текст, выбранный голос и '
+        + 'настройки вкладки. Голоса, словарь произношения и открытый диалог остаются. '
+        + 'Настройки анализатора вернутся к значениям окружения.',
+    },
+  },
+};
+
+// Настройки, которые «полный сброс» возвращает к умолчанию. Значения берутся из
+// разметки один раз при старте, пока пользователь их не тронул: держать вторую
+// копию умолчаний в JS — значит однажды разойтись с формой.
+const RESET_DIALOGUE_CONTROLS = [
+  'pause', 'crossfade', 'auto-accent', 'output-format', 'output-name', 'qa',
+  'short-enabled', 'short-strategy', 'short-very-short', 'short-short', 'chunk-strategy',
+];
+const RESET_TEXT_CONTROLS = [
+  'text-voice', 'text-pause', 'text-crossfade', 'text-auto-accent', 'text-output-format',
+  'text-output-name', 'text-qa', 'text-short-enabled', 'text-short-strategy',
+  'text-short-very-short', 'text-short-short', 'text-chunk-strategy', 'text-body',
+  'text-speed', 'text-cfg', 'text-nfe', 'text-gain', 'text-pitch', 'text-rms',
+];
+// Не поля формы, а подписи, которые меняются по ходу работы: у сплошного текста
+// дропзона показывает имя загруженного файла, а после сброса должна снова звать
+// перетащить файл.
+const RESET_HTML_BLOCKS = ['text-drop'];
+const RESET_DEFAULTS = {};
+
+function captureResetDefaults() {
+  [...RESET_DIALOGUE_CONTROLS, ...RESET_TEXT_CONTROLS, ...RESET_HTML_BLOCKS].forEach((id) => {
+    const element = $(id);
+    if (!element) return;
+    const control = ['INPUT', 'SELECT', 'TEXTAREA'].includes(element.tagName);
+    RESET_DEFAULTS[id] = control
+      ? { control: true, value: element.type === 'checkbox' ? element.checked : element.value }
+      : { control: false, value: element.innerHTML };
+  });
+}
+
+function restoreDefaults(ids) {
+  ids.forEach((id) => {
+    const saved = RESET_DEFAULTS[id];
+    const element = $(id);
+    if (!saved || !element) return;
+    if (!saved.control) {
+      element.innerHTML = saved.value;
+      return;
+    }
+    if (element.type === 'checkbox') element.checked = saved.value;
+    else element.value = saved.value;
+    // Подписи ползунков обновляют их же обработчики, а программная запись события
+    // не порождает — стреляем тем, что они слушают, вместо копии форматирования.
+    if (element.type === 'range') element.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
+function resetScope(tab) {
+  const checked = document.querySelector(`#${RESET_TABS[tab].scopeId} input:checked`);
+  return checked ? checked.value : 'cache';
+}
+
+function updateResetHint(tab) {
+  const hint = $(RESET_TABS[tab].hintId);
+  if (hint) hint.textContent = RESET_TABS[tab].hints[resetScope(tab)];
+}
+
+function setResetBusy(tab, busy) {
+  const button = $(RESET_TABS[tab].buttonId);
+  if (!button) return;
+  button.disabled = busy;
+  button.textContent = busy ? 'Сбрасываю…' : 'Сбросить';
+}
+
+// Отчёт читается как список сделанного, а не как намерение: «проект удалён» здесь
+// появляется только тогда, когда удаление действительно произошло.
+function resetReportText(report) {
+  const cache = report.cache || {};
+  const parts = [`освобождено ${Number(cache.total_mb || 0).toFixed(2)} МБ кеша`];
+  if (report.project_deleted) {
+    const archives = report.diagnostics_deleted
+      ? `, архивов диагностики удалено: ${report.diagnostics_deleted}`
+      : '';
+    parts.push(`открытый проект удалён${archives}`);
+  }
+  if (report.llm_settings_reset) {
+    parts.push('настройки анализатора возвращены к значениям окружения');
+  }
+  return `Сброс выполнен: ${parts.join(' · ')}.`;
+}
+
+// Панель «что услышит модель» держит последний показанный разбор: после сброса он
+// относился бы к тексту, которого больше нет.
+function clearPreviewMount(mountId) {
+  const mount = $(mountId);
+  if (!mount || !mount.dataset.ready) return;
+  previewEl(mount, 'text').value = '';
+  previewEl(mount, 'voice').value = '';
+  previewEl(mount, 'engine').value = '';
+  previewEl(mount, 'status').textContent = '';
+  showAlert(previewEl(mount, 'error'), '');
+  const result = previewEl(mount, 'result');
+  result.hidden = true;
+  result.innerHTML = '';
+  previewEl(mount, 'empty').hidden = false;
+}
+
+function clearDialogueTab() {
+  stopTake();
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  state.jobId = null;
+  state.replicaJobId = null;
+  state.project = null;
+  state.sourceDirty = false;
+  state.analysis = null;
+  state.llm = null;
+  state.timeline = null;
+  state.timelineError = null;
+  state.preview = {};
+  state.replicaPreview = {};
+  state.openDetails = {};
+  state.preparedDetails = {};
+  state.speakerDetails = {};
+  rememberProject(null);
+  $('dialogue').value = '';
+  $('dialogue-file-note').hidden = true;
+  restoreDefaults(RESET_DIALOGUE_CONTROLS);
+  showAlert($('parse-error'), '');
+  showAlert($('analyze-error'), '');
+  showAlert($('job-error'), '');
+  showAlert($('timeline-error'), '');
+  $('job-status').textContent = '—';
+  setProgress(0);
+  $('player').pause();
+  $('player').hidden = true;
+  $('player').removeAttribute('src');
+  $('download-link').hidden = true;
+  clearPreviewMount('dialogue-preview');
+  // Проекта больше нет, а список архивов строится по нему: без явной очистки в нём
+  // остались бы ссылки на удалённые файлы.
+  renderDiagnosticsList([]);
+  applyProject(null, { speakers: false, analysis: false });
+  refreshLlmAnalysis();
+}
+
+function clearTextTab() {
+  if (state.textPollTimer) {
+    clearInterval(state.textPollTimer);
+    state.textPollTimer = null;
+  }
+  state.textJobId = null;
+  state.textEngineParams = {};
+  state.textEngineVoice = '';
+  restoreDefaults(RESET_TEXT_CONTROLS);
+  restoreDefaults(RESET_HTML_BLOCKS);
+  showAlert($('text-error'), '');
+  showAlert($('text-job-error'), '');
+  $('text-job-status').textContent = '—';
+  $('text-job-note').hidden = true;
+  setTextProgress(0);
+  $('text-player').pause();
+  $('text-player').hidden = true;
+  $('text-player').removeAttribute('src');
+  $('text-download-link').hidden = true;
+  resetSuggestions();
+  $('suggestions-status').textContent = '';
+  $('suggestions-empty').hidden = false;
+  // Голос сброшен в «не выбран», поэтому набор ручек движка тоже пуст — иначе он
+  // относился бы к голосу, которого в форме уже нет.
+  renderTextEngineParams();
+  updateTextSummary();
+  updateTextButton();
+  clearPreviewMount('text-preview');
+  refreshLlmAnalysis();
+}
+
+async function resetTab(tab) {
+  const config = RESET_TABS[tab];
+  const scope = resetScope(tab);
+  if (scope === 'full' && !window.confirm(config.question)) return;
+  const projectId = tab === 'dialogue' && state.project ? state.project.id : null;
+  showAlert($(config.errorId), '');
+  setResetBusy(tab, true);
+  try {
+    const report = await api('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Проект уходит только у полного сброса диалога: сервер не знает, что открыто
+      // в браузере, и угадывать это по «последнему» проекту здесь нельзя.
+      body: JSON.stringify({
+        scope,
+        tab,
+        project_id: scope === 'full' ? projectId : null,
+      }),
+    });
+    // Файл настроек удалён, а живой статус помнит прежние значения: перечитываем
+    // его, иначе панель анализа показывала бы настройки, которых уже нет.
+    if (report.llm_settings_reset) {
+      state.llmStatus = null;
+      state.llmStatusSettings = null;
+    }
+    if (scope === 'full') {
+      if (tab === 'dialogue') clearDialogueTab();
+      else clearTextTab();
+    }
+    showAlert($(config.noteId), resetReportText(report), 'info');
+  } catch (error) {
+    showAlert($(config.errorId), error.message);
+  } finally {
+    setResetBusy(tab, false);
+  }
+}
+
+function bindResetEvents() {
+  Object.keys(RESET_TABS).forEach((tab) => {
+    const group = $(RESET_TABS[tab].scopeId);
+    if (group) {
+      group.addEventListener('change', () => {
+        updateResetHint(tab);
+        // Отчёт прошлой ступени к новой не относится: «кеш очищен» рядом с
+        // «полным сбросом» читалось бы как выполненный полный сброс.
+        showAlert($(RESET_TABS[tab].noteId), '');
+      });
+    }
+    const button = $(RESET_TABS[tab].buttonId);
+    if (button) {
+      button.addEventListener('click', () => {
+        resetTab(tab).catch((error) => showAlert($(RESET_TABS[tab].errorId), error.message));
+      });
+    }
+    updateResetHint(tab);
+  });
+}
+
 // Словарь глобальный: правило, добавленное здесь, применяется во всех проектах.
 // Проверка текста идёт тем же эндпоинтом, что и стадии синтеза, поэтому фронт не
 // повторяет порядок шагов и не может показать одно, а отправить в модель другое.
@@ -5411,8 +5682,13 @@ function bindEvents() {
 
 // --- старт --------------------------------------------------------------------
 async function init() {
+  // Умолчания настроек запоминаются до первого запроса к API: загрузка голосов
+  // подставляет голос в форму сплошного текста, и снятое позже «умолчание» было бы
+  // уже не умолчанием, а случайным первым голосом.
+  captureResetDefaults();
   renderRecordPhrases();
   bindEvents();
+  bindResetEvents();
   bindTimelineEvents();
   bindExportEvents();
   renderTimeline();

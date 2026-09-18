@@ -560,6 +560,33 @@
           </p>
         </div>
       </section>
+
+      <!-- Панель 7 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">07</span>
+          <div>
+            <h2>СБРОС</h2>
+            <p>Кеш приложения или вся вкладка целиком. Записанные голоса и словарь остаются.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="alert error" id="reset-error"></div>
+          <div class="alert info" id="reset-note" hidden></div>
+          <div class="reset-scope" id="reset-scope">
+            <label><input type="radio" name="reset-scope" value="cache" checked /> Только кеш</label>
+            <label><input type="radio" name="reset-scope" value="full" /> Полный сброс вкладки</label>
+          </div>
+          <p class="hint muted" id="reset-hint"></p>
+          <div class="row" style="margin-top: 12px">
+            <button class="ghost danger" id="btn-reset" type="button">Сбросить</button>
+          </div>
+          <p class="hint muted">
+            Пока в очереди есть задача, полный сброс отклоняется: удалять проект и
+            take'ы из-под работающего рендера нельзя. Дождитесь окончания задачи.
+          </p>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -838,6 +865,33 @@
           <div class="row" style="margin-top: 12px">
             <a id="text-download-link" class="muted" href="#" download hidden>скачать файл</a>
           </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">07</span>
+          <div>
+            <h2>СБРОС</h2>
+            <p>Кеш приложения или вся вкладка целиком. Записанные голоса и словарь остаются.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="alert error" id="text-reset-error"></div>
+          <div class="alert info" id="text-reset-note" hidden></div>
+          <div class="reset-scope" id="text-reset-scope">
+            <label><input type="radio" name="text-reset-scope" value="cache" checked /> Только кеш</label>
+            <label><input type="radio" name="text-reset-scope" value="full" /> Полный сброс вкладки</label>
+          </div>
+          <p class="hint muted" id="text-reset-hint"></p>
+          <div class="row" style="margin-top: 12px">
+            <button class="ghost danger" id="btn-reset-text" type="button">Сбросить</button>
+          </div>
+          <p class="hint muted">
+            Пока в очереди есть задача, полный сброс отклоняется: удалять текст из-под
+            работающей озвучки нельзя. Дождитесь окончания задачи. Настройки анализатора
+            общие для обеих вкладок озвучки — их сброс виден и в диалоге.
+          </p>
         </div>
       </section>
     </div>

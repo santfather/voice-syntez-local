@@ -21,6 +21,7 @@ from pydantic import BaseModel, BeforeValidator, Field, field_validator
 from starlette.background import BackgroundTask
 
 from . import (
+    app_reset,
     audio_analysis,
     audio_pipeline,
     benchmark,
@@ -908,6 +909,59 @@ async def clear_cache(request: Request) -> dict:
         # Неизвестную категорию отсекает валидация выше; сюда попадает только
         # расхождение между списком роута и модулем — это 400, а не 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- сброс приложения ----------------------------------------------------------
+# Сброс запускается из вкладок озвучки, а не из «Моделей»: чистится то, с чем
+# пользователь работал именно там. Правило очереди то же, что у выгрузки движка:
+# пока в очереди есть задача, удалять проект нельзя — рендер потеряет из-под себя
+# реплики и take'ы, а результат будет уже некуда записать.
+RESET_QUEUE_BUSY = (
+    "В очереди есть задача: сброс удалил бы текст и take'ы прямо под работающим "
+    "рендером. Дождитесь окончания задачи и повторите сброс."
+)
+
+
+class ResetRequest(BaseModel):
+    """Что именно сбрасывается: ступень, вкладка и, для диалога, открытый проект."""
+
+    # Ступень и вкладка объявлены строками, а не `Literal`: закрытый список знает
+    # `app_reset`, и на неизвестное значение он отвечает текстом с перечислением
+    # доступных ступеней. `Literal` отдал бы 422 без этого текста — ошибку в
+    # интерфейсе было бы нечем объяснить.
+    scope: str = app_reset.SCOPE_CACHE
+    tab: str | None = None
+    # Проект приходит от клиента, а не ищется «текущим» на сервере: сервер не
+    # знает, какой проект открыт в браузере, и угадывать его нельзя — ошибка
+    # здесь стоит пользовательского диалога.
+    project_id: str | None = None
+
+
+@app.post("/api/reset")
+async def reset_app(payload: ResetRequest) -> dict:
+    """Сбрасывает кеш приложения или вкладку целиком.
+
+    Ступени и границы описаны в `backend/app_reset.py`: `cache` — транзитные файлы,
+    `full` — они же плюс проект диалога и общие настройки анализатора. Голоса и
+    словарь произношения не удаляются ни на одной ступени.
+
+    Анализатор пересоздаётся после сброса, чтобы снятая настройка применилась
+    сразу: файл настроек удалён, а живой объект держал бы прочитанное значение до
+    перезапуска сервера.
+    """
+    scope = payload.scope
+    if scope == app_reset.SCOPE_FULL and engine_lifecycle.queue_busy_now():
+        raise HTTPException(status_code=409, detail=RESET_QUEUE_BUSY)
+    try:
+        report = await asyncio.to_thread(
+            app_reset.reset, scope, payload.tab, payload.project_id
+        )
+    except ValueError as exc:
+        # Неизвестная ступень или вкладка — 400 с их списком, а не 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if report["llm_settings_reset"]:
+        llm_analyzer.reset_analyzer()
+    return report
 
 
 async def _read_json_body(request: Request) -> Any:
