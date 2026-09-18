@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -248,6 +249,14 @@ class ShortUtteranceContext:
     same_speaker_previous: str | None = None
     same_speaker_next: str | None = None
     utterance: UtteranceClass | None = None
+    # Подсказка лингвистического анализатора (Task 2 §8 замечание к интеграции):
+    # класс реплики и релевантные соседи. Это **информация**, а не управление:
+    # аудио, текст и стратегии решает Short Utterance Strategy, а подсказка лишь
+    # дополняет контекст и попадает в диагностику. Поэтому поля отдельные от
+    # `utterance` (детерминированный класс) и не влияют на `synthesis_text`.
+    llm_class: str | None = None
+    llm_context_dependency: str | None = None
+    llm_relevant: tuple[int, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -260,6 +269,9 @@ class ShortUtteranceContext:
             "same_speaker_previous": self.same_speaker_previous,
             "same_speaker_next": self.same_speaker_next,
             "utterance": self.utterance.to_dict() if self.utterance else None,
+            "llm_class": self.llm_class,
+            "llm_context_dependency": self.llm_context_dependency,
+            "llm_relevant": list(self.llm_relevant),
         }
 
 
@@ -305,6 +317,7 @@ def build_contexts(
     *,
     thresholds: ShortThresholds | None = None,
     window: int | None = None,
+    llm_hints: Mapping[int, Mapping[str, object]] | None = None,
 ) -> list[ShortUtteranceContext]:
     """Собирает контекст каждой реплики, не меняя ни одну из них.
 
@@ -316,6 +329,11 @@ def build_contexts(
 
     `window` ограничивает, насколько далеко ищется реплика того же спикера: текст
     из начала сцены — уже не контекст для текущей фразы.
+
+    `llm_hints` — подсказки лингвистического анализатора по индексам реплик
+    (`{"class": ..., "context_dependency": ..., "relevant_replica_ids": [...]}`).
+    Они переносятся в контекст как есть и ни на что не влияют: цель, тексты соседей
+    и план синтеза остаются прежними, а решения по аудио принимает этот же слой.
     """
     items = list(replicas)
     prepared = [_prepared_text(replica) for replica in items]
@@ -336,9 +354,40 @@ def build_contexts(
                 ),
                 same_speaker_next=_nearest_same_speaker(prepared, speakers, index, 1, limit),
                 utterance=classify_utterance(prepared[index], thresholds),
+                llm_class=_hint_str(llm_hints, index, "class"),
+                llm_context_dependency=_hint_str(llm_hints, index, "context_dependency"),
+                llm_relevant=_hint_relevant(llm_hints, index),
             )
         )
     return contexts
+
+
+def _hint_str(
+    hints: Mapping[int, Mapping[str, object]] | None, index: int, key: str
+) -> str | None:
+    """Строковое поле подсказки или None: чужая структура не должна ронять сборку."""
+    if not hints:
+        return None
+    raw = (hints.get(index) or {}).get(key)
+    text = str(raw or "").strip()
+    return text or None
+
+
+def _hint_relevant(
+    hints: Mapping[int, Mapping[str, object]] | None, index: int
+) -> tuple[int, ...]:
+    """Релевантные соседи из подсказки: только целые неотрицательные индексы."""
+    if not hints:
+        return ()
+    raw = (hints.get(index) or {}).get("relevant_replica_ids") or ()
+    result: list[int] = []
+    for item in raw if isinstance(raw, (list, tuple)) else ():
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            continue
+        number = int(item)
+        if number >= 0 and number != index:
+            result.append(number)
+    return tuple(sorted(set(result)))
 
 
 # --- план синтеза -------------------------------------------------------------

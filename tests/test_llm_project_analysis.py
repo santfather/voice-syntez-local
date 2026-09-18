@@ -572,3 +572,94 @@ def test_continuous_text_skips_analysis_when_disabled(llm_env, voices, stub, mon
     assert body["llm"]["status"] == llm.STATUS_DISABLED
     assert client.calls == []
     assert body["job_id"]
+
+
+def test_short_replica_receives_llm_context_hint(llm_env, voices, stub, monkeypatch):
+    """Подсказка LLM доходит до контекста короткой реплики, не меняя её текст.
+
+    Класс реплики и релевантные соседи — информация для слоя коротких реплик;
+    решения по аудио, стратегии и текст остаются за ним.
+    """
+    from backend.dialogue_parser import Replica
+    from backend.short_utterance import build_contexts
+
+    def responder(case):
+        return json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replica_id": case["replica_id"],
+                "items": [],
+                "utterance": {
+                    "class": "CONFIRMATION",
+                    "context_dependency": "HIGH",
+                    "relevant_replica_ids": [1, 2],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    llm_env(responder=responder)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            state = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+            full = (await api.get(f"/api/projects/{project['id']}")).json()
+            return {"state": state, "full": full}
+
+    result = asyncio.run(scenario())
+    assert result["state"]["status"] in {llm.STATUS_READY, llm.STATUS_NEEDS_REVIEW}
+
+    # Подсказки читаются из сохранённых разборов проекта.
+    from backend.db.store import get_projects_store
+
+    hints = get_projects_store().llm_utterance_hints(result["full"]["id"])
+    assert hints, "подсказки должны читаться из базы"
+    assert hints[0]["class"] == "CONFIRMATION"
+    assert hints[0]["context_dependency"] == "HIGH"
+
+    # Контекст короткой реплики получает подсказку и сохраняет цель неизменной.
+    replicas = [
+        Replica(voice="ИВАН", text=row["text"], line_number=row["index"] + 1,
+                final_text=row["final_text"])
+        for row in result["full"]["replicas"]
+    ]
+    contexts = build_contexts(replicas, llm_hints=hints)
+    assert contexts[0].llm_class == "CONFIRMATION"
+    assert contexts[0].llm_relevant == (1, 2)
+    assert contexts[0].target_text == result["full"]["replicas"][0]["final_text"]
+    # Тексты соседей и план не изменились: подсказка — только информация.
+    assert contexts[0].previous_text is None
+    assert contexts[0].utterance is not None
+
+    # Отрицательные и «свои» id отбрасываются: подсказка не должна ссылаться на себя.
+    dirty = build_contexts(
+        replicas, llm_hints={0: {"class": "NEGATION", "relevant_replica_ids": [-1, 0, 1, "мусор"]}}
+    )
+    assert dirty[0].llm_relevant == (1,)
+    assert dirty[0].llm_class == "NEGATION"
+
+
+def test_job_payload_hints_do_not_change_render_settings():
+    """Подсказки не попадают в настройки рендера: аудио они не меняют."""
+    from backend import job_queue as job_queue_module
+    from backend.audio_pipeline import RenderSettings, SpeakerSettings
+    from backend.dialogue_parser import Replica
+    from backend.job_queue import JobPayload
+
+    payload = JobPayload(
+        replicas=[Replica(voice="ИВАН", text="Да.", line_number=1, final_text="Да.")],
+        speakers={"ИВАН": SpeakerSettings(voice_id="voice-f5")},
+        settings=RenderSettings(),
+        project_id="",
+    )
+    before = (payload.settings.pause_ms, payload.settings.auto_accent, payload.settings.qa)
+    # Пустой project_id — подсказок нет, и никакого обращения к базе не происходит.
+    assert job_queue_module.JobQueue._llm_hints(payload) == {}
+    after = (payload.settings.pause_ms, payload.settings.auto_accent, payload.settings.qa)
+    assert after == before, "подсказки не меняют настройки рендера"
+    assert payload.project_id == ""
+    assert payload.replicas[0].final_text == "Да."

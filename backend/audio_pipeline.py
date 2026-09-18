@@ -8,7 +8,7 @@ import random
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1456,6 +1456,7 @@ async def render_dialogue(
     on_engine_loaded: EngineLoadedCallback | None = None,
     on_chunk_timing: ChunkTimingCallback | None = None,
     resume: RenderPartial | None = None,
+    llm_hints: Mapping[int, Mapping[str, object]] | None = None,
 ) -> RenderResult:
     """Синтезирует реплики строго по одной и склеивает их в один файл.
 
@@ -1512,7 +1513,12 @@ async def render_dialogue(
     short_contexts: list[su.ShortUtteranceContext] = []
     if settings.short_utterance is not None and settings.short_utterance.enabled:
         short_contexts = await asyncio.to_thread(
-            su.build_contexts, replicas, thresholds=settings.short_utterance.thresholds
+            su.build_contexts,
+            replicas,
+            thresholds=settings.short_utterance.thresholds,
+            # Подсказки LLM (класс реплики и релевантные соседи) — только
+            # информация для контекста: ни текст, ни план синтеза они не меняют.
+            llm_hints=llm_hints,
         )
 
     resolved: dict[str, Voice] = {}

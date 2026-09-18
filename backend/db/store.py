@@ -479,7 +479,7 @@ class ProjectsStore:
         self, project_id: str, replica_index: int, key: "AnalysisKey"
     ) -> "CacheLookup":
         """Ищет действительный разбор реплики: сравнение входа целиком (§18)."""
-        from ..llm.analysis_cache import AnalysisCache, CacheLookup
+        from ..llm.analysis_cache import AnalysisCache
 
         with transaction() as connection:
             return AnalysisCache(LlmAnalysesRepository(connection)).lookup(
@@ -512,6 +512,19 @@ class ProjectsStore:
                 llm_analysis_updated_at=_now_iso(),
             )
         return self.get_project(project_id)  # type: ignore[return-value]
+
+    def llm_utterance_hints(self, project_id: str) -> dict[int, dict]:
+        """Подсказки анализатора по репликам: класс и релевантные соседи (§8).
+
+        Читаются из сохранённых разборов: на рендере модель уже не спрашивают, а
+        подсказка нужна Short Utterance Strategy. Ошибка чтения — пустой словарь:
+        подсказка вторична по отношению к синтезу.
+        """
+        from ..llm.integration import utterance_hints
+
+        with transaction() as connection:
+            rows = LlmAnalysesRepository(connection).list_for_project(project_id)
+        return utterance_hints(rows)
 
     def mark_llm_analyses_stale(
         self, project_id: str, indexes: list[int] | None = None

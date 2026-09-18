@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -293,6 +294,36 @@ def worst_status(statuses: Iterable[str], *, enabled: bool) -> str:
         if _STATUS_SEVERITY.get(status, 0) > _STATUS_SEVERITY.get(worst, 0):
             worst = status
     return worst
+
+
+def utterance_hints(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
+    """Подсказки коротких реплик из сохранённых разборов: индекс → класс и соседи.
+
+    Наружу отдаётся только то, что разрешено схемой: класс реплики, зависимость от
+    контекста и релевантные id. Ни текст, ни уверенность сюда не попадают — слой
+    коротких реплик не должен получать от модели ничего, кроме подсказки.
+    """
+    hints: dict[int, dict] = {}
+    for row in rows:
+        if str(row.get("status") or "") not in (STATUS_READY, STATUS_NEEDS_REVIEW):
+            continue
+        try:
+            payload = json.loads(str(row.get("analysis_json") or "{}"))
+        except ValueError:
+            continue
+        utterance = payload.get("utterance") or {}
+        if not isinstance(utterance, dict):
+            continue
+        hints[int(row.get("replica_index") or 0)] = {
+            "class": str(utterance.get("class") or ""),
+            "context_dependency": str(utterance.get("context_dependency") or ""),
+            "relevant_replica_ids": [
+                int(item)
+                for item in (utterance.get("relevant_replica_ids") or [])
+                if isinstance(item, (int, float)) and not isinstance(item, bool)
+            ],
+        }
+    return hints
 
 
 @dataclass

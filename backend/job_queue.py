@@ -1033,6 +1033,7 @@ class JobQueue:
                     speakers=payload.speakers,
                     settings=payload.settings,
                     resume=resume,
+                    llm_hints=JobQueue._llm_hints(payload),
                     **kwargs,
                 )
             except (proto.WorkerFailure, audio_pipeline.ChunkTimeoutError) as exc:
@@ -1128,6 +1129,22 @@ class JobQueue:
         return short_run.to_dict()
 
     @staticmethod
+    def _llm_hints(payload: JobPayload | None) -> dict:
+        """Подсказки LLM для коротких реплик проекта (пусто — слой работает сам).
+
+        Ошибка чтения не должна мешать синтезу: подсказка вторична, а рендер важнее.
+        """
+        if payload is None or not payload.project_id:
+            return {}
+        try:
+            return get_projects_store().llm_utterance_hints(payload.project_id)
+        except Exception as exc:  # noqa: BLE001 — подсказка не повод падать
+            logger.warning(
+                "Проект %s: подсказки LLM не прочитаны (%s)", payload.project_id, exc
+            )
+            return {}
+
+    @staticmethod
     def _short_context(job: Job, index: int):
         """Контекст соседей для перегенерации одной реплики.
 
@@ -1143,7 +1160,9 @@ class JobQueue:
             return None
         try:
             contexts = su.build_contexts(
-                payload.replicas, thresholds=settings.short_utterance.thresholds
+                payload.replicas,
+                thresholds=settings.short_utterance.thresholds,
+                llm_hints=JobQueue._llm_hints(payload),
             )
         except Exception as exc:  # noqa: BLE001 — контекст вторичен, синтез важнее
             logger.warning("Задача %s: контекст короткой реплики не собран (%s)", job.id, exc)
