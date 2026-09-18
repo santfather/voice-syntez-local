@@ -2778,6 +2778,9 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
         get_projects_store().set_llm_analysis_state(
             project["id"], status=llm_analyzer.STATUS_DISABLED
         )
+    # Эмоция реплики переносится в данные проекта до подготовки текста: она не
+    # влияет ни на одну стадию текста, но нужна карточке и рендеру (UPDATE 2 §6).
+    _apply_emotions(project["id"], selected, llm_outcome)
 
     preparations = []
     for row in selected:
@@ -2875,6 +2878,47 @@ async def analyze_project(project_id: str, payload: ProjectAnalyzeRequest | None
         }
     )
     return response
+
+
+def _apply_emotions(project_id: str, selected: list[dict], llm_outcome) -> None:
+    """Переносит эмоцию в данные реплик: от LLM, а без неё — детерминированно.
+
+    Эмоция — **предложение**, а не правка текста: она выбирает референс, и ручной
+    выбор пользователя (`emotion_override`) здесь не трогается никогда (§5, §11).
+    Когда LLM выключена или ответила без эмоции, работает безопасная эвристика по
+    самому тексту: приложение обязано продолжать работать без модели (§6), а
+    подпись «Авто → Вопрос» должна быть честной — источник виден в API
+    (`emotion.source`).
+    """
+    store = get_projects_store()
+    detected: dict[int, dict] = {}
+    if llm_outcome is not None:
+        try:
+            detected = llm_integration.replica_emotions(store.llm_analyses(project_id))
+        except Exception as exc:  # noqa: BLE001 — эмоция вторична по отношению к тексту
+            logger.warning("Проект %s: эмоции из разборов не прочитаны (%s)", project_id, exc)
+    for row in selected:
+        index = int(row["index"])
+        found = detected.get(index)
+        if found is not None:
+            store.set_replica_emotion(
+                project_id,
+                index,
+                detected=str(found.get("emotion") or ""),
+                confidence=float(found.get("confidence") or 0.0),
+                dialogue_act=str(found.get("dialogue_act") or ""),
+                context_dependency=str(found.get("context_dependency") or ""),
+            )
+            continue
+        guess = emotions.heuristic_emotion(row["text"])
+        store.set_replica_emotion(
+            project_id,
+            index,
+            detected=guess.emotion,
+            confidence=guess.confidence,
+            dialogue_act=guess.reason,
+            context_dependency="",
+        )
 
 
 def _llm_candidates_of(project: dict) -> list[dict]:

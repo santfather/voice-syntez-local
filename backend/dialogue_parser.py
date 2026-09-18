@@ -16,7 +16,7 @@
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import config
 
@@ -312,10 +312,49 @@ def parse_dialogue(raw_text: str, max_replica_chars: int | None = None) -> Parse
 
     result = [replica for replica in replicas if replica.text]
 
+    # Имена одного персонажа, записанные по-разному («АРТЁМ» и «АРТЕМ»), — один
+    # голос. Без этого правила диалог получал бы две карточки голоса на одного
+    # человека, и один и тот же персонаж звучал бы двумя тембрами (UPDATE 2 §2).
+    result = _merge_speaker_spellings(result)
+
     if max_replica_chars:
         result = _split_long_replicas(result, max_replica_chars)
 
     return ParsedDialogue(replicas=result)
+
+
+def _speaker_identity(key: str) -> str:
+    """Ключ сравнения имён: регистр, «ё» и лишние пробелы не различают персонажей.
+
+    Сравнивается ровно то, что не меняет человека: «АРТЁМ» и «АРТЕМ» — одно и то
+    же имя, а «Мария» и «Марья» — разные (различие не в «ё»). Шире нормализовать
+    нельзя: подгонять имена по звучанию значило бы склеивать разных персонажей.
+    """
+    return " ".join(str(key or "").lower().replace("ё", "е").split())
+
+
+def _merge_speaker_spellings(replicas: list[Replica]) -> list[Replica]:
+    """Приводит варианты написания одного имени к первому встреченному.
+
+    Ключ голоса — то, по чему проект группирует реплики и назначает голос, поэтому
+    он должен быть один у одного персонажа. Первое написание становится каноничным
+    (как написал пользователь), остальные к нему приводятся; реплики при этом не
+    переставляются и текст не меняется.
+    """
+    canonical: dict[str, str] = {}
+    merged: list[Replica] = []
+    for replica in replicas:
+        identity = _speaker_identity(replica.voice)
+        if identity and identity not in canonical:
+            canonical[identity] = replica.voice
+        voice = canonical.get(identity, replica.voice)
+        if voice != replica.voice:
+            logger.info(
+                "Имя «%s» (строка %s) приводится к «%s»: это тот же персонаж",
+                replica.voice, replica.line_number, voice,
+            )
+        merged.append(replace(replica, voice=voice) if voice != replica.voice else replica)
+    return merged
 
 
 def _split_long_replicas(replicas: list[Replica], max_chars: int) -> list[Replica]:
