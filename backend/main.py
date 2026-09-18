@@ -28,11 +28,13 @@ from . import (
     config,
     denoise,
     diagnostics,
+    emotions,
     engine_lifecycle,
     model_manager,
     project_analysis,
     project_export,
     recovery,
+    reference_resolver,
     resource_guard,
     take_quality,
     timeline,
@@ -76,6 +78,9 @@ from .model_manager import (
 from .pronunciation import PronunciationConflict
 from .pronunciation import get_store as get_pronunciation_store
 from .pronunciation_suggest import build_suggestions
+from .reference_resolver import (
+    reference_status,  # noqa: F401 — используется через reference_resolver
+)
 from .resource_guard import ResourceGuard
 from .text_normalization import PronunciationRule, normalize_stages
 from .text_normalization.pronunciation import compile_rule
@@ -341,6 +346,12 @@ class ReplicaUpdateRequest(BaseModel):
     overrides: dict[str, Any] | None = None
     # Сбросить все правки реплики разом (кнопка «вернуть как у спикера»).
     reset_overrides: bool = False
+    # Эмоция этой реплики (UPDATE 2 §11): null — «Авто», то есть решает анализ.
+    # Это metadata, а не текст: ручной выбор не меняет `final_text` и не требует
+    # повторного анализа (§5, §11).
+    emotion_override: str | None = None
+    # Явный референс-профиль реплики; null — выбирать по эмоции.
+    reference_profile_id: str | None = None
 
 
 class ProjectAnalyzeRequest(BaseModel):
@@ -1072,6 +1083,92 @@ async def delete_voice(voice_id: str) -> dict:
     if not get_store().delete(voice_id):
         raise HTTPException(status_code=404, detail="Голос не найден")
     return {"deleted": voice_id}
+
+
+class VoiceReferenceUpdate(BaseModel):
+    """Правка референс-профиля: эмоция и подпись (UPDATE 2 §8, §37)."""
+
+    emotion: str | None = None
+    label: str | None = None
+
+
+@app.post("/api/voices/{voice_id}/references", status_code=201)
+async def add_voice_reference(
+    voice_id: str,
+    file: Annotated[UploadFile, File()],
+    emotion: Annotated[str, Form(...)] = emotions.EMOTION_NEUTRAL,
+    ref_text: Annotated[str, Form()] = "",
+    label: Annotated[str, Form()] = "",
+    verify_ref_text: Annotated[bool, Form()] = True,
+) -> dict:
+    """Добавляет голосу эмоциональный референс — отдельным профилем.
+
+    Голос остаётся **одним**: другой референс той же эмоции — это профиль, а не
+    новый голос (§37). Проверка «референс ↔ расшифровка» идёт тем же путём, что и
+    у основного: без неё эмоциональный профиль мог бы перебить нейтральный, не
+    совпадая с собственной записью (§38).
+    """
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Пустой файл записи")
+    try:
+        profile = get_store().add_reference(
+            voice_id,
+            emotion=emotion,
+            audio_filename=file.filename or "reference.wav",
+            audio_bytes=data,
+            ref_text=ref_text,
+            label=label,
+            verify_ref_text=verify_ref_text,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Голос не найден") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    voice = get_store().get(voice_id)
+    return {
+        "voice_id": voice_id,
+        "profile": profile.to_dict(),
+        "reference_profiles": [] if voice is None else [item.to_dict() for item in voice.reference_profiles()],
+    }
+
+
+@app.patch("/api/voices/{voice_id}/references/{profile_id}")
+async def update_voice_reference(
+    voice_id: str, profile_id: str, payload: VoiceReferenceUpdate
+) -> dict:
+    """Меняет эмоцию или подпись референса, не перезаписывая аудио."""
+    try:
+        profile = get_store().update_reference(
+            voice_id, profile_id, emotion=payload.emotion, label=payload.label
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Референс не найден") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    voice = get_store().get(voice_id)
+    return {
+        "voice_id": voice_id,
+        "profile": profile.to_dict(),
+        "reference_profiles": [] if voice is None else [item.to_dict() for item in voice.reference_profiles()],
+    }
+
+
+@app.delete("/api/voices/{voice_id}/references/{profile_id}")
+async def delete_voice_reference(voice_id: str, profile_id: str) -> dict:
+    """Удаляет эмоциональный референс вместе с его файлом."""
+    try:
+        removed = get_store().delete_reference(voice_id, profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Голос не найден") from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="Референс не найден")
+    voice = get_store().get(voice_id)
+    return {
+        "voice_id": voice_id,
+        "deleted": profile_id,
+        "reference_profiles": [] if voice is None else [item.to_dict() for item in voice.reference_profiles()],
+    }
 
 
 class VoiceEngineUpdate(BaseModel):
@@ -2005,8 +2102,71 @@ def _speakers_payload(project: dict, voices: dict) -> list[dict]:
             if voice is None
             else audio_pipeline.settings_view(voice, _speaker_layer(speaker, voice.id))
         )
-        result.append({**speaker, "settings": settings})
+        result.append(
+            {
+                **speaker,
+                "settings": settings,
+                # Что произойдёт для каждой эмоции у этого голоса: есть ли
+                # подходящий референс и случится ли откат (§11, §37). Считается на
+                # спикера, а не на реплику: у одного голоса набор один и тот же.
+                "emotions": _emotion_catalog(voice),
+                "reference_profiles": (
+                    [] if voice is None else [item.to_dict() for item in voice.reference_profiles()]
+                ),
+            }
+        )
     return result
+
+
+def _emotion_source(project: dict) -> str:
+    """Откуда взялась распознанная эмоция: LLM, эвристика или ничего.
+
+    Интерфейс обязан показывать это рядом с «Авто»: «Авто → Вопрос» от 8B-модели и
+    «Авто → Вопрос» от знака вопроса — разные степени доверия, и выдавать одно за
+    другое нельзя.
+    """
+    status = str(project.get("llm_analysis_status") or llm_analyzer.STATUS_DISABLED)
+    if status in (llm_analyzer.STATUS_READY, llm_analyzer.STATUS_NEEDS_REVIEW):
+        return "llm"
+    if status == llm_analyzer.STATUS_DISABLED:
+        return "heuristic"
+    return "none"
+
+
+def _emotion_catalog(voice: Voice | None) -> list[dict]:
+    """Эмоции голоса: что доступно, какой профиль возьмётся и где будет откат."""
+    if voice is None:
+        return [
+            {
+                "value": value,
+                "title": emotions.EMOTION_TITLES[value],
+                "available": False,
+                "fallback_used": False,
+                "profile_id": "",
+                "error": "голос не назначен",
+            }
+            for value in emotions.SELECTABLE_EMOTIONS
+        ]
+    catalog = []
+    for value in emotions.SELECTABLE_EMOTIONS:
+        request = (
+            emotions.EMOTION_NEUTRAL if value == emotions.EMOTION_AUTO else value
+        )
+        status = reference_resolver.reference_status(voice, voice.engine, request)
+        # AUTO — не эмоция, а способ её выбрать: интерфейсу важно знать, что
+        # автоматика не оставит реплику без референса.
+        catalog.append(
+            {
+                "value": value,
+                "title": emotions.EMOTION_TITLES[value],
+                "available": bool(status.get("available")) or value == emotions.EMOTION_AUTO,
+                "fallback_used": bool(status.get("reference_fallback_used")),
+                "profile_id": str(status.get("reference_profile_id") or ""),
+                "resolved_emotion": str(status.get("resolved_emotion") or ""),
+                "error": str(status.get("error") or ""),
+            }
+        )
+    return catalog
 
 
 def _takes_payload(project_id: str, index: int, replica: dict) -> list[dict]:
@@ -2043,12 +2203,36 @@ def _replica_payload(project: dict, index: int, voices: dict | None = None) -> d
     speaker = next(
         (item for item in project["speakers"] if item["key"] == replica["speaker"]), None
     )
+    voice_id = str(replica["voice_id"] or (speaker["voice_id"] if speaker else "") or "")
+    voice = _resolved_voice(voice_id, {} if voices is None else voices)
     return {
         **replica,
         "inherited_voice_id": speaker["voice_id"] if speaker else "",
         "engine": audio_pipeline.voice_engine(replica["voice_id"]),
         "settings": _replica_settings(replica, speaker, {} if voices is None else voices),
         "takes": _takes_payload(project["id"], index, replica),
+        # Эмоция: распознанная, выбранная руками и действующая. `effective`
+        # приходит из строки реплики (единое правило `override → detected →
+        # NEUTRAL`), а подпись нужна интерфейсу на русском.
+        "emotion": {
+            "detected": replica["emotion_detected"],
+            "confidence": replica["emotion_confidence"],
+            "override": replica["emotion_override"],
+            "effective": replica["emotion_effective"],
+            "effective_title": emotions.EMOTION_TITLES.get(
+                replica["emotion_effective"], replica["emotion_effective"]
+            ),
+            "source": _emotion_source(project),
+            "dialogue_act": replica["dialogue_act"],
+            "context_dependency": replica["context_dependency"],
+            "catalog": _emotion_catalog(voice),
+        },
+        # Что реально ушло в движок последним синтезом этой реплики.
+        "reference": {
+            "profile_id": replica["reference_profile_id"],
+            "emotion": replica["reference_emotion"],
+            "fallback_used": replica["reference_fallback_used"],
+        },
     }
 
 
@@ -2881,6 +3065,11 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
                 voice_id=replica["voice_override"],
                 # Ровно тот текст, который пользователь видел и подтверждал.
                 final_text=replica["final_text"],
+                # Эмоция реплики: распознанная и/или выбранная руками. В текст она
+                # не попадает — только в выбор референса (UPDATE 2 §4, §10).
+                emotion_detected=replica["emotion_detected"],
+                emotion_override=replica["emotion_override"],
+                reference_profile_id=replica["reference_profile_id"],
             )
             for index, replica in enumerate(project["replicas"])
         ],
@@ -2919,20 +3108,54 @@ async def update_replica(project_id: str, index: int, payload: ReplicaUpdateRequ
             # Правка текста устаревает подготовку именно этой реплики: остальные
             # остаются подготовленными, и пересчитывать их незачем.
             text=fields.get("text", UNSET),
+            # Эмоция правится без пересчёта текста (§11): она меняет только
+            # референс, и `null` здесь означает «Авто», а не «не трогать».
+            emotion_override=fields.get("emotion_override", UNSET),
+            reference_profile_id=fields.get("reference_profile_id", UNSET),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Реплика не найдена") from exc
     return {"project_id": project_id, "replica": _replica_payload(project, index)}
 
 
+class ReplicaRegenerateRequest(BaseModel):
+    """Чем можно поменять пересинтез одной реплики (UPDATE 2 §12).
+
+    Эмоция и явный профиль — то, что пользователь имеет право поменять перед
+    повторной генерацией. Текст и произношение сюда не входят: подтверждённые
+    слова и смысл реплики пересинтез не меняет (§23).
+    """
+
+    emotion_override: str | None = None
+    reference_profile_id: str | None = None
+
+
 @app.post("/api/projects/{project_id}/replicas/{index}/regenerate", status_code=202)
-async def regenerate_project_replica(project_id: str, index: int) -> dict:
+async def regenerate_project_replica(
+    project_id: str, index: int, payload: ReplicaRegenerateRequest | None = None
+) -> dict:
     """Пересинтезирует одну реплику проекта — остальные не трогаются.
 
     Результат сохраняется вариантом реплики и становится активным: прежнее
-    звучание остаётся доступным, и сравнить две версии можно на слух.
+    звучание остаётся доступным, и сравнить две версии можно на слух. Эмоцию
+    можно сменить тем же запросом — она применяется до синтеза, а не после.
     """
+    payload = payload or ReplicaRegenerateRequest()
     project = _project_or_404(project_id)
+    if payload.emotion_override is not None or payload.reference_profile_id is not None:
+        try:
+            project = get_projects_store().patch_replica(
+                project_id,
+                index,
+                emotion_override=(
+                    UNSET if payload.emotion_override is None else payload.emotion_override
+                ),
+                reference_profile_id=(
+                    UNSET if payload.reference_profile_id is None else payload.reference_profile_id
+                ),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Реплика не найдена") from exc
     replica = _replica_or_404(project, index)
     if not replica["voice_id"]:
         raise HTTPException(
@@ -2960,6 +3183,9 @@ async def regenerate_project_replica(project_id: str, index: int) -> dict:
                 overrides=replica["overrides"],
                 voice_id=replica["voice_override"],
                 final_text=replica["final_text"],
+                emotion_detected=replica["emotion_detected"],
+                emotion_override=replica["emotion_override"],
+                reference_profile_id=replica["reference_profile_id"],
             ),
             speakers=_project_speakers(project),
             settings=_replica_render_settings(project),

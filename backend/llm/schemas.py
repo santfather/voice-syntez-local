@@ -27,7 +27,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "1"
+# Версия контракта растёт вместе с полями. Эмоция и акт реплики (UPDATE 2 §32)
+# добавились в версии 2 — старые сохранённые разборы после этого считаются
+# устаревшими: кэш сравнивает версию схемы, и это ровно то поведение, которое
+# нужно (§34).
+SCHEMA_VERSION = "2"
 
 # --- категории корпуса (§6) ---------------------------------------------------
 CATEGORY_HOMOGRAPH = "homograph"
@@ -98,6 +102,19 @@ UTTERANCE_CLASSES: tuple[str, ...] = (
     "CONTEXT_DEPENDENT",
 )
 CONTEXT_DEPENDENCIES: tuple[str, ...] = ("LOW", "MEDIUM", "HIGH")
+# Эмоция реплики (UPDATE 2 §32). Значения те же, что у слоя эмоций
+# (`backend/emotions.py`): один словарь на LLM, хранение, UI и резолвер референса.
+# `AUTO` сюда не входит — это выбор пользователя, а не результат анализа.
+EMOTION_VALUES: tuple[str, ...] = (
+    "NEUTRAL",
+    "QUESTION",
+    "DELIGHT",
+    "SURPRISE",
+    "FEAR",
+)
+# Речевой акт — свободная строка, но ограниченная по длине: она показывается в
+# интерфейсе и объясняет выбор эмоции, а не служит полем для рассуждений модели.
+DIALOGUE_ACT_MAX_CHARS = 40
 
 # Коды причин: короткие, машинные, без chain-of-thought (§15 Таска 2).
 REASON_CONTEXT_DISAMBIGUATION = "CONTEXT_DISAMBIGUATION"
@@ -138,6 +155,7 @@ ERROR_CONFIDENCE_RANGE = "confidence_range"
 ERROR_OVERLAP = "overlap"
 ERROR_UNKNOWN_UTTERANCE_CLASS = "unknown_utterance_class"
 ERROR_UNKNOWN_FIELD = "unknown_field"
+ERROR_UNKNOWN_EMOTION = "unknown_emotion"
 
 # Поля, которые модели разрешено возвращать. Список закрытый: схема ответа и так
 # не содержит поля для текста, но модель может добавить его «от себя» — и тогда
@@ -155,7 +173,16 @@ ANNOTATION_FIELDS: tuple[str, ...] = (
     "needs_review",
     "reason_code",
 )
-UTTERANCE_FIELDS: tuple[str, ...] = ("class", "context_dependency", "relevant_replica_ids")
+UTTERANCE_FIELDS: tuple[str, ...] = (
+    "class",
+    "context_dependency",
+    "relevant_replica_ids",
+    # Эмоция и её уверенность: то, ради чего поле `utterance` расширено
+    # (UPDATE 2 §32). Текст реплики модель по-прежнему не возвращает.
+    "emotion",
+    "emotion_confidence",
+    "dialogue_act",
+)
 # Ключи, которыми модель чаще всего пытается вернуть переписанный текст. Выделены
 # отдельно: метрики считают такую попытку критической ошибкой (`text_change`).
 REWRITE_FIELDS: tuple[str, ...] = (
@@ -241,12 +268,21 @@ class UtteranceHint:
     cls: str = "NORMAL"
     context_dependency: str = "LOW"
     relevant_replica_ids: tuple[int, ...] = ()
+    # Эмоция реплики и уверенность модели (UPDATE 2 §32). Пустая строка — «модель
+    # не сказала»: это не NEUTRAL, а отсутствие ответа, и разница важна, потому
+    # что NEUTRAL — осознанный выбор модели, а не молчание.
+    emotion: str = ""
+    emotion_confidence: float = 0.0
+    dialogue_act: str = ""
 
     def to_dict(self) -> dict:
         return {
             "class": self.cls,
             "context_dependency": self.context_dependency,
             "relevant_replica_ids": list(self.relevant_replica_ids),
+            "emotion": self.emotion,
+            "emotion_confidence": round(float(self.emotion_confidence), 4),
+            "dialogue_act": self.dialogue_act,
         }
 
     @classmethod
@@ -257,6 +293,9 @@ class UtteranceHint:
             cls=str(raw.get("class") or "NORMAL").upper(),
             context_dependency=str(raw.get("context_dependency") or "LOW").upper(),
             relevant_replica_ids=tuple(int(item) for item in ids if _is_int(item)),
+            emotion=str(raw.get("emotion") or "").upper(),
+            emotion_confidence=float(raw.get("emotion_confidence") or 0.0),
+            dialogue_act=str(raw.get("dialogue_act") or "")[:DIALOGUE_ACT_MAX_CHARS],
         )
 
 
@@ -437,6 +476,12 @@ def parse_analysis(
         errors.append(ERROR_UNKNOWN_UTTERANCE_CLASS)
     if utterance.context_dependency not in CONTEXT_DEPENDENCIES:
         errors.append(ERROR_UNKNOWN_UTTERANCE_CLASS)
+    # Эмоция: пустая допустима (старый prompt, разбор без эмоций), а вот
+    # выдуманное значение — нет: оно ушло бы прямо в выбор референса и в интерфейс.
+    if utterance.emotion and utterance.emotion not in EMOTION_VALUES:
+        errors.append(ERROR_UNKNOWN_EMOTION)
+    if not (CONFIDENCE_MIN <= float(utterance.emotion_confidence) <= CONFIDENCE_MAX):
+        errors.append(ERROR_CONFIDENCE_RANGE)
 
     unique = list(dict.fromkeys(errors))
     if unique:
@@ -659,8 +704,13 @@ def analysis_json_schema() -> dict:
                     "class": {"type": "string", "enum": list(UTTERANCE_CLASSES)},
                     "context_dependency": {"type": "string", "enum": list(CONTEXT_DEPENDENCIES)},
                     "relevant_replica_ids": {"type": "array", "items": {"type": "integer"}},
+                    # Эмоция и речевой акт (UPDATE 2 §32): модель называет эмоцию
+                    # реплики, но поля для текста в схеме по-прежнему нет.
+                    "emotion": {"type": "string", "enum": list(EMOTION_VALUES)},
+                    "emotion_confidence": {"type": "number"},
+                    "dialogue_act": {"type": "string"},
                 },
-                "required": ["class"],
+                "required": ["class", "emotion"],
             },
         },
         "required": ["schema_version", "replica_id", "items"],

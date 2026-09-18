@@ -159,16 +159,35 @@ def _words(text: str) -> list[str]:
     return [word for word in re.findall(r"[а-яa-z0-9]+", clean) if word]
 
 
-def _asr_words(path: Path) -> list[str]:
-    """Расшифровка WAV по словам (Whisper в отдельном процессе)."""
+def _asr_words(path: Path, cache: dict | None = None, key: str = "") -> list[str]:
+    """Расшифровка WAV по словам (Whisper в отдельном процессе).
+
+    Пустые токены выбрасываются: таймстемп может относиться к знаку без слова, и
+    такой токен ломал бы проверку «первое слово на месте».
+
+    Результат кэшируется в `asr_cache.json` рядом с трейсом: Whisper поднимает
+    модель на каждый файл, и повторный разбор того же трейса (например, после
+    правки правил сравнения) не должен занимать те же минуты.
+    """
     from backend import transcribe
 
+    if cache is not None and key and key in cache:
+        return [str(word) for word in cache[key]]
     stamps = transcribe.transcribe_words(path)
-    return [_normalize(word.word) for word in stamps]
+    words = [_normalize(word.word) for word in stamps]
+    words = [word for word in words if word]
+    if cache is not None and key:
+        cache[key] = words
+    return words
+
+
+# Пунктуация, которую Whisper приклеивает к слову: кавычки-«ёлочки» и лапки тоже,
+# иначе «пожалуйста» и «пожалуйста» перестают совпадать на ровном месте.
+_PUNCTUATION = ".,!?;:…—-\"'«»“”„()[]"
 
 
 def _normalize(word: str) -> str:
-    return str(word).lower().replace("ё", "е").strip(".,!?;:…—-\"'")
+    return str(word).lower().replace("ё", "е").strip(_PUNCTUATION)
 
 
 def _word_check(expected: str, heard: list[str]) -> dict:
@@ -194,6 +213,13 @@ def _analyze(trace_dir: Path, *, asr: bool, limit: int | None = None) -> dict:
         json.loads(line)
         for line in (trace_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    cache_path = trace_dir / "asr_cache.json"
+    cache: dict = {}
+    if asr and cache_path.is_file():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except ValueError:
+            cache = {}
     replicas = []
     for record in records:
         stages = record.get("stages", {})
@@ -216,15 +242,29 @@ def _analyze(trace_dir: Path, *, asr: bool, limit: int | None = None) -> dict:
             "asr_final": None,
         }
         if asr:
-            for label, name in (("asr_raw", synthesis_trace.STAGE_RAW), ("asr_final", synthesis_trace.STAGE_FINAL)):
+            for label, name in (
+                ("asr_raw", synthesis_trace.STAGE_RAW),
+                ("asr_context", synthesis_trace.STAGE_CONTEXT),
+                ("asr_final", synthesis_trace.STAGE_FINAL),
+            ):
                 path = trace_dir / f"r{record['index']:03d}" / f"{name}.wav"
                 if not path.is_file():
                     continue
-                heard = _asr_words(path)
+                heard = _asr_words(path, cache, f"r{record['index']:03d}/{name}.wav")
                 item[label] = _word_check(item["final_text"], heard)
+            # Протёк ли контекст в готовый файл: слова контекста, которые слышны в
+            # финальном аудио. Ради этого вопроса контекстный синтез и проверяется
+            # отдельно от DIRECT (§29 пакета).
+            context_words = _words(record.get("tts_context_text") or "")
+            final_words = set((item.get("asr_final") or {}).get("asr_words") or [])
+            item["context_leaked"] = sorted(set(context_words) & final_words)
         replicas.append(item)
         if limit and len(replicas) >= limit:
             break
+    if asr and cache:
+        cache_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     return {
         "trace_dir": str(trace_dir),
         "replicas": replicas,
@@ -260,10 +300,16 @@ def _verdict(replicas: list[dict], *, asr: bool) -> dict:
             pipeline_dropped.append(
                 {"index": item["index"], "missing": final.get("missing_words", [])}
             )
+    context_leaks = [
+        {"index": item["index"], "words": item["context_leaked"]}
+        for item in replicas
+        if item.get("context_leaked")
+    ]
     return {
         "cut_audible_edge": cut_speech,
         "model_missing_words": model_dropped,
         "pipeline_missing_words": pipeline_dropped,
+        "context_leaked": context_leaks,
         "asr_used": asr,
     }
 
@@ -280,14 +326,21 @@ def _print(report: dict) -> None:
             f"{item['final_sec']:>6.2f} {item['dropped_start_ms']:>6.0f} {item['dropped_end_ms']:>6.0f} "
             f"{(tail if tail is not None else 0):>7.1f}"
         )
-        if item.get("asr_raw") or item.get("asr_final"):
-            raw = (item.get("asr_raw") or {}).get("complete")
-            final = (item.get("asr_final") or {}).get("complete")
+        if item.get("asr_final"):
+            final = item["asr_final"]
             print(
-                f"      ASR: raw_complete={raw} final_complete={final} "
-                f"raw={item.get('asr_raw', {}).get('asr_words')} "
-                f"final={item.get('asr_final', {}).get('asr_words')}"
+                f"      ASR final: complete={final.get('complete')} "
+                f"first={final.get('first_word_ok')} last={final.get('last_word_ok')} "
+                f"words={final.get('asr_words')}"
             )
+        if item.get("asr_context"):
+            context = item["asr_context"]
+            print(
+                f"      ASR контекст: complete={context.get('complete')} "
+                f"missing={context.get('missing_words')}"
+            )
+        if item.get("context_leaked"):
+            print(f"      ! контекст слышен в файле: {item['context_leaked']}")
     verdict = report["verdict"]
     print("\nВердикт:")
     if verdict["cut_audible_edge"]:
@@ -301,6 +354,7 @@ def _print(report: dict) -> None:
     if verdict["asr_used"]:
         print(f"  модель не сказала слова: {verdict['model_missing_words'] or '—'}")
         print(f"  пайплайн потерял слова: {verdict['pipeline_missing_words'] or '—'}")
+        print(f"  контекст слышен в файле: {verdict['context_leaked'] or '—'}")
     else:
         print("  слова не проверялись (--asr не задан)")
 

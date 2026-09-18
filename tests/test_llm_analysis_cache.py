@@ -22,6 +22,7 @@ from backend.db.migrations import MIGRATIONS, apply_migrations
 from backend.db.repositories.llm_analyses import LlmAnalysesRepository
 from backend.db.store import get_projects_store
 from backend.llm import analysis_cache as cache
+from backend.llm import versioning
 from backend.llm import schemas as s
 from backend.llm.analyzer import (
     STATUS_NEEDS_REVIEW,
@@ -50,7 +51,7 @@ def _analysis(**overrides) -> ReplicaAnalysis:
         ),
         "model_tag": "qwen3:8b",
         "model_digest": "digest-primary",
-        "prompt_version": "2",
+        "prompt_version": versioning.PROMPT_VERSION,
         "schema_version": s.SCHEMA_VERSION,
         "source_hash": cache.text_hash(TEXT),
         "context_hash": cache.context_hash({"target_text": TEXT}),
@@ -126,8 +127,8 @@ def test_model_and_prompt_and_schema_changes_invalidate_analysis():
 
         for override, field in (
             ({"model_digest": "другой-digest"}, "model_digest"),
-            ({"prompt_version": "3"}, "prompt_version"),
-            ({"schema_version": "2"}, "schema_version"),
+            ({"prompt_version": versioning.PROMPT_VERSION + "-другой"}, "prompt_version"),
+            ({"schema_version": str(int(s.SCHEMA_VERSION) + 1)}, "schema_version"),
         ):
             hit = analysis_cache.lookup(project_id, 0, cache.key_for(_analysis(**override)))
             assert hit.hit is False, override
@@ -336,7 +337,7 @@ def test_saved_analysis_round_trips_annotations(status):
     assert restored.items[0].meaning == "строение, крепость"
     assert restored.items[0].needs_review is False
     assert restored.model_tag == "qwen3:8b"
-    assert restored.prompt_version == "2"
+    assert restored.prompt_version == versioning.PROMPT_VERSION
 
 
 def test_llm_model_is_unloaded_after_analysis_pass():

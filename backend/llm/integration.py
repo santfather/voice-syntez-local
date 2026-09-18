@@ -322,8 +322,41 @@ def utterance_hints(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
                 for item in (utterance.get("relevant_replica_ids") or [])
                 if isinstance(item, (int, float)) and not isinstance(item, bool)
             ],
+            # Эмоция и акт реплики (UPDATE 2 §32). Короткий слой их не использует:
+            # они нужны, чтобы после анализа записать эмоцию реплики в проект и
+            # показать её в интерфейсе — без второго чтения разборов.
+            "emotion": str(utterance.get("emotion") or ""),
+            "emotion_confidence": float(utterance.get("emotion_confidence") or 0.0),
+            "dialogue_act": str(utterance.get("dialogue_act") or ""),
         }
     return hints
+
+
+def replica_emotions(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
+    """Эмоция по репликам из сохранённых разборов: индекс → эмоция и уверенность.
+
+    Отдельно от `utterance_hints`, потому что читатели разные: подсказки короткого
+    слоя — про класс и соседей, а эмоция уходит в данные проекта и в интерфейс.
+    Смешивать их значило бы тянуть в короткий слой лишнее.
+    """
+    result: dict[int, dict] = {}
+    for row in rows:
+        if str(row.get("status") or "") not in (STATUS_READY, STATUS_NEEDS_REVIEW):
+            continue
+        try:
+            payload = json.loads(str(row.get("analysis_json") or "{}"))
+        except ValueError:
+            continue
+        utterance = payload.get("utterance") or {}
+        if not isinstance(utterance, dict) or not utterance.get("emotion"):
+            continue
+        result[int(row.get("replica_index") or 0)] = {
+            "emotion": str(utterance.get("emotion") or ""),
+            "confidence": float(utterance.get("emotion_confidence") or 0.0),
+            "dialogue_act": str(utterance.get("dialogue_act") or ""),
+            "context_dependency": str(utterance.get("context_dependency") or ""),
+        }
+    return result
 
 
 @dataclass

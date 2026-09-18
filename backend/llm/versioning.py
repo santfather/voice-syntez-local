@@ -21,11 +21,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .schemas import SCHEMA_VERSION
+
 logger = logging.getLogger("tts.llm.versioning")
 
 BENCHMARK_VERSION = "1"
-PROMPT_VERSION = "2"
-# Версия схемы живёт в `schemas.SCHEMA_VERSION`; здесь — только для отчёта.
+# Версия prompt'а анализатора: держится в одном шаге с файлом
+# `benchmarks/russian_linguistics/prompts/analyzer.vN.txt` (v3 — эмоция и речевой
+# акт, UPDATE 2 §32). Паспорт прогона обязан называть ту же версию: иначе отчёт
+# benchmark ссылался бы на prompt, которого модель не видела.
+PROMPT_VERSION = "3"
+# Версия схемы берётся из `schemas.SCHEMA_VERSION` — единственного источника:
+# паспорт прогона обязан называть ту же схему, по которой backend проверял ответ.
 
 GIT_TIMEOUT_SEC = 5.0
 
@@ -38,7 +45,7 @@ class RunMetadata:
     benchmark_version: str = BENCHMARK_VERSION
     dataset_version: str = "1"
     prompt_version: str = PROMPT_VERSION
-    schema_version: str = "1"
+    schema_version: str = SCHEMA_VERSION
     git_commit: str = ""
     timestamp: str = ""
     os_version: str = ""
@@ -143,7 +150,7 @@ def build_run_metadata(
     model_tag: str,
     dataset_version: str = "1",
     prompt_version: str = PROMPT_VERSION,
-    schema_version: str = "1",
+    schema_version: str = SCHEMA_VERSION,
     ollama_version: str = "",
     model_digest: str = "",
     model_size_gb: float = 0.0,

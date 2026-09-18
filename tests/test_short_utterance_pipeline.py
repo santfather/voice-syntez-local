@@ -365,13 +365,16 @@ def test_status_exposes_short_policy(monkeypatch):
 
     payload = asyncio.run(main.status())
     policy = payload["short_utterance"]
-    # По умолчанию слой включён: короткие реплики на F5 без него теряют окончания
-    # (WER 0.125–0.20), а с контекстом того же спикера — WER 0.0.
+    # По умолчанию слой включён, но производственная стратегия — DIRECT: замер
+    # UPDATE 2 (§45, `update_2_report.md`) показал, что контекстный синтез не
+    # добавляет разборчивости (слова на месте и там, и там), зато делает реплику на
+    # 25–50 % длиннее и стоит вчетверо дороже. Контекстные стратегии остаются
+    # выбираемыми вручную, но не по умолчанию.
     assert policy["enabled"] is True
-    # Политика измеренная: у F5 выигрывает контекст того же спикера, у XTTS — direct.
-    assert policy["strategies"]["f5"] == su.STRATEGY_SAME_SPEAKER_CONTEXT
+    assert policy["strategies"]["f5"] == su.STRATEGY_DIRECT
     assert policy["strategies"]["xtts"] == su.STRATEGY_DIRECT
     assert su.STRATEGY_AUTO in policy["available_strategies"]
+    assert su.STRATEGY_SAME_SPEAKER_CONTEXT in policy["available_strategies"]
     assert su.STRATEGY_BATCH_AND_CROP not in policy["available_strategies"]
     assert policy["thresholds"]["very_short_words"] == config.SHORT_UTTERANCE_VERY_SHORT_WORDS
 

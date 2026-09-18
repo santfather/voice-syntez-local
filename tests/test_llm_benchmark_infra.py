@@ -286,7 +286,8 @@ def test_llm_response_accepts_schema_version_noise():
     """
     # Пустая версия приравнивается к текущей: отсутствие поля в контракте
     # допускалось и раньше, менять это здесь незачем.
-    for value in ("1", "1.0", "v1", " 1.0 ", ""):
+    current = s.SCHEMA_VERSION
+    for value in (current, f"{current}.0", f"v{current}", f" {current}.0 ", ""):
         payload = json.loads(_valid_response())
         payload["schema_version"] = value
         analysis, errors = s.parse_analysis(
@@ -296,9 +297,11 @@ def test_llm_response_accepts_schema_version_noise():
         )
         assert errors == [], value
         assert analysis is not None
-        assert analysis.schema_version == "1"
+        assert analysis.schema_version == current
 
-    for value in ("2", "1.1"):
+    # Прошлая версия схемы и «почти текущая» — разные контракты: молча принять их
+    # значило бы разобрать ответ по полям, которых в нём может не быть.
+    for value in (str(int(current) - 1), f"{current}.1"):
         payload = json.loads(_valid_response())
         payload["schema_version"] = value
         analysis, errors = s.parse_analysis(

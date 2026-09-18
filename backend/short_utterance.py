@@ -160,6 +160,36 @@ STRATEGY_PUNCTUATION = "punctuation"
 STRATEGY_SAME_SPEAKER_CONTEXT = "same_speaker_context"
 STRATEGY_SYNTHETIC_CONTEXT = "synthetic_context"
 STRATEGY_BATCH_AND_CROP = "batch_and_crop"
+
+# Стадии планировщика (UPDATE 2 §25). Имена — из постановки, значения — то, что
+# уже хранится в метаданных take'а: переименовывать сохранённые стратегии значило
+# бы ломать историю вариантов ради красивого слова. Стадия отвечает на вопрос
+# «что планировщик сделал в итоге», стратегия — «что попросили».
+PLANNER_DIRECT = "DIRECT"
+PLANNER_CONTEXT_ASSISTED = "CONTEXT_ASSISTED"
+PLANNER_SAME_SPEAKER_BATCH = "SAME_SPEAKER_BATCH"
+PLANNER_FALLBACK_DIRECT = "FALLBACK_DIRECT"
+
+_PLANNER_BY_STRATEGY = {
+    STRATEGY_DIRECT: PLANNER_DIRECT,
+    STRATEGY_PUNCTUATION: PLANNER_DIRECT,
+    STRATEGY_SAME_SPEAKER_CONTEXT: PLANNER_CONTEXT_ASSISTED,
+    STRATEGY_SYNTHETIC_CONTEXT: PLANNER_CONTEXT_ASSISTED,
+    STRATEGY_BATCH_AND_CROP: PLANNER_SAME_SPEAKER_BATCH,
+}
+
+
+def planner_stage(strategy: str, fallback: str = "") -> str:
+    """Итоговая стадия планировщика: сработала стратегия или случился откат.
+
+    Откат называется отдельной стадией (`FALLBACK_DIRECT`), а не «direct с
+    пометкой»: это разные события. DIRECT — осознанное решение синтезировать цель
+    отдельно, откат — признание, что контекстный план не подтвердился, и в
+    диагностике их нельзя показывать одним словом (§29).
+    """
+    if fallback:
+        return PLANNER_FALLBACK_DIRECT
+    return _PLANNER_BY_STRATEGY.get(strategy, PLANNER_DIRECT)
 # `auto` — выбор по движку из измеренной политики (см. `default_strategy`).
 STRATEGY_AUTO = "auto"
 

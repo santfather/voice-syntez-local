@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from ... import config
+from ... import config, emotions
 from . import dumps, loads
 
 
@@ -41,6 +41,20 @@ def row_to_replica(row: sqlite3.Row) -> dict:
         "supports_accents": bool(row["supports_accents"]),
         "auto_accent": bool(row["auto_accent"]),
         "effective_engine_params": loads(row["effective_engine_params"], {}),
+        # Эмоция и референс (миграция 9). `emotion_effective` вычисляется здесь, а
+        # не хранится: правило `override → detected → NEUTRAL` одно на всё
+        # приложение, и колонка-дубликат однажды разошлась бы с ним.
+        "emotion_detected": row["emotion_detected"],
+        "emotion_confidence": float(row["emotion_confidence"] or 0.0),
+        "emotion_override": row["emotion_override"],
+        "dialogue_act": row["dialogue_act"],
+        "context_dependency": row["context_dependency"],
+        "reference_profile_id": row["reference_profile_id"],
+        "reference_emotion": row["reference_emotion"],
+        "reference_fallback_used": bool(row["reference_fallback_used"]),
+        "emotion_effective": emotions.emotion_effective(
+            row["emotion_detected"], row["emotion_override"]
+        ),
     }
 
 
@@ -240,6 +254,32 @@ class ReplicasRepository:
                 1 if analysis.get("supports_accents", True) else 0,
                 1 if analysis.get("auto_accent", True) else 0,
                 dumps(analysis.get("effective_engine_params") or {}),
+                replica_id,
+            ),
+        )
+        return cursor.rowcount > 0
+
+    def save_emotion(self, replica_id: int, emotion: dict) -> bool:
+        """Пишет эмоцию реплики и фактический референс последнего синтеза.
+
+        Отдельным обновлением от текста, а не вместе с `save_analysis`: анализ
+        меняет произносимый текст, а эмоция — только выбор референса, и ручная
+        смена эмоции не должна требовать пересчёта подготовки (§11).
+        """
+        cursor = self._conn.execute(
+            "UPDATE replicas SET emotion_detected = ?, emotion_confidence = ?,"
+            " emotion_override = ?, dialogue_act = ?, context_dependency = ?,"
+            " reference_profile_id = ?, reference_emotion = ?, reference_fallback_used = ?"
+            " WHERE id = ?",
+            (
+                emotions.normalize_emotion(emotion.get("emotion_detected"), default=""),
+                float(emotion.get("emotion_confidence") or 0.0),
+                emotions.normalize_emotion(emotion.get("emotion_override"), default=""),
+                str(emotion.get("dialogue_act") or ""),
+                str(emotion.get("context_dependency") or ""),
+                str(emotion.get("reference_profile_id") or ""),
+                emotions.normalize_emotion(emotion.get("reference_emotion"), default=""),
+                1 if emotion.get("reference_fallback_used") else 0,
                 replica_id,
             ),
         )

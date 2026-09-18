@@ -255,6 +255,23 @@ ALTER TABLE projects ADD COLUMN llm_analysis_error TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN llm_analysis_updated_at TEXT;
 """
 
+# Эмоция — метаданные реплики, а не текст (UPDATE 2 §4, §6): ни одно из этих
+# полей не попадает ни в `text`, ни в `final_text`. `emotion_effective` не
+# хранится отдельной колонкой: это `override → detected → NEUTRAL`, и второй
+# источник правды разошёлся бы с первым при правке одного только override.
+# `reference_*` — что **фактически** ушло в движок у последнего синтеза: по ним
+# в карточке видно, взялся эмоциональный референс или случился откат на NEUTRAL.
+_MIGRATION_9 = """
+ALTER TABLE replicas ADD COLUMN emotion_detected TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN emotion_confidence REAL NOT NULL DEFAULT 0;
+ALTER TABLE replicas ADD COLUMN emotion_override TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN dialogue_act TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN context_dependency TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN reference_profile_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN reference_emotion TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN reference_fallback_used INTEGER NOT NULL DEFAULT 0;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -264,6 +281,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (6, _MIGRATION_6),
     (7, _MIGRATION_7),
     (8, _MIGRATION_8),
+    (9, _MIGRATION_9),
 )
 
 

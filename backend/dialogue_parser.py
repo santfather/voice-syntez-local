@@ -80,6 +80,20 @@ class Replica:
     # пользователь видел и подтверждал. `None` означает подготовку на месте; так
     # работают разовые задачи и legacy-входы, у которых сохранённого анализа нет.
     final_text: str | None = None
+    # Эмоция реплики (UPDATE 2 §6). Это метаданные, а не текст: ни одно из этих
+    # полей не попадает ни в `text`, ни в `final_text` и не уходит в движок как
+    # слово. Действующая эмоция считается как override → detected → NEUTRAL.
+    emotion_detected: str = ""
+    emotion_override: str = ""
+    # Явный референс-профиль реплики; пустая строка — выбрать по эмоции.
+    reference_profile_id: str = ""
+
+    @property
+    def emotion_effective(self) -> str:
+        """Действующая эмоция: ручной выбор важнее автоматического (§6)."""
+        from .emotions import emotion_effective
+
+        return emotion_effective(self.emotion_detected, self.emotion_override)
 
     @property
     def label(self) -> str:
@@ -94,6 +108,10 @@ class Replica:
             "overrides": self.overrides,
             "voice_id": self.voice_id,
             "final_text": self.final_text,
+            "emotion_detected": self.emotion_detected,
+            "emotion_override": self.emotion_override,
+            "emotion_effective": self.emotion_effective,
+            "reference_profile_id": self.reference_profile_id,
         }
 
 

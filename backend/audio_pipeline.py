@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from . import config, qa_screening, synthesis_trace, take_quality
+from . import config, qa_screening, reference_resolver, synthesis_trace, take_quality
 from . import short_utterance as su
 from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
@@ -290,6 +290,10 @@ class RenderResult:
     # План короткой реплики по индексу: класс, стратегия, источник контекста,
     # отпечаток синтез-текста (§24). Пусто — слой не применялся.
     short_runs: dict[int, "ShortRun"] = field(default_factory=dict)
+    # Фактически использованный референс по индексу реплики (UPDATE 2 §10):
+    # профиль, эмоция и признак отката на NEUTRAL. Нужен, чтобы карточка реплики
+    # и метаданные take'а показывали **факт**, а не намерение.
+    references: dict[int, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -889,6 +893,9 @@ def _log_synthesis_input(
     label: str,
     seed: int | None,
     params: dict,
+    reference: "reference_resolver.ResolvedReference | None" = None,
+    ref_audio_path: str = "",
+    ref_text: str = "",
 ) -> None:
     """Одна строка со всем входом синтеза — непосредственно перед вызовом движка.
 
@@ -906,7 +913,7 @@ def _log_synthesis_input(
     logger.info(
         "tts.synthesis.input engine=%s voice=%s label=%s position=%s source=[%s] "
         "final=[%s] prepared=%s words=%s class=%s ref=%s ref_text=[%s] speed=%.2f "
-        "seed=%s params=%s",
+        "seed=%s params=%s emotion=%s profile=%s fallback=%s",
         engine.id,
         tuning.voice_id,
         label,
@@ -916,11 +923,14 @@ def _log_synthesis_input(
         source_text is not None,
         count_words(text),
         classify_utterance(text).kind,
-        voice.audio_path.name,
-        _text_fingerprint_text(voice.ref_text or ""),
+        Path(ref_audio_path).name if ref_audio_path else voice.audio_path.name,
+        _text_fingerprint_text(ref_text or ""),
         tuning.speed,
         seed,
         params,
+        "" if reference is None else reference.resolved_emotion,
+        "" if reference is None else reference.profile_id,
+        "" if reference is None else reference.fallback_used,
     )
 
 
@@ -950,6 +960,7 @@ async def _synthesize_chunk(
     position: str,
     label: str,
     source_text: str | None = None,
+    reference: "reference_resolver.ResolvedReference | None" = None,
 ) -> tuple[np.ndarray, int | None]:
     """Синтезирует один кусок, отделяя свой таймаут от чужой ошибки движка.
 
@@ -965,9 +976,15 @@ async def _synthesize_chunk(
 
     `source_text` — исходная реплика до подготовки; нужна только для строки лога
     о входе синтеза (см. `_log_synthesis_input`), модели она не уходит.
+
+    `reference` — выбранный референс (эмоциональный или нейтральный, см.
+    `reference_resolver`). Без него берётся основной референс голоса: разовые
+    задачи и старые вызовы продолжают работать как раньше.
     """
     seed = random.randrange(config.SEED_MAX) if engine.supports_seed else None
     params = _engine_params(tuning, settings, seed)
+    ref_audio_path = str(reference.audio_path) if reference is not None else str(voice.audio_path)
+    ref_text = reference.ref_text if reference is not None else voice.ref_text
     _log_synthesis_input(
         engine=engine,
         voice=voice,
@@ -979,6 +996,9 @@ async def _synthesize_chunk(
         label=label,
         seed=seed,
         params=params,
+        reference=reference,
+        ref_audio_path=ref_audio_path,
+        ref_text=ref_text,
     )
     started = time.monotonic()
     try:
@@ -987,8 +1007,8 @@ async def _synthesize_chunk(
                 _synthesize_in_thread,
                 engine,
                 text=text,
-                ref_audio_path=str(voice.audio_path),
-                ref_text=voice.ref_text,
+                ref_audio_path=ref_audio_path,
+                ref_text=ref_text,
                 speed=tuning.speed,
                 **params,
             ),
@@ -1143,6 +1163,10 @@ class ShortRun:
 
     def to_dict(self) -> dict:
         payload = self.plan.to_dict()
+        # Стадия планировщика (§25): «что сделали» рядом с «что просили»
+        # (`short_utterance_strategy`). Откат виден как FALLBACK_DIRECT, а не как
+        # молчаливая подмена стратегии.
+        payload["short_planner_stage"] = su.planner_stage(self.plan.strategy, self.fallback)
         payload["short_utterance_fallback"] = self.fallback
         payload["short_utterance_attempts"] = self.attempts
         payload["short_utterance_verdict"] = (
@@ -1217,6 +1241,7 @@ async def _synthesize_attempt(
     short: ShortRun | None,
     attempt: int,
     trace: "synthesis_trace.ReplicaTrace | None" = None,
+    reference: "reference_resolver.ResolvedReference | None" = None,
 ) -> tuple[np.ndarray, int | None]:
     """Одна попытка: синтез плана, обрезка до цели и откат, если границы нет.
 
@@ -1245,6 +1270,7 @@ async def _synthesize_attempt(
         position=position,
         label=label,
         source_text=replica.text,
+        reference=reference,
     )
     if trace is not None:
         trace.seed = seed
@@ -1287,6 +1313,7 @@ async def _synthesize_attempt(
             position=position,
             label=label,
             source_text=replica.text,
+            reference=reference,
         )
         if trace is not None:
             trace.seed = seed
@@ -1322,6 +1349,7 @@ async def _synthesize_checked(
     should_abort: Callable[[], bool] | None = None,
     context: su.ShortUtteranceContext | None = None,
     trace: "synthesis_trace.ReplicaTrace | None" = None,
+    reference: "reference_resolver.ResolvedReference | None" = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None, ShortRun | None]:
     """Синтез куска: обычный, с проверкой (`settings.qa`) и/или коротким слоем.
 
@@ -1381,7 +1409,8 @@ async def _synthesize_checked(
 
     if short is None and not use_qa:
         chunk, seed = await _synthesize_attempt(
-            engine, voice, replica, text, tuning, settings, position, label, None, 1, trace
+            engine, voice, replica, text, tuning, settings, position, label, None, 1, trace,
+            reference,
         )
         return chunk, seed, None, None
 
@@ -1416,7 +1445,8 @@ async def _synthesize_checked(
             on_note(f"Реплика {position}: {reason}, попытка {attempt} из {limit}")
 
         chunk, seed = await _synthesize_attempt(
-            engine, voice, replica, text, tuning, settings, position, label, short, attempt, trace
+            engine, voice, replica, text, tuning, settings, position, label, short, attempt,
+            trace, reference,
         )
         attempts = attempt
         if short is not None:
@@ -1713,6 +1743,7 @@ async def render_dialogue(
         per_replica[index] = tuning_for(voice, base, replica.overrides)
     engines = await _load_engines(list(resolved.values()), on_loaded=on_engine_loaded)
 
+    references: dict[int, dict] = {}
     pieces: list[np.ndarray] = list(resume.pieces) if resume else []
     segments: list[tuple[int, int]] = list(resume.segments) if resume else []
     seeds: list[int | None] = list(resume.seeds) if resume else []
@@ -1758,6 +1789,13 @@ async def render_dialogue(
             settings_for_replica = per_replica[index - 1]
             voice = resolved[settings_for_replica.voice_id]
             engine = engines[voice.engine]
+            # Референс выбирается под эмоцию реплики одним резолвером (UPDATE 2 §10):
+            # эмоциональный профиль того же голоса, иначе его нейтральный. Гарантия
+            # «только свой голос» структурная — профили лежат внутри голоса.
+            reference = reference_resolver.resolve_reference(
+                voice, engine.id, replica.emotion_effective, profile_id=replica.reference_profile_id
+            )
+            references[index - 1] = reference.to_dict()
             replica_trace = None
             if trace is not None:
                 replica_trace = trace.replica(
@@ -1770,9 +1808,15 @@ async def render_dialogue(
                     position=f"{index} из {total}",
                     source_text=replica.text or "",
                     final_text=replica.final_text or "",
-                    reference_audio=voice.audio_path.name,
-                    reference_text=voice.ref_text or "",
+                    reference_audio=Path(reference.audio_path).name,
+                    reference_text=reference.ref_text or "",
                 )
+                replica_trace.emotion_detected = replica.emotion_detected
+                replica_trace.emotion_override = replica.emotion_override
+                replica_trace.emotion_effective = replica.emotion_effective
+                replica_trace.reference_profile_id = reference.profile_id
+                replica_trace.reference_emotion = reference.resolved_emotion
+                replica_trace.reference_fallback_used = reference.fallback_used
 
             started = time.monotonic()
             chunk, seed, qa_outcome, short_run = await _synthesize_checked(
@@ -1787,6 +1831,7 @@ async def render_dialogue(
                 on_note=on_note,
                 context=short_contexts[index - 1] if short_contexts else None,
                 trace=replica_trace,
+                reference=reference,
             )
             if short_run is not None:
                 short_runs[index - 1] = short_run
@@ -1868,6 +1913,7 @@ async def render_dialogue(
         qa=checks,
         qualities=qualities,
         short_runs=short_runs,
+        references=references,
     )
 
 
@@ -1901,6 +1947,9 @@ async def synthesize_replica(
     resolved = tuning_for(voice, speaker, replica.overrides)
     engine = _engine_for(voice)
     await asyncio.to_thread(engine.load)
+    reference = reference_resolver.resolve_reference(
+        voice, engine.id, replica.emotion_effective, profile_id=replica.reference_profile_id
+    )
 
     chunk, seed, qa_outcome, short_run = await _synthesize_checked(
         engine,
@@ -1914,6 +1963,7 @@ async def synthesize_replica(
         on_note=on_note,
         should_abort=should_abort,
         context=context,
+        reference=reference,
     )
     prepared = await asyncio.to_thread(
         _prepare_chunk, chunk, resolved, text=replica.final_text or replica.text

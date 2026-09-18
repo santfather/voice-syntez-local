@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .. import config
+from .. import config, emotions
 from ..dialogue_parser import parse_dialogue, voice_label
 from .connection import transaction
 from .repositories.crashes import WorkerCrashesRepository
@@ -271,8 +271,10 @@ class ProjectsStore:
         overrides: dict | None = None,
         reset_overrides: bool = False,
         text: object = UNSET,
+        emotion_override: object = UNSET,
+        reference_profile_id: object = UNSET,
     ) -> dict:
-        """Правит одну реплику: текст, голос, отдельные параметры или всё сразу.
+        """Правит одну реплику: текст, голос, эмоцию, параметры или всё сразу.
 
         Один вызов на все правки: карточка меняет то текст, то голос, то ползунок,
         и отдельные ручки означали бы, что интерфейс помнит, чем что менять.
@@ -281,6 +283,11 @@ class ProjectsStore:
         меняют то, что уйдёт в модель, а ползунок громкости — нет. Поэтому
         `overrides` не сбрасывают анализ: иначе каждое движение слайдера требовало
         бы прогонять подготовку заново.
+
+        Эмоция — тоже правка без пересчёта текста: ручной выбор меняет только
+        референс, и заставлять пользователя ждать повторный анализ из-за него
+        нельзя (§11). Текст при этом не трогается вовсе — эмоция хранится
+        отдельными колонками (§4).
         """
         with transaction() as connection:
             replicas = ReplicasRepository(connection)
@@ -301,6 +308,28 @@ class ProjectsStore:
                 replicas.set_overrides(
                     replica_id, merge_overrides(replica["overrides"], overrides)
                 )
+            if emotion_override is not UNSET or reference_profile_id is not UNSET:
+                replicas.save_emotion(
+                    replica_id,
+                    {
+                        "emotion_detected": replica["emotion_detected"],
+                        "emotion_confidence": replica["emotion_confidence"],
+                        "emotion_override": (
+                            replica["emotion_override"]
+                            if emotion_override is UNSET
+                            else emotions.normalize_emotion(emotion_override, default="")
+                        ),
+                        "dialogue_act": replica["dialogue_act"],
+                        "context_dependency": replica["context_dependency"],
+                        "reference_profile_id": (
+                            replica["reference_profile_id"]
+                            if reference_profile_id is UNSET
+                            else str(reference_profile_id or "")
+                        ),
+                        "reference_emotion": replica["reference_emotion"],
+                        "reference_fallback_used": replica["reference_fallback_used"],
+                    },
+                )
             if reason is not None:
                 replicas.mark_analysis_pending(project_id, [index])
                 ProjectsRepository(connection).update(
@@ -308,6 +337,84 @@ class ProjectsStore:
                     analysis_status=config.PROJECT_ANALYSIS_RAW,
                     analysis_error=f"реплика {index + 1}: {reason}",
                 )
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def set_replica_emotion(
+        self,
+        project_id: str,
+        index: int,
+        *,
+        detected: str | None = None,
+        confidence: float = 0.0,
+        dialogue_act: str = "",
+        context_dependency: str = "",
+    ) -> dict:
+        """Пишет **распознанную** эмоцию реплики (результат анализа сцены).
+
+        Ручной выбор (`emotion_override`) не трогается: анализ не имеет права
+        переписывать решение пользователя (§5, §11). Вместе с эмоцией пишутся
+        `dialogue_act` и `context_dependency` — они приходят из того же ответа
+        модели и без них «почему именно вопрос» не объяснить.
+        """
+        with transaction() as connection:
+            replicas = ReplicasRepository(connection)
+            replica = replicas.by_index(project_id, index)
+            if replica is None:
+                raise KeyError(index)
+            replicas.save_emotion(
+                int(replica["id"]),
+                {
+                    "emotion_detected": (
+                        replica["emotion_detected"] if detected is None else detected
+                    ),
+                    "emotion_confidence": (
+                        replica["emotion_confidence"] if detected is None else confidence
+                    ),
+                    "emotion_override": replica["emotion_override"],
+                    "dialogue_act": replica["dialogue_act"] if detected is None else dialogue_act,
+                    "context_dependency": (
+                        replica["context_dependency"] if detected is None else context_dependency
+                    ),
+                    "reference_profile_id": replica["reference_profile_id"],
+                    "reference_emotion": replica["reference_emotion"],
+                    "reference_fallback_used": replica["reference_fallback_used"],
+                },
+            )
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def set_replica_reference(
+        self,
+        project_id: str,
+        index: int,
+        *,
+        profile_id: str,
+        emotion: str,
+        fallback_used: bool,
+    ) -> dict:
+        """Записывает, какой референс **фактически** ушёл в движок последним синтезом.
+
+        Это факт, а не намерение: после рендера видно, взялся эмоциональный
+        профиль или случился откат на NEUTRAL, — и в карточке реплики не нужно
+        ничего досчитывать.
+        """
+        with transaction() as connection:
+            replicas = ReplicasRepository(connection)
+            replica = replicas.by_index(project_id, index)
+            if replica is None:
+                raise KeyError(index)
+            replicas.save_emotion(
+                int(replica["id"]),
+                {
+                    "emotion_detected": replica["emotion_detected"],
+                    "emotion_confidence": replica["emotion_confidence"],
+                    "emotion_override": replica["emotion_override"],
+                    "dialogue_act": replica["dialogue_act"],
+                    "context_dependency": replica["context_dependency"],
+                    "reference_profile_id": profile_id,
+                    "reference_emotion": emotion,
+                    "reference_fallback_used": fallback_used,
+                },
+            )
         return self.get_project(project_id)  # type: ignore[return-value]
 
     def set_replica_voice(self, project_id: str, index: int, voice_id: str | None) -> dict:

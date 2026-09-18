@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "russian_linguistics" / "prompts"
-ANALYZER_PROMPT = "analyzer.v2.txt"
+ANALYZER_PROMPT = "analyzer.v3.txt"
+# v2 остаётся на диске: по нему получены сохранённые benchmark-результаты, и
+# удалять его значило бы сделать прошлые отчёты невоспроизводимыми.
+ANALYZER_PROMPT_V2 = "analyzer.v2.txt"
 # v1 остаётся в дереве: по нему уже были прогоны, и он нужен для сравнения
 # «до/после» — но по умолчанию используется v2.
 ANALYZER_PROMPT_V1 = "analyzer.v1.txt"

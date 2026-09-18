@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import audio_analysis, config, transcribe
+from . import audio_analysis, config, emotions, transcribe
 from .denoise import clean_bytes as clean_reference_bytes
 from .engines.base import (
     ENGINE_F5,
@@ -93,6 +93,69 @@ def _inspect_reference(audio_bytes: bytes, suffix: str, name: str, gender: str) 
 
 
 @dataclass
+class ReferenceProfile:
+    """Один референс голоса: нейтральный или эмоциональный (UPDATE 2 §8).
+
+    Профиль принадлежит **голосу**: он лежит внутри записи голоса, и это делает
+    «взять эмоциональный референс чужого голоса» структурно невозможным, а не
+    запрещённым проверкой, которую однажды забудут.
+
+    `quality_status` — итог уже существующей проверки «референс ↔ расшифровка»:
+    `ok` (совпало), `warning` (расшифровка расходится), `unknown` (не проверяли).
+    Резолвер не предпочитает профиль с `warning`, если есть нейтральный (§38).
+    """
+
+    id: str
+    emotion: str = emotions.EMOTION_NEUTRAL
+    label: str = ""
+    audio_file: str = ""  # имя файла внутри voices/
+    ref_text: str = ""
+    # Кем записан профиль: `legacy` — основной референс голоса, `record` — запись
+    # из интерфейса. Нужен, чтобы миграция не выдавала старое за новое.
+    source: str = "legacy"
+    quality_status: str = "unknown"
+    quality_note: str = ""
+    # Движки, для которых профиль проверен. Пустой список — «любой движок голоса».
+    engine_compatibility: list = field(default_factory=list)
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+
+    @property
+    def audio_path(self) -> Path:
+        return config.VOICES_DIR / self.audio_file
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["has_audio"] = bool(self.audio_file) and self.audio_path.exists()
+        data["emotion_title"] = emotions.EMOTION_TITLES.get(self.emotion, self.emotion)
+        return data
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "ReferenceProfile | None":
+        """Профиль из JSON; `None` — запись без обязательных полей.
+
+        Терпимость к старым и чужим файлам та же, что у голоса: неизвестные ключи
+        отбрасываются, а запись без идентификатора или файла пропускается, чтобы
+        один битый профиль не уносил с собой весь голос.
+        """
+        if not isinstance(raw, dict):
+            return None
+        known = {key: value for key, value in raw.items() if key in _PROFILE_FIELDS}
+        if not known.get("id") or not known.get("audio_file"):
+            return None
+        known["emotion"] = emotions.normalize_emotion(known.get("emotion"))
+        compatibility = known.get("engine_compatibility") or []
+        known["engine_compatibility"] = (
+            [str(item) for item in compatibility] if isinstance(compatibility, list) else []
+        )
+        try:
+            return cls(**known)
+        except TypeError:
+            return None
+
+
+@dataclass
 class Voice:
     id: str
     name: str
@@ -116,18 +179,72 @@ class Voice:
     # пользователем в «Прослушать». Это слой между паспортом движка и слотом
     # проекта: новый диалог берёт эти значения сам, без повторной настройки.
     preset: dict = field(default_factory=dict)
+    # Референс-профили: нейтральный плюс эмоциональные (UPDATE 2 §8). Пустой
+    # список — старый голос: его основной референс читается как NEUTRAL
+    # (`reference_profiles`), поэтому миграция данных не нужна.
+    profiles: list = field(default_factory=list)
 
     @property
     def audio_path(self) -> Path:
         return config.VOICES_DIR / self.audio_file
 
+    def reference_profiles(self) -> list["ReferenceProfile"]:
+        """Профили голоса, включая проекцию старого референса в NEUTRAL (§9).
+
+        Голос, сохранённый до появления эмоций, имеет один `audio_file` и один
+        `ref_text`. Он обязан продолжать работать и всегда доступен как NEUTRAL —
+        даже когда рядом уже записаны эмоциональные профили: «нет референса для
+        восторга» не должно означать «нет референса вообще».
+
+        Проекция вычисляется на чтение: переписывать `voices.json` при каждом
+        чтении нельзя, а разойтись двум представлениям одного референса негде —
+        источник один.
+        """
+        profiles = [item for item in self.profiles if isinstance(item, ReferenceProfile)]
+        neutral = self.neutral_profile()
+        if not neutral.audio_file:
+            return profiles
+        if any(item.audio_file == neutral.audio_file for item in profiles):
+            return profiles
+        return [neutral, *profiles]
+
+    def neutral_profile(self) -> "ReferenceProfile":
+        """Основной референс голоса как NEUTRAL-профиль.
+
+        Качество берётся из уже посчитанных предупреждений голоса: расхождение
+        расшифровки (`ref_text_warning`) — ровно тот случай, когда эмоциональный
+        профиль нельзя предпочитать нейтральному.
+        """
+        return ReferenceProfile(
+            id=f"{self.id}-neutral",
+            emotion=emotions.EMOTION_NEUTRAL,
+            label="Основной",
+            audio_file=self.audio_file,
+            ref_text=self.ref_text,
+            source="legacy",
+            quality_status="warning" if self.ref_text_warning else "ok",
+            quality_note=self.ref_text_warning or "",
+            engine_compatibility=[self.engine] if self.engine else [],
+            created_at=self.created_at,
+        )
+
+    def profile(self, profile_id: str) -> "ReferenceProfile | None":
+        for item in self.reference_profiles():
+            if item.id == profile_id:
+                return item
+        return None
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data["has_audio"] = self.audio_path.exists()
+        # Профили отдаются уже с проекцией старого референса: интерфейсу не нужно
+        # знать, был голос записан до появления эмоций или после.
+        data["reference_profiles"] = [item.to_dict() for item in self.reference_profiles()]
         return data
 
 
 _VOICE_FIELDS = {f.name for f in fields(Voice)}
+_PROFILE_FIELDS = {f.name for f in fields(ReferenceProfile)}
 
 
 class VoicesStore:
@@ -159,6 +276,14 @@ class VoicesStore:
                     voice.engine, voice.engine_params if isinstance(voice.engine_params, dict) else {}
                 )
                 voice.preset = _normalize_preset(voice.preset)
+                # Профили: битая запись пропускается поштучно, остальные остаются.
+                voice.profiles = [
+                    profile
+                    for profile in (
+                        ReferenceProfile.from_dict(raw) for raw in (voice.profiles or [])
+                    )
+                    if profile is not None
+                ]
                 voices.append(voice)
             except TypeError as exc:  # запись без обязательного поля — пропускаем
                 logger.warning("Пропускаю некорректную запись в voices.json: %s", exc)
@@ -327,6 +452,114 @@ class VoicesStore:
             "Голос %s: движок %s, пресет %s", voice_id, voice.engine, voice.preset or "пуст"
         )
         return voice
+
+    # -- референс-профили (UPDATE 2 §8, §37, §38) -------------------------------
+    def add_reference(
+        self,
+        voice_id: str,
+        *,
+        emotion: str,
+        audio_filename: str,
+        audio_bytes: bytes,
+        ref_text: str = "",
+        label: str = "",
+        verify_ref_text: bool = True,
+    ) -> ReferenceProfile:
+        """Добавляет эмоциональный референс существующему голосу.
+
+        Тот же путь, что и у основного референса: файл пишется в `voices/`, а
+        расшифровка либо сверяется с записью, либо берётся из формы. Качество
+        проставляется здесь же — резолвер не должен выбирать профиль, про который
+        известно, что он не совпадает с записью (§38).
+        """
+        emotion = emotions.normalize_emotion(emotion)
+        if emotion == emotions.EMOTION_AUTO:
+            raise ValueError("AUTO — не эмоция референса: выберите конкретную")
+        suffix = Path(audio_filename or "").suffix.lower()
+        if suffix not in ALLOWED_AUDIO_SUFFIXES:
+            raise ValueError(f"Формат {suffix or 'без расширения'} не поддерживается")
+        if not audio_bytes:
+            raise ValueError("Пустой файл записи")
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            raise ValueError("Файл слишком большой")
+        with self._lock:
+            voices = self._read()
+            voice = next((v for v in voices if v.id == voice_id), None)
+            if voice is None:
+                raise KeyError(voice_id)
+            profile_id = uuid.uuid4().hex[:12]
+            filename = f"{voice_id}-{profile_id}{suffix}"
+            path = config.VOICES_DIR / filename
+            path.write_bytes(audio_bytes)
+            try:
+                resolved_text, warning = self._resolve_ref_text(path, ref_text, verify_ref_text)
+            except ValueError:
+                path.unlink(missing_ok=True)
+                raise
+            profile = ReferenceProfile(
+                id=profile_id,
+                emotion=emotion,
+                label=label.strip() or emotions.EMOTION_TITLES.get(emotion, emotion),
+                audio_file=filename,
+                ref_text=resolved_text,
+                source="record",
+                quality_status="warning" if warning else "ok",
+                quality_note=warning or "",
+                engine_compatibility=[voice.engine],
+            )
+            # Профили хранятся отдельным списком; старый одиночный референс
+            # остаётся нетронутым и читается как NEUTRAL.
+            voice.profiles = [*voice.profiles, profile]
+            self._write(voices)
+        logger.info("Голос %s: добавлен референс %s (%s)", voice_id, profile.id, emotion)
+        return profile
+
+    def update_reference(
+        self,
+        voice_id: str,
+        profile_id: str,
+        *,
+        emotion: str | None = None,
+        label: str | None = None,
+    ) -> ReferenceProfile:
+        """Правит эмоцию или подпись профиля, не перезаписывая запись."""
+        with self._lock:
+            voices = self._read()
+            voice = next((v for v in voices if v.id == voice_id), None)
+            if voice is None:
+                raise KeyError(voice_id)
+            profile = next((item for item in voice.profiles if item.id == profile_id), None)
+            if profile is None:
+                raise KeyError(profile_id)
+            if emotion is not None:
+                chosen = emotions.normalize_emotion(emotion)
+                if chosen == emotions.EMOTION_AUTO:
+                    raise ValueError("AUTO — не эмоция референса: выберите конкретную")
+                profile.emotion = chosen
+            if label is not None:
+                profile.label = label.strip() or profile.label
+            self._write(voices)
+        logger.info("Голос %s: референс %s обновлён (%s)", voice_id, profile_id, profile.emotion)
+        return profile
+
+    def delete_reference(self, voice_id: str, profile_id: str) -> bool:
+        """Удаляет профиль вместе с его файлом. Основной референс не удаляется."""
+        with self._lock:
+            voices = self._read()
+            voice = next((v for v in voices if v.id == voice_id), None)
+            if voice is None:
+                raise KeyError(voice_id)
+            profile = next((item for item in voice.profiles if item.id == profile_id), None)
+            if profile is None:
+                return False
+            voice.profiles = [item for item in voice.profiles if item.id != profile_id]
+            self._write(voices)
+            try:
+                profile.audio_path.unlink(missing_ok=True)
+            except OSError as exc:  # файл мог быть удалён руками
+                logger.warning("Файл референса %s не удалён: %s", profile.audio_file, exc)
+        logger.info("Голос %s: референс %s удалён", voice_id, profile_id)
+        return True
 
     def inspect_existing(self) -> int:
         """Считает F0 и метки для голосов, загруженных до появления проверки."""

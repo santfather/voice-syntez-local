@@ -1126,6 +1126,24 @@ class JobQueue:
         job.message = f"{title}{where}"
 
     @staticmethod
+    def _reference_dict(result: audio_pipeline.RenderResult, index: int) -> dict:
+        """Паспорт референса варианта: профиль, эмоция, был ли откат.
+
+        Пустой индекс — пустой словарь: старые рендеры (до слоя эмоций) писали
+        take'ы без этих полей, и подставлять им «NEUTRAL» значило бы выдумывать
+        факт, которого не было.
+        """
+        reference = (result.references or {}).get(index)
+        if not reference:
+            return {}
+        return {
+            "reference_profile_id": str(reference.get("reference_profile_id") or ""),
+            "reference_emotion": str(reference.get("reference_emotion") or ""),
+            "reference_fallback_used": bool(reference.get("reference_fallback_used")),
+            "emotion_requested": str(reference.get("requested_emotion") or ""),
+        }
+
+    @staticmethod
     def _short_plan_dict(short_run) -> dict | None:
         """Метаданные короткой реплики для карточки куска (§24) или None."""
         if short_run is None:
@@ -1331,6 +1349,11 @@ class JobQueue:
                             **(audio_pipeline.chunk_parameters(replica, speaker)
                                if speaker else {}),
                             **(self._short_plan_dict(result.short_runs.get(index)) or {}),
+                            # Референс и эмоция — часть паспорта варианта
+                            # (UPDATE 2 §12): по метаданным видно, с каким
+                            # референсом получено это звучание, даже когда
+                            # эмоция реплики уже сменена.
+                            **self._reference_dict(result, index),
                         },
                         "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
                         "qa": result.qa[index].to_dict()
@@ -1344,6 +1367,24 @@ class JobQueue:
             await asyncio.to_thread(
                 get_projects_store().save_render_takes, project_id, job.id, takes
             )
+            # Фактически использованный референс пишется и в реплику: карточка
+            # показывает не намерение, а результат («эмоциональный профиль» или
+            # «откат на NEUTRAL»), и после перезапуска это видно (§10, §37).
+            for index, reference in (result.references or {}).items():
+                try:
+                    await asyncio.to_thread(
+                        get_projects_store().set_replica_reference,
+                        project_id,
+                        index,
+                        profile_id=str(reference.get("reference_profile_id") or ""),
+                        emotion=str(reference.get("reference_emotion") or ""),
+                        fallback_used=bool(reference.get("reference_fallback_used")),
+                    )
+                except Exception as exc:  # noqa: BLE001 — история кусков важнее
+                    logger.warning(
+                        "Проект %s: референс реплики %s не записан (%s)",
+                        project_id, index, exc,
+                    )
         except Exception as exc:  # noqa: BLE001 — файл готов, история кусков вторична
             logger.warning(
                 "Проект %s: не удалось сохранить куски рендера (%s: %s)",

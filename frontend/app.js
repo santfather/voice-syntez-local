@@ -1535,6 +1535,7 @@ function renderVoiceCards() {
           <span class="muted preview-status" data-role="preview-status"></span>
         </div>
         <p class="muted preset-state" data-role="preset-state">${esc(presetText(voice))}</p>
+        ${voiceReferencesHtml(voice)}
         <button class="tiny ghost compare-button" data-role="compare">⇄ Сравнить движки</button>
         <div class="benchmark-panel" data-role="benchmark" hidden></div>
         <audio data-role="player" controls hidden></audio>
@@ -1545,6 +1546,63 @@ function renderVoiceCards() {
   Object.keys(state.benchmark).forEach((voiceId) => {
     if (state.benchmark[voiceId].open) renderBenchmarkPanel(voiceId);
   });
+}
+
+// Референс-профили голоса (UPDATE 2 §37). Один голос — один `voice_id`, но
+// несколько референсов: нейтральный (загруженный при создании) и эмоциональные.
+// Показываем эмоцию, подпись и качество; добавление и удаление — здесь же, потому
+// что «где записать восторг» и «где выбрать голос» — одно место.
+const REFERENCE_EMOTIONS = ['NEUTRAL', 'QUESTION', 'DELIGHT', 'SURPRISE', 'FEAR'];
+
+function voiceReferencesHtml(voice) {
+  const profiles = voice.reference_profiles || [];
+  const rows = profiles.map((profile) => {
+    const quality = profile.quality_status === 'warning'
+      ? `<span class="tag warn" title="${esc(profile.quality_note || 'расшифровка не совпала с записью')}">проверить</span>`
+      : '';
+    const emotion = EMOTION_LABELS[profile.emotion] || profile.emotion;
+    const removable = profile.id !== `${voice.id}-neutral`
+      ? `<button class="tiny ghost danger" data-role="reference-delete" data-profile="${esc(profile.id)}">удалить</button>`
+      : '<span class="muted">основной</span>';
+    return `
+      <div class="row between" style="margin-top:6px">
+        <span class="muted">${esc(emotion)} · ${esc(profile.label || '')} ${quality}</span>
+        ${removable}
+      </div>`;
+  }).join('');
+  const options = REFERENCE_EMOTIONS
+    .map((value) => `<option value="${value}">${esc(EMOTION_LABELS[value] || value)}</option>`)
+    .join('');
+  return `
+    <details class="advanced">
+      <summary>Референсы эмоций (${profiles.length})</summary>
+      ${rows || '<div class="muted" style="margin-top:6px">Отдельных эмоциональных записей пока нет.</div>'}
+      <div class="row" style="margin-top:8px">
+        <select data-role="reference-emotion">${options}</select>
+        <button class="tiny" data-role="reference-add">Загрузить запись</button>
+        <input type="file" accept="audio/*" hidden data-role="reference-file" />
+      </div>
+      <span class="muted">
+        Своя запись для эмоции даёт модели нужную интонацию: вопрос, восторг,
+        удивление, испуг. Без неё эмоция озвучивается нейтральным референсом того же
+        голоса — синтез не блокируется, но интонация будет нейтральной. Референс
+        другого голоса не используется никогда.
+      </span>
+    </details>`;
+}
+
+async function addVoiceReference(voiceId, emotion, file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  form.append('emotion', emotion);
+  form.append('verify_ref_text', 'false');
+  const result = await api(`/api/voices/${voiceId}/references`, { method: 'POST', body: form });
+  return result;
+}
+
+async function deleteVoiceReference(voiceId, profileId) {
+  return api(`/api/voices/${voiceId}/references/${profileId}`, { method: 'DELETE' });
 }
 
 function setPreviewStatus(card, message, isError = false) {
@@ -3650,6 +3708,8 @@ function replicaCardHtml(replica) {
         <span class="muted">Свой голос этой реплики; остальные читает голос спикера.</span>
       </div>
 
+      ${replicaEmotionHtml(replica)}
+
       ${replicaSliderHtml(replica, 'speed', 'Speed', PARAM_RANGES.speed)}
       ${replicaSliderHtml(replica, 'pause_override_ms', 'Pause before', { min: 0, max: 5000, step: 50 }, pause === null ? 400 : pause)}
 
@@ -3670,6 +3730,62 @@ function replicaCardHtml(replica) {
 
       ${replicaPreviewHtml(replica)}
     </div>`;
+}
+
+// Эмоция реплики: селектор, фактический результат «Авто» и состояние референса.
+// Эмоция — метаданные, а не текст: она выбирает референс голоса (UPDATE 2 §11) и
+// никогда не попадает в произносимую строку. Поэтому здесь только селектор и
+// подпись — правка текста живёт в другом месте карточки.
+const EMOTION_SOURCE_LABELS = {
+  llm: 'модель',
+  heuristic: 'по тексту',
+  none: 'нет',
+};
+
+const EMOTION_LABELS = {
+  NEUTRAL: 'нейтральный',
+  QUESTION: 'вопрос',
+  DELIGHT: 'восторг',
+  SURPRISE: 'удивление',
+  FEAR: 'испуг',
+};
+
+function replicaEmotionHtml(replica) {
+  const emotion = replica.emotion || {};
+  const catalog = emotion.catalog && emotion.catalog.length
+    ? emotion.catalog
+    : [{ value: 'AUTO', title: 'Авто' }];
+  const selected = emotion.override || 'AUTO';
+  const options = catalog
+    .map((item) => `<option value="${esc(item.value)}"${item.value === selected ? ' selected' : ''}${item.available === false ? ' disabled' : ''}>${esc(item.title)}${item.available === false ? ' (нет референса)' : ''}</option>`)
+    .join('');
+  const effective = emotion.effective_title || emotion.effective || '—';
+  const source = emotion.source || 'none';
+  // «Авто → Вопрос» — результат автоматики и то, откуда он взялся. Ручной выбор
+  // показывается без стрелки: это решение пользователя, а не догадка.
+  const result = selected === 'AUTO'
+    ? `Авто → ${esc(effective)} <span class="muted">(${esc(EMOTION_SOURCE_LABELS[source] || source)})</span>`
+    : `выбрано: ${esc(effective)}`;
+  const reference = replica.reference || {};
+  const referenceNote = reference.fallback_used
+    ? 'референс: откат на нейтральный'
+    : reference.emotion
+      ? `референс: ${esc(EMOTION_LABELS[reference.emotion] || reference.emotion)}`
+      : 'референс: ещё не синтезировалось';
+  const act = emotion.dialogue_act ? ` · ${esc(emotion.dialogue_act)}` : '';
+  return `
+      <div class="field" style="margin-top: 4px">
+        <span>Эмоция реплики</span>
+        <div class="grid-2">
+          <select data-role="emotion">${options}</select>
+          <span class="muted">${result}${act}<br />${referenceNote}</span>
+        </div>
+        <span class="muted">
+          Эмоция выбирает референс этого же голоса: вопрос, восторг, удивление и испуг
+          звучат своим референсом, а если его нет — нейтральным (об этом скажет подпись).
+          Ручной выбор важнее автоматического.
+        </span>
+      </div>`;
 }
 
 // Подготовленный текст реплики: то, что реально уйдёт в модель, и предупреждения.
@@ -4819,6 +4935,13 @@ function bindReplicaCards() {
     const card = event.target.closest('.replica-card');
     if (!card) return;
     const index = indexOf(event.target);
+    // Эмоция — метаданные реплики, а не текст: смена только выбирает референс и
+    // не требует повторного анализа (§11). `AUTO` снимает ручной выбор (null).
+    if (event.target.dataset.role === 'emotion') {
+      const value = event.target.value || 'AUTO';
+      patchReplica(index, { emotion_override: value === 'AUTO' ? null : value });
+      return;
+    }
     // Голос реплики — это её собственный голос поверх голоса спикера.
     if (event.target.dataset.role === 'voice') {
       patchReplica(index, { voice_id: event.target.value });
@@ -5108,11 +5231,28 @@ function bindEvents() {
     }
   });
 
-  voiceCards.addEventListener('change', (event) => {
+  voiceCards.addEventListener('change', async (event) => {
     const card = event.target.closest('.card');
     if (!card) return;
     const voiceId = card.dataset.voiceId;
     const role = event.target.dataset.role;
+    if (role === 'reference-file') {
+      // Загрузка эмоционального референса: расшифровку не проверяем (`false`) —
+      // запись сделана по показанной фразе, и распознавание только удлинило бы шаг.
+      const file = event.target.files && event.target.files[0];
+      event.target.value = '';
+      const emotion = event.target.dataset.emotion || 'NEUTRAL';
+      if (!file) return;
+      setPreviewStatus(card, 'загружаю референс…');
+      try {
+        await addVoiceReference(voiceId, emotion, file);
+        await loadVoices();
+        renderVoiceCards();
+      } catch (error) {
+        setPreviewStatus(card, error.message, true);
+      }
+      return;
+    }
     if (role === 'benchmark-engine') {
       const engine = event.target.dataset.engine;
       const cfg = benchmarkState(voiceId);
@@ -5149,6 +5289,25 @@ function bindEvents() {
     if (button.dataset.role === 'preview-cancel') cancelPreview(card);
     if (button.dataset.role === 'save-preset') saveVoicePreset(voiceId);
     if (button.dataset.role === 'compare') toggleBenchmark(voiceId);
+    if (button.dataset.role === 'reference-add') {
+      // Файл выбирает пользователь: запись эмоции — это отдельный референс, и
+      // подставлять вместо неё что-то другое нельзя (§38).
+      const card = button.closest('.card');
+      const input = card.querySelector('[data-role="reference-file"]');
+      input.dataset.emotion = card.querySelector('[data-role="reference-emotion"]').value;
+      input.click();
+      return;
+    }
+    if (button.dataset.role === 'reference-delete') {
+      try {
+        await deleteVoiceReference(voiceId, button.dataset.profile);
+        await loadVoices();
+        renderVoiceCards();
+      } catch (error) {
+        setPreviewStatus(button.closest('.card'), error.message, true);
+      }
+      return;
+    }
     if (button.dataset.role === 'benchmark-run') runBenchmark(voiceId);
     if (button.dataset.role === 'benchmark-play') playBenchmarkTake(voiceId, button.dataset.url);
     if (button.dataset.role === 'benchmark-select') {
