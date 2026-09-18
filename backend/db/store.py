@@ -10,14 +10,19 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .. import config
 from ..dialogue_parser import parse_dialogue, voice_label
 from .connection import transaction
 from .repositories.crashes import WorkerCrashesRepository
+from .repositories.llm_analyses import LlmAnalysesRepository
 from .repositories.projects import ProjectsRepository
 from .repositories.replicas import ReplicasRepository
 from .repositories.takes import TakesRepository
+
+if TYPE_CHECKING:  # pragma: no cover — только для аннотаций
+    from ..llm.analyzer import ReplicaAnalysis
 
 
 def _analysis_status_from_rows(rows: list[dict]) -> str:
@@ -439,12 +444,42 @@ class ProjectsStore:
                 raise KeyError(project_id)
             replicas = ReplicasRepository(connection)
             replicas.mark_analysis_pending(project_id, indexes)
+            # Разбор LLM устаревает вместе с подготовкой: он опирался на тот же
+            # текст, контекст и словарь. Записи не удаляем — это история.
+            LlmAnalysesRepository(connection).mark_stale(project_id, indexes)
             projects.update(
                 project_id,
                 analysis_status=config.PROJECT_ANALYSIS_RAW,
                 analysis_error=reason,
             )
         return self.get_project(project_id)  # type: ignore[return-value]
+
+    # -- разборы локальной LLM (Task 2) ----------------------------------------
+    def llm_analyses(self, project_id: str) -> list[dict]:
+        """Сохранённые разборы реплик проекта — в порядке реплик."""
+        with transaction() as connection:
+            return LlmAnalysesRepository(connection).list_for_project(project_id)
+
+    def save_llm_analysis(
+        self,
+        project_id: str,
+        replica_index: int,
+        analysis: "ReplicaAnalysis | None" = None,
+    ) -> dict:
+        """Сохраняет разбор реплики (заменяя прежний) через кеш-репозиторий."""
+        from ..llm.analysis_cache import AnalysisCache
+
+        with transaction() as connection:
+            return AnalysisCache(LlmAnalysesRepository(connection)).save(
+                project_id, replica_index, analysis
+            )
+
+    def mark_llm_analyses_stale(
+        self, project_id: str, indexes: list[int] | None = None
+    ) -> int:
+        """Помечает разборы устаревшими: точечно по репликам или все сразу."""
+        with transaction() as connection:
+            return LlmAnalysesRepository(connection).mark_stale(project_id, indexes)
 
     def get_take(self, project_id: str, index: int, take_id: int) -> dict | None:
         """Вариант реплики, если он действительно ей принадлежит."""

@@ -338,6 +338,9 @@ class ReplicaAnalysis:
     schema_version: str = s.SCHEMA_VERSION
     source_hash: str = ""
     context_hash: str = ""
+    # Хеш словаря, влияющего на реплику: разбор перестаёт быть действительным при
+    # изменении правила, а не только текста (§11, §18 Task 2).
+    dictionary_hash: str = ""
     seconds: float = 0.0
     error: str = ""
     # Ответ пришлось запрашивать повторно (repair): это диагностика, а не ошибка.
@@ -362,6 +365,7 @@ class ReplicaAnalysis:
             "schema_version": self.schema_version,
             "source_hash": self.source_hash,
             "context_hash": self.context_hash,
+            "dictionary_hash": self.dictionary_hash,
             "seconds": round(self.seconds, 3),
             "error": self.error,
             "repaired": self.repaired,
@@ -482,6 +486,7 @@ class LinguisticAnalyzer:
         target_text: str,
         before: Sequence[str] = (),
         after: Sequence[str] = (),
+        dictionary_digest: str = "",
         cancel=None,
     ) -> ReplicaAnalysis:
         """Анализирует одну реплику и возвращает разбор (никогда не бросает).
@@ -507,6 +512,7 @@ class LinguisticAnalyzer:
                 prompt_version=self.prompt.version,
                 source_hash=source_digest,
                 context_hash=context_digest,
+                dictionary_hash=dictionary_digest,
                 error="Analyzer выключен",
             )
 
@@ -523,6 +529,7 @@ class LinguisticAnalyzer:
                 context_digest,
                 started,
                 f"Модель «{model}» не скачана локально",
+                dictionary_digest=dictionary_digest,
             )
         payload = {
             "replica_id": replica_id,
@@ -542,6 +549,7 @@ class LinguisticAnalyzer:
                 context_digest,
                 started,
                 f"{type(exc).__name__}: {exc}",
+                dictionary_digest=dictionary_digest,
             )
 
         if analysis is None:
@@ -552,6 +560,7 @@ class LinguisticAnalyzer:
                 context_digest,
                 started,
                 "Ответ не прошёл проверку: " + ", ".join(errors),
+                dictionary_digest=dictionary_digest,
             )
 
         items, dropped = locate_annotations(analysis.items, target_text)
@@ -576,6 +585,7 @@ class LinguisticAnalyzer:
             prompt_version=self.prompt.version,
             source_hash=source_digest,
             context_hash=context_digest,
+            dictionary_hash=dictionary_digest,
             seconds=self.clock() - started,
             repaired=repaired,
             markup_stripped=markup_stripped,
@@ -679,6 +689,7 @@ class LinguisticAnalyzer:
         context_digest: str,
         started: float,
         error: str,
+        dictionary_digest: str = "",
     ) -> ReplicaAnalysis:
         logger.info("Анализ реплики %s не выполнен: %s", replica_id, error)
         return ReplicaAnalysis(
@@ -689,6 +700,7 @@ class LinguisticAnalyzer:
             prompt_version=self.prompt.version,
             source_hash=source_digest,
             context_hash=context_digest,
+            dictionary_hash=dictionary_digest,
             seconds=self.clock() - started,
             error=error,
         )

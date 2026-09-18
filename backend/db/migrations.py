@@ -212,6 +212,38 @@ CREATE INDEX IF NOT EXISTS idx_worker_crashes_job ON worker_crashes(job_id);
 CREATE INDEX IF NOT EXISTS idx_worker_crashes_replica ON worker_crashes(project_id, replica_index);
 """
 
+# Разборы локальной LLM живут отдельно от текста реплики: текст — пользовательский
+# и неизменяемый, разбор — производная, которую можно пересчитать и которая обязана
+# устаревать при изменении входа. Хеши входа хранятся рядом, чтобы «устарел или нет»
+# решалось сравнением, а не догадкой по времени.
+_MIGRATION_7 = """
+CREATE TABLE IF NOT EXISTS llm_analyses (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id       TEXT NOT NULL UNIQUE,
+    project_id        TEXT NOT NULL,
+    replica_id        INTEGER NOT NULL,
+    replica_index     INTEGER NOT NULL,
+    source_text_hash  TEXT NOT NULL DEFAULT '',
+    context_hash      TEXT NOT NULL DEFAULT '',
+    dictionary_hash   TEXT NOT NULL DEFAULT '',
+    model_tag         TEXT NOT NULL DEFAULT '',
+    model_digest      TEXT NOT NULL DEFAULT '',
+    prompt_version    TEXT NOT NULL DEFAULT '',
+    schema_version    TEXT NOT NULL DEFAULT '',
+    analysis_json     TEXT NOT NULL DEFAULT '{}',
+    status            TEXT NOT NULL DEFAULT 'PENDING',
+    error             TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    -- Ключ — место реплики в проекте: при повторном разборе диалога id меняются,
+    -- а индекс остаётся тем же местом в тексте, и разбор не должен «теряться».
+    UNIQUE(project_id, replica_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_analyses_project ON llm_analyses(project_id, replica_index);
+CREATE INDEX IF NOT EXISTS idx_llm_analyses_status ON llm_analyses(status);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -219,6 +251,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
+    (7, _MIGRATION_7),
 )
 
 
