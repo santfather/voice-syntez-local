@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -336,3 +337,59 @@ def test_saved_analysis_round_trips_annotations(status):
     assert restored.items[0].needs_review is False
     assert restored.model_tag == "qwen3:8b"
     assert restored.prompt_version == "2"
+
+
+def test_llm_model_is_unloaded_after_analysis_pass():
+    """После прохода анализа модель выгружается: память нужна рендеру (§14.3).
+
+    Иначе резидентная LLM (2--6 GB) останется висеть рядом с F5, и синтез упрётся в
+    ту же память, которую анализатор только что занимал.
+    """
+    from backend.llm import analyzer as llm
+    from backend.llm import integration as integration_module
+    from backend.llm import memory_policy
+    from backend.llm import scheduler as scheduler_module
+    from backend.llm.fake_client import FakeOllamaClient
+    from backend.llm.ollama_client import OllamaModel
+
+    client = FakeOllamaClient(
+        models=[OllamaModel(tag="qwen3:8b", digest="d1", size_bytes=5 * 1024**3)],
+        responder=lambda case: json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replica_id": case["replica_id"],
+                "items": [],
+                "utterance": {"class": "NORMAL"},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    analyzer = llm.LinguisticAnalyzer(
+        settings=llm.AnalyzerSettings(enabled=True), client=client
+    )
+    runner = integration_module.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=scheduler_module.HeavyScheduler(
+            gate=memory_policy.HeavyGate(),
+            sensor=lambda: {"system_percent": 40.0, "available_gb": 12.0, "pressure": "green"},
+        ),
+        lookup=lambda index, key: None,
+        save=lambda index, analysis: None,
+    )
+    outcome = runner.run(project_id="p1", replicas=[{"index": 0, "text": "Да."}])
+    assert outcome.calls == 1
+    assert outcome.unloaded is True
+    assert client.unloaded == ["qwen3:8b"], "модель обязана быть выгружена после прохода"
+    assert client.loaded_models() == []
+
+    # Проход целиком из кеша модель не грузит и никого не выгружает.
+    cached = integration_module.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=runner.scheduler,
+        lookup=lambda index, key: integration_module.ReplicaAnalysis(
+            replica_id=1, status=llm.STATUS_READY
+        ),
+        save=lambda index, analysis: None,
+    )
+    outcome = cached.run(project_id="p1", replicas=[{"index": 0, "text": "Да."}])
+    assert outcome.calls == 0 and outcome.unloaded is False

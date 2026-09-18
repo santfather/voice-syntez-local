@@ -663,3 +663,60 @@ def test_job_payload_hints_do_not_change_render_settings():
     assert after == before, "подсказки не меняют настройки рендера"
     assert payload.project_id == ""
     assert payload.replicas[0].final_text == "Да."
+
+
+def test_analysis_pass_stops_on_hard_stop_memory():
+    """HARD STOP во время прохода останавливает анализ и выгружает модель (§14).
+
+    Проход длинный: десятки реплик, модель загружена, KV-кэш растёт. Проверка только
+    «до начала» не спасает — память уходит в HARD STOP уже в середине, и продолжать
+    значит уйти в swap на всей машине.
+    """
+    from backend.llm import integration as integration_module
+    from backend.llm import memory_policy as memory
+    from backend.llm import scheduler as scheduler_module
+    from backend.llm.analyzer import LinguisticAnalyzer
+    from backend.llm.fake_client import FakeOllamaClient
+    from backend.llm.ollama_client import OllamaModel
+
+    client = FakeOllamaClient(
+        models=[OllamaModel(tag="qwen3:8b", digest="d1", size_bytes=5 * 1024**3)],
+        responder=lambda case: json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replica_id": case["replica_id"],
+                "items": [],
+                "utterance": {"class": "NORMAL"},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    green = {"system_percent": 50.0, "available_gb": 12.0, "pressure": "green"}
+    hard = {"system_percent": 90.0, "available_gb": 2.0, "pressure": "green"}
+    # Первая зелёная — вход в слот; вторая — проверка перед первой репликой;
+    # дальше HARD STOP: анализ обязан остановиться, не дойдя до второй реплики.
+    samples = [dict(green), dict(green), dict(hard)]
+    state = {"index": 0}
+
+    def sensor() -> dict:
+        index = min(state["index"], len(samples) - 1)
+        state["index"] += 1
+        return samples[index]
+
+    analyzer = LinguisticAnalyzer(settings=llm.AnalyzerSettings(enabled=True), client=client)
+    runner = integration_module.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=scheduler_module.HeavyScheduler(
+            gate=memory.HeavyGate(), sensor=sensor
+        ),
+        lookup=lambda index, key: None,
+        save=lambda index, analysis: None,
+    )
+    outcome = runner.run(
+        project_id="p1",
+        replicas=[{"index": 0, "text": "Да."}, {"index": 1, "text": "Нет."}, {"index": 2, "text": "Ок."}],
+    )
+    assert outcome.status == llm.STATUS_FAILED
+    assert "HARD STOP" in outcome.error
+    assert outcome.calls == 1, "после HARD STOP модель больше не спрашивают"
+    assert client.unloaded == ["qwen3:8b"], "модель обязана быть выгружена при остановке"

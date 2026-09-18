@@ -194,8 +194,14 @@ def test_queue_light_api_answers_while_llm_analysis_runs(monkeypatch):
     aio.run(scenario())
 
 
-def test_scheduler_singleton_shares_gate_with_queue():
-    """Планировщик и очередь используют один и тот же gate, а не свои копии."""
+def test_scheduler_singleton_shares_gate_with_queue(monkeypatch):
+    """Планировщик и очередь используют один и тот же gate, а не свои копии.
+
+    Датчик памяти подменяется: singleton читает живую память, и без подмены тест
+    зависел бы от того, что сейчас запущено на машине (а жёлтое давление macOS —
+    законный запрет запуска, не связанный с предметом проверки).
+    """
+    monkeypatch.setattr(memory, "read_sensors", lambda: dict(GREEN))
     scheduler_module.reset_scheduler()
     try:
         scheduler = scheduler_module.get_scheduler()

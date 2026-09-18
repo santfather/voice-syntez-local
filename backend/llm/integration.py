@@ -339,6 +339,7 @@ class ProjectAnalysisOutcome:
     from_cache: int = 0
     calls: int = 0
     blocked_reason: str = ""
+    unloaded: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -351,6 +352,7 @@ class ProjectAnalysisOutcome:
             "seconds": round(self.seconds, 3),
             "error": self.error,
             "blocked_reason": self.blocked_reason,
+            "unloaded": self.unloaded,
         }
 
 
@@ -370,6 +372,7 @@ class ProjectLlmAnalyzer:
         lookup: Callable[[int, AnalysisKey], ReplicaAnalysis | None] | None = None,
         save: Callable[[int, ReplicaAnalysis], None] | None = None,
         model_size_gb: float | None = None,
+        unload_after: bool = True,
         clock=time.monotonic,
     ) -> None:
         self.analyzer = analyzer or LinguisticAnalyzer()
@@ -377,6 +380,10 @@ class ProjectLlmAnalyzer:
         self._lookup = lookup
         self._save = save
         self.model_size_gb = model_size_gb
+        # Выгружать модель после прохода (§14.3): дальше идёт рендер, которому нужна
+        # память под F5/XTTS. Держать резидентную LLM «на всякий случай» значит
+        # отдать под неё 2--6 GB, которые понадобятся синтезу.
+        self.unload_after = unload_after
         self.clock = clock
 
     def run(
@@ -416,6 +423,28 @@ class ProjectLlmAnalyzer:
                 owner=f"analysis:{project_id}",
             ):
                 for position, row in enumerate(replicas):
+                    # Проход длинный (десятки реплик), и память может уйти в HARD
+                    # STOP уже во время него: модель загружена, KV-кэш растёт.
+                    # Проверяем перед каждой репликой и останавливаемся с причиной —
+                    # частичный разбор лучше, чем swap на всей машине (§14).
+                    abort = self.scheduler.check(
+                        memory.HEAVY_LLM, model_size_gb=self.model_size_gb
+                    )
+                    if abort.memory_level == memory.LEVEL_HARD_STOP:
+                        # Модель могла быть загружена предыдущими репликами: при
+                        # остановке её обязательно возвращаем системе.
+                        self._unload_model_safely(model_tag or self.analyzer.selected_model())
+                        return ProjectAnalysisOutcome(
+                            status=STATUS_FAILED,
+                            model_tag=model_tag,
+                            model_digest=digest,
+                            analyses=analyses,
+                            seconds=self.clock() - started,
+                            error=f"HARD STOP: {abort.memory_reason}",
+                            blocked_reason=abort.memory_reason,
+                            from_cache=from_cache,
+                            calls=calls,
+                        )
                     index = int(row.get("index") or position)
                     target = texts[position]
                     context = build_context(
@@ -486,6 +515,7 @@ class ProjectLlmAnalyzer:
         status = worst_status((item.status for item in analyses.values()), enabled=True)
         if not analyses:
             status = STATUS_READY
+        unloaded = self._release_model(model_tag or self.analyzer.selected_model(), calls)
         return ProjectAnalysisOutcome(
             status=status,
             model_tag=model_tag,
@@ -494,7 +524,36 @@ class ProjectLlmAnalyzer:
             seconds=self.clock() - started,
             from_cache=from_cache,
             calls=calls,
+            unloaded=unloaded,
         )
+
+    def _unload_model_safely(self, model: str) -> bool:
+        """Выгружает модель, не поднимая исключение: остановка важнее деталей."""
+        if not model:
+            return False
+        try:
+            return bool(self.analyzer.client.unload(model))
+        except Exception as exc:  # noqa: BLE001 — выгрузка не повод падать
+            logger.warning("Не удалось выгрузить модель %s: %s", model, exc)
+            return False
+
+    def _release_model(self, model: str, calls: int) -> bool:
+        """Освобождает память модели после прохода.
+
+        Выгружаем только если модель реально загружалась в этом проходе: при полном
+        попадании в кеш выгружать нечего, и трогать чужую загруженную модель нельзя.
+        Ошибка выгрузки не отменяет результат анализа — она логируется.
+        """
+        if not self.unload_after or not model or calls == 0:
+            return False
+        try:
+            released = bool(self.analyzer.client.unload(model))
+        except Exception as exc:  # noqa: BLE001 — выгрузка не повод терять разбор
+            logger.warning("Не удалось выгрузить модель %s: %s", model, exc)
+            return False
+        if released:
+            logger.info("Модель %s выгружена после анализа: память возвращена синтезу", model)
+        return released
 
     def _lookup_analysis(self, index: int, key: AnalysisKey) -> ReplicaAnalysis | None:
         """Поиск в кеше с учётом digest модели: он известен из прошлого разбора.
