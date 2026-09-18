@@ -214,12 +214,24 @@
           <!-- Лингвистический анализ локальной LLM: отдельная ось от готовности
                текста. Показываем состояние, модель и предложения с решениями;
                при выключенном Analyzer'е блок честно говорит «выкл». -->
-          <div id="llm-panel" class="review-panel" hidden>
+          <div id="llm-panel" class="review-panel">
             <div class="row between">
               <span class="muted">Лингвистический анализ</span>
               <span class="badge" id="llm-badge">—</span>
             </div>
             <div class="muted" id="llm-state"></div>
+            <div class="row" style="margin: 8px 0">
+              <label class="row" style="gap: 6px">
+                <input type="checkbox" id="llm-enabled" />
+                <span>Включить локальный анализ текста</span>
+              </label>
+              <select id="llm-model" title="Модель Ollama для анализа"></select>
+              <label class="row" style="gap: 6px">
+                <input type="checkbox" id="llm-required" />
+                <span>Требовать анализ перед рендером</span>
+              </label>
+              <span class="muted" id="llm-settings-note"></span>
+            </div>
             <div id="llm-list"></div>
           </div>
 

@@ -1154,6 +1154,10 @@ async def _synthesize_attempt(
     if not needs_crop:
         return chunk, seed
 
+    # Границу ищем только выбранным методом. «По тишине» production-ready не
+    # считается: она не подтверждает, что найден именно целевой текст, и обрезать
+    # по ней значит рискнуть чужим куском в файле. Если ASR границу не подтвердил,
+    # честнее откатиться на прежнее поведение и показать это в диагностике.
     cropped, boundary = await asyncio.to_thread(
         boundary_module.crop_to_target,
         chunk,

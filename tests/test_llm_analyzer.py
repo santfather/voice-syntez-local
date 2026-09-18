@@ -554,3 +554,83 @@ def test_unknown_reason_code_is_informational_not_fatal():
     strict, errors = s.parse_analysis(payload, expected_replica_id=1, target_text=CASTLE)
     assert strict is None
     assert s.ERROR_UNKNOWN_REASON in errors
+
+
+def test_settings_toggle_enables_analyzer_and_survives_restart(tmp_path, monkeypatch):
+    """Галочка в интерфейсе включает анализ и переживает перезапуск.
+
+    Без этого пользователь видел «анализатор выключен (LLM_ANALYZER_ENABLED=0)» и
+    не мог ничего сделать из приложения: настройка жила только в окружении.
+    """
+    from backend.llm import settings_store
+
+    path = tmp_path / "llm_settings.json"
+    monkeypatch.setenv(settings_store.SETTINGS_ENV, str(path))
+
+    # По умолчанию (окружение без переменных) анализатор выключен.
+    assert llm.settings_from_env({}).enabled is False
+
+    saved = settings_store.save_settings(
+        {"enabled": True, "primary_model": "qwen3:4b-instruct-2507-q4_K_M", "num_ctx": 4096}
+    )
+    assert saved["enabled"] is True
+    assert path.exists()
+
+    # Файл перекрывает окружение — иначе настройка не пережила бы перезапуск.
+    settings = llm.settings_from_env({"LLM_ANALYZER_ENABLED": "0"})
+    assert settings.enabled is True
+    assert settings.primary_model == "qwen3:4b-instruct-2507-q4_K_M"
+    assert settings.num_ctx == 4096
+
+    # Выключение тоже сохраняется.
+    settings_store.save_settings({"enabled": False})
+    assert llm.settings_from_env({}).enabled is False
+
+
+def test_settings_reject_broken_file_and_bad_values(tmp_path, monkeypatch):
+    """Битый файл настроек и мусор в значениях не ломают приложение."""
+    from backend.llm import settings_store
+
+    path = tmp_path / "llm_settings.json"
+    monkeypatch.setenv(settings_store.SETTINGS_ENV, str(path))
+    path.write_text("{это не json", encoding="utf-8")
+    assert settings_store.load_settings() == {}
+    assert llm.settings_from_env({}).enabled is False
+
+    saved = settings_store.save_settings(
+        {"num_ctx": "не число", "context_replicas": -5, "primary_model": "  ", "enabled": True}
+    )
+    assert saved["enabled"] is True
+    assert "num_ctx" not in saved and "context_replicas" not in saved
+    assert "primary_model" not in saved
+
+
+def test_llm_settings_endpoint_toggles_and_resets_analyzer(monkeypatch, tmp_path):
+    """Ручка настроек включает анализ сразу, без перезапуска сервера."""
+    import asyncio
+
+    from test_projects_api import _client
+
+    from backend.llm import settings_store
+
+    monkeypatch.setenv(settings_store.SETTINGS_ENV, str(tmp_path / "llm.json"))
+    llm.reset_analyzer()
+    client = FakeOllamaClient(models=MODELS)
+    monkeypatch.setattr(llm, "_analyzer", llm.LinguisticAnalyzer(settings=llm.AnalyzerSettings(enabled=False), client=client))
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            before = (await api.get("/api/llm/status")).json()
+            response = await api.post(
+                "/api/llm/settings",
+                json={"enabled": True, "primary_model": "qwen3:4b-instruct-2507-q8_0"},
+            )
+            assert response.status_code == 200, response.text
+            after = (await api.get("/api/llm/status")).json()
+            return {"before": before, "after": after, "body": response.json()}
+
+    result = asyncio.run(scenario())
+    assert result["before"]["enabled"] is False
+    assert result["after"]["enabled"] is True
+    assert result["after"]["settings"]["primary_model"] == "qwen3:4b-instruct-2507-q8_0"
+    assert result["body"]["saved"]["enabled"] is True

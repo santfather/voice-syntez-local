@@ -41,6 +41,7 @@ from .ollama_client import (
     get_client,
 )
 from .prompt import PromptTemplate, load_prompt
+from .settings_store import load_settings
 
 logger = logging.getLogger("tts.llm.analyzer")
 
@@ -160,12 +161,53 @@ def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
 
 
 def settings_from_env(env: Mapping[str, str] | None = None) -> AnalyzerSettings:
-    """Настройки Analyzer'а из окружения.
+    """Настройки Analyzer'а: окружение как база + то, что включили в интерфейсе.
 
-    По умолчанию Analyzer **выключен**: включение — осознанное действие
-    пользователя, потому что это отдельная тяжёлая модель рядом с синтезом.
+    Окружение (`LLM_*`) описывает развёртывание, файл `data/llm_settings.json` —
+    выбор пользователя; файл важнее, иначе галочка в приложении не пережила бы
+    перезапуск. По умолчанию (без файла и без переменных) Analyzer **выключен**:
+    включение — осознанное действие, потому что это отдельная модель рядом с TTS.
     """
     source = os.environ if env is None else env
+    base = _settings_from_env(source)
+    return apply_overrides(base, load_settings())
+
+
+def apply_overrides(settings: AnalyzerSettings, overrides: Mapping[str, object]) -> AnalyzerSettings:
+    """Накладывает сохранённые настройки на значения окружения."""
+    if not overrides:
+        return settings
+    values = settings.to_dict()
+    for key in ("enabled", "required_for_render"):
+        if key in overrides:
+            values[key] = bool(overrides[key])
+    for key in ("num_ctx", "context_replicas"):
+        if key in overrides:
+            try:
+                number = int(overrides[key])
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                values[key] = number
+    for key in ("primary_model", "fallback_model"):
+        text = str(overrides.get(key) or "").strip()
+        if text:
+            values[key] = text
+    return replace(settings, **{
+        key: values[key]
+        for key in (
+            "enabled",
+            "primary_model",
+            "fallback_model",
+            "required_for_render",
+            "num_ctx",
+            "context_replicas",
+        )
+    })
+
+
+def _settings_from_env(source: Mapping[str, str]) -> AnalyzerSettings:
+    """Значения по умолчанию из окружения: база для пользовательских настроек."""
     return AnalyzerSettings(
         enabled=_env_flag(source, "LLM_ANALYZER_ENABLED", False),
         primary_model=_env(source, "LLM_PRIMARY_MODEL") or DEFAULT_PRIMARY_MODEL,

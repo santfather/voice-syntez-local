@@ -2546,9 +2546,18 @@ const LLM_LABELS = {
 async function refreshLlmAnalysis() {
   const panel = $('llm-panel');
   if (!panel) return null;
+  if (!state.llmStatus) {
+    try {
+      state.llmStatus = await api('/api/llm/status');
+      state.llmStatusSettings = state.llmStatus.settings || null;
+      renderLlmPanel(state.llmStatus);
+    } catch (error) {
+      state.llmStatus = null;
+    }
+  }
   if (!state.project) {
     state.llm = null;
-    renderLlmPanel();
+    renderLlmPanel(state.llmStatus);
     return null;
   }
   try {
@@ -2562,9 +2571,16 @@ async function refreshLlmAnalysis() {
   return state.llm;
 }
 
-function renderLlmPanel() {
+function renderLlmPanel(statusData = null) {
   const panel = $('llm-panel');
   if (!panel) return;
+  if (statusData) {
+    // Статус приходит из /api/llm/status и /api/llm/settings: он описывает
+    // анализатор, а не проект, поэтому хранится отдельно от state.llm.
+    state.llmStatus = statusData;
+    state.llmStatusSettings = statusData.settings || state.llmStatusSettings;
+    syncLlmControls(statusData);
+  }
   const data = state.llm;
   const textPanel = $('text-llm-panel');
   // Во вкладке сплошного текста проекта нет: там показываем только состояние
@@ -2576,8 +2592,17 @@ function renderLlmPanel() {
     textPanel.hidden = false;
     renderLlmStatusLine($('text-llm-badge'), $('text-llm-state'), data);
   }
+  syncLlmControls(statusData);
   if (!data) {
-    panel.hidden = true;
+    // Проекта ещё нет: показываем состояние анализатора, панель не прячем — иначе
+    // включить анализ было бы негде.
+    panel.hidden = false;
+    renderLlmStatusLine(
+      $('llm-badge'),
+      $('llm-state'),
+      statusData || state.llmStatus || null
+    );
+    $('llm-list').innerHTML = '';
     return;
   }
   panel.hidden = false;
@@ -2615,6 +2640,64 @@ function renderLlmPanel() {
       reviewLlmCandidate(Number(card.dataset.llmIndex), button.dataset.llmReview);
     });
   });
+}
+
+// Переключатель анализа: без него «выключен» нельзя было исправить из приложения,
+// и пользователь видел только сообщение про LLM_ANALYZER_ENABLED=0.
+async function loadLlmModels() {
+  const select = $('llm-model');
+  if (!select) return;
+  try {
+    const payload = await api('/api/llm/models');
+    const models = payload.models || [];
+    select.innerHTML = models
+      .map((item) => `<option value="${esc(item.tag)}">${esc(item.tag)}${
+        item.role ? ` (${item.role === 'primary' ? 'основная' : 'запасная'})` : ''
+      }</option>`)
+      .join('');
+    if (payload.selected) select.value = payload.selected;
+    state.llmModels = models;
+  } catch (error) {
+    select.innerHTML = '';
+  }
+}
+
+function syncLlmControls(data) {
+  const enabled = $('llm-enabled');
+  const required = $('llm-required');
+  const note = $('llm-settings-note');
+  if (!enabled) return;
+  const settings = (data && data.settings) || state.llmStatusSettings || {};
+  enabled.checked = Boolean((data && data.enabled) ?? settings.enabled);
+  if (required) required.checked = Boolean(data ? data.required_for_render : settings.required_for_render);
+  if (note) {
+    const ollama = (data && data.ollama) || {};
+    if (!enabled.checked) {
+      note.textContent = 'Анализ выключен — включите его здесь, чтобы модель разбирала текст';
+    } else if (data && !data.model_available) {
+      note.textContent = `Модель «${data.model || ''}» не скачана: ollama pull ${data.model || ''}`;
+    } else if (!ollama.available) {
+      note.textContent = `Ollama недоступна: ${ollama.error || 'запустите ollama serve'}`;
+    } else {
+      note.textContent = 'Модель остаётся локальной: текст никуда не отправляется';
+    }
+  }
+}
+
+async function saveLlmSettings(patch) {
+  const note = $('llm-settings-note');
+  try {
+    const payload = await api('/api/llm/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    state.llmStatusSettings = (payload.status && payload.status.settings) || null;
+    renderLlmPanel(payload.status);
+    if (state.project) await refreshLlmAnalysis();
+  } catch (error) {
+    if (note) note.textContent = error.message;
+  }
 }
 
 function renderLlmStatusLine(badge, text, data, detailed = false) {
@@ -3480,11 +3563,23 @@ function takesHtml(replica) {
 function shortNote(take) {
   const params = take.parameters || {};
   const strategy = params.short_utterance_strategy;
-  if (!strategy || strategy === 'direct') return '';
+  const fallback = params.short_utterance_fallback || '';
+  if (!strategy) return '';
+  // Откат показываем явно: раньше он выглядел как «слой ничего не сделал», и
+  // пользователь не мог отличить «выключено» от «не нашлась граница».
+  if (strategy === 'direct' && !fallback) return '';
   const source = params.short_utterance_context_source || '';
   const klass = params.short_utterance_class || '';
-  const parts = [SHORT_STRATEGY_LABELS[strategy] || strategy];
-  if (source) parts.push(SHORT_SOURCE_LABELS[source] || source);
+  const parts = [];
+  if (fallback) {
+    parts.push(`короткая: откат — ${fallback}`);
+  } else {
+    parts.push(SHORT_STRATEGY_LABELS[strategy] || strategy);
+    if (source) parts.push(SHORT_SOURCE_LABELS[source] || source);
+    // Граница могла найдена запасным методом: это тоже часть решения.
+    const method = params.short_utterance_boundary_method;
+    if (method) parts.push(`граница: ${method}`);
+  }
   const title = `Класс: ${klass}. Отпечаток синтез-текста: ${params.synthesis_text_hash || '—'}`;
   return `<span class="replica-qa muted" title="${esc(title)}">${esc(parts.join(' · '))}</span>`;
 }
@@ -4688,6 +4783,20 @@ function bindEvents() {
   $('dialogue').addEventListener('input', markSourceDirty);
   $('btn-apply-source').addEventListener('click', applySource);
   $('btn-analyze').addEventListener('click', analyzeDialogue);
+  // Переключатель анализатора: без него «выключен» нельзя было исправить из
+  // приложения, и в панели оставалось только сообщение про LLM_ANALYZER_ENABLED=0.
+  const llmEnabled = $('llm-enabled');
+  if (llmEnabled) {
+    llmEnabled.addEventListener('change', () => saveLlmSettings({ enabled: llmEnabled.checked }));
+    $('llm-required').addEventListener('change', () =>
+      saveLlmSettings({ required_for_render: $('llm-required').checked })
+    );
+    $('llm-model').addEventListener('change', () =>
+      saveLlmSettings({ primary_model: $('llm-model').value })
+    );
+    loadLlmModels();
+    refreshLlmAnalysis();
+  }
   const dialogueFile = $('dialogue-file');
   $('dialogue-drop').addEventListener('click', () => dialogueFile.click());
   dialogueFile.addEventListener('change', () => {

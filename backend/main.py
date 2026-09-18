@@ -512,6 +512,39 @@ async def llm_status() -> dict:
     return await asyncio.to_thread(llm_analyzer.get_analyzer().status)
 
 
+class LlmSettingsRequest(BaseModel):
+    """Что пользователь меняет в интерфейсе. Прочее — настройка развёртывания."""
+
+    enabled: bool | None = None
+    primary_model: str | None = None
+    fallback_model: str | None = None
+    required_for_render: bool | None = None
+    num_ctx: int | None = None
+    context_replicas: int | None = None
+
+
+@app.post("/api/llm/settings")
+async def update_llm_settings(payload: LlmSettingsRequest) -> dict:
+    """Включает/выключает анализатор и меняет выбранную модель.
+
+    Настройка сохраняется в `data/llm_settings.json` и переживает перезапуск: галочка
+    в интерфейсе, которая исчезает после рестарта, — не настройка. Анализатор
+    создаётся заново, чтобы смена модели и включение применились сразу, без
+    перезапуска сервера.
+    """
+    from .llm import settings_store
+
+    patch = {key: value for key, value in payload.model_dump().items() if value is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="Не передано ни одной настройки")
+    saved = await asyncio.to_thread(settings_store.save_settings, patch)
+    llm_analyzer.reset_analyzer()
+    return {
+        "saved": saved,
+        "status": await asyncio.to_thread(llm_analyzer.get_analyzer().status),
+    }
+
+
 @app.get("/api/llm/models")
 async def llm_models() -> dict:
     """Скачанные локальные модели с ролями primary/fallback (для экрана настроек)."""

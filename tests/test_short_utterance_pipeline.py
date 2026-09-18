@@ -144,12 +144,21 @@ def test_short_optimization_does_not_change_long_text_output(stub, fake_store, f
 
 
 def test_layer_is_disabled_by_default(stub, fake_store, fixed_seed):
-    """Без настройки слой не работает: прежнее поведение по умолчанию."""
-    result = _render(_replicas(SECOND), RenderSettings(pause_ms=0))
+    """Явное выключение возвращает прежнее поведение (`enabled=False`).
+
+    По умолчанию слой включён (измеренное улучшение коротких реплик), поэтому
+    «прежнее поведение» проверяется именно явным выключением — иначе тест проверял
+    бы значение по умолчанию, а не механизм отказа от слоя.
+    """
+    result = _render(
+        _replicas(SECOND),
+        RenderSettings(pause_ms=0, short_utterance=ShortUtteranceSettings(enabled=False)),
+    )
     assert len(stub.calls) == 1
     assert stub.calls[0]["text"] == SECOND
     assert result.short_runs == {}
-    assert config.SHORT_UTTERANCE_DEFAULT_ENABLED is False
+    # Значение по умолчанию — включено: это измеренное решение benchmark'а.
+    assert config.SHORT_UTTERANCE_DEFAULT_ENABLED is True
 
 
 # --- короткая реплика получает контекст (§14, §15) ------------------------------
@@ -356,7 +365,9 @@ def test_status_exposes_short_policy(monkeypatch):
 
     payload = asyncio.run(main.status())
     policy = payload["short_utterance"]
-    assert policy["enabled"] is False
+    # По умолчанию слой включён: короткие реплики на F5 без него теряют окончания
+    # (WER 0.125–0.20), а с контекстом того же спикера — WER 0.0.
+    assert policy["enabled"] is True
     # Политика измеренная: у F5 выигрывает контекст того же спикера, у XTTS — direct.
     assert policy["strategies"]["f5"] == su.STRATEGY_SAME_SPEAKER_CONTEXT
     assert policy["strategies"]["xtts"] == su.STRATEGY_DIRECT
