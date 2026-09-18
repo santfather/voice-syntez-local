@@ -373,3 +373,64 @@ def test_asr_worker_requests_russian_explicitly():
     # Значение из окружения читается при старте воркера (модуль живёт в отдельном
     # процессе), поэтому проверяется значение по умолчанию, а не подмена env.
     assert transcribe_worker.ASR_LANGUAGE == "ru"
+
+
+# --- §23–§25. Смена стратегии по измеренному провалу --------------------------
+def test_failed_short_qa_switches_to_same_speaker_context(stub, monkeypatch):
+    """DIRECT не сказал слово → следующая попытка идёт с контекстом того же спикера.
+
+    Это и есть «bounded retry» по §23: меняется не только сид, но и стратегия, а
+    решение принимается по измеренному провалу (нет последнего слова), а не по
+    предположению. Соседняя реплика того же спикера даёт модели нужную просодию.
+    """
+    seen_plans: list[str] = []
+
+    def fake_check(chunk, expected, **kwargs):
+        seen_plans.append(expected)
+        # Первая попытка «теряет» последнее слово, вторая — нет.
+        if len(seen_plans) == 1:
+            return su.ShortVerdict(
+                ok=False,
+                reasons=(su.REASON_END_TRUNCATION,),
+                first_word_ok=True,
+                last_word_ok=False,
+            )
+        return su.ShortVerdict(ok=True, first_word_ok=True, last_word_ok=True)
+
+    monkeypatch.setattr(audio_pipeline.su, "check_chunk", fake_check)
+    replicas = [
+        Replica(voice=SPEAKER, text="Мне тридцать девять, мальчик.", line_number=1),
+        Replica(voice=SPEAKER, text="Это проблема?", line_number=2),
+    ]
+    settings = RenderSettings(
+        output_format="wav",
+        short_utterance=audio_pipeline.ShortUtteranceSettings(
+            enabled=True, strategy=su.STRATEGY_DIRECT, max_attempts=3
+        ),
+    )
+    asyncio.run(
+        audio_pipeline.render_dialogue(
+            "job-escalate",
+            replicas,
+            {SPEAKER: SpeakerSettings.from_dict({"voice_id": HOLDER["voice"].id})},
+            settings,
+        )
+    )
+    # Первая реплика проверялась дважды (DIRECT, затем контекст), вторая — один раз:
+    # её первая попытка прошла. Целью в обеих попытках остаётся сама реплика —
+    # `check_chunk` получает именно её, а контекст живёт только в синтез-тексте.
+    assert seen_plans == [
+        "Мне тридцать девять, мальчик.",
+        "Мне тридцать девять, мальчик.",
+        "Это проблема?",
+    ]
+    # В движок действительно ушёл контекст: первый вызов — цель, второй — цель с
+    # соседом того же спикера.
+    assert stub.calls[0]["text"] == "Мне тридцать девять, мальчик."
+    assert "Мне тридцать девять, мальчик." in stub.calls[1]["text"]
+    assert "Это проблема?" in stub.calls[1]["text"]
+    # Границу цели в тесте подтвердить нечем (Whisper не поднимается), поэтому
+    # слой честно откатился на DIRECT: третий вызов — снова только цель. Это и есть
+    # правило «нет надёжной границы — не режем вовсе».
+    assert stub.calls[2]["text"] == "Мне тридцать девять, мальчик."
+    assert len(stub.calls) == 4

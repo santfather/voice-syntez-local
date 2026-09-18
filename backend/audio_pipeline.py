@@ -1427,6 +1427,11 @@ async def _synthesize_checked(
     attempts = 0
     status = QA_ATTEMPTS
     screening: qa_screening.Screening | None = None
+    # План текущей попытки. Он может смениться между попытками: если DIRECT не
+    # сказал слово, следующая попытка идёт с контекстом того же спикера (см.
+    # `_escalate_short_plan`). Так «потерянное слово» лечится не перебором сидов, а
+    # сменой стратегии — и только в пределах лимита попыток (§23).
+    attempt_short = short
     for attempt in range(1, limit + 1):
         # Между попытками проверки — безопасная точка: здесь не убивается поток
         # внутри инференса, а просто не начинается следующая попытка.
@@ -1445,12 +1450,12 @@ async def _synthesize_checked(
             on_note(f"Реплика {position}: {reason}, попытка {attempt} из {limit}")
 
         chunk, seed = await _synthesize_attempt(
-            engine, voice, replica, text, tuning, settings, position, label, short, attempt,
-            trace, reference,
+            engine, voice, replica, text, tuning, settings, position, label, attempt_short,
+            attempt, trace, reference,
         )
         attempts = attempt
-        if short is not None:
-            short.attempts = attempt
+        if attempt_short is not None:
+            attempt_short.attempts = attempt
         # Проверка измеряет то, что попадёт в файл, а не сырой выход модели:
         # подготовка (обрезка краёв, кроссфейд, нормализация) стоит между ними, и
         # дефект, внесённый ею, иначе не видел бы никто — «QA прошёл, а слово
@@ -1511,15 +1516,15 @@ async def _synthesize_checked(
                     on_note(f"Реплика {position}: проверка {attempt} из {limit}, WER {wer:.2f}")
 
         verdict = None
-        if short is not None:
+        if attempt_short is not None:
             verdict = await asyncio.to_thread(
                 su.check_chunk,
                 measured,
-                short.plan.target_text,
+                attempt_short.plan.target_text,
                 transcription=transcription,
                 wer=wer,
             )
-            short.verdict = verdict
+            attempt_short.verdict = verdict
             if on_note and not verdict.ok:
                 on_note(
                     f"Реплика {position}: короткая проверка — "
@@ -1533,9 +1538,9 @@ async def _synthesize_checked(
                 qa_outcome = None
             logger.info(
                 "Реплика %s: принята (попытка %s, стратегия %s)",
-                position, attempt, short.plan.strategy if short else "direct",
+                position, attempt, attempt_short.plan.strategy if attempt_short else "direct",
             )
-            return chunk, seed, qa_outcome, short
+            return chunk, seed, qa_outcome, attempt_short
         if use_qa and qa_outcome.status == QA_UNAVAILABLE and verdict is None:
             # Нечем проверять — повторять нечего.
             return chunk, seed, qa_outcome, short
@@ -1553,10 +1558,25 @@ async def _synthesize_checked(
             )
         key = _attempt_score(verdict, wer)
         if best is None or key > best[0]:
-            best = (key, chunk, measured, seed, qa_outcome)
+            best = (key, chunk, measured, seed, qa_outcome, attempt_short)
+        # Провал по словам — повод сменить стратегию, а не только сид: контекст
+        # того же спикера возвращает модели просодию, которой не хватает
+        # односложной фразе. Смена разовая и ограничена лимитом попыток.
+        if verdict is not None and not verdict.ok and attempt < limit:
+            escalated = _escalate_short_plan(
+                attempt_short, replica, engine, settings, context
+            )
+            if escalated is not None:
+                escalated.attempts = attempt
+                attempt_short = escalated
+                if on_note:
+                    on_note(
+                        f"Реплика {position}: слова не все — пробую "
+                        f"{escalated.plan.strategy} с контекстом того же спикера"
+                    )
 
     assert best is not None  # первая попытка выполняется всегда
-    _, chunk, measured, seed, qa_outcome = best
+    _, chunk, measured, seed, qa_outcome, short = best
     if short is not None:
         # Финальный вердикт — по подготовленному аудио лучшей попытки: именно оно
         # уходит в файл, и «слово потеряно» должно относиться к нему.
@@ -1603,6 +1623,41 @@ async def _synthesize_checked(
         short.plan.strategy if short else "direct",
     )
     return chunk, seed, final_outcome, short
+
+
+def _escalate_short_plan(
+    current: ShortRun | None,
+    replica: Replica,
+    engine: SynthesisEngine,
+    settings: RenderSettings,
+    context: su.ShortUtteranceContext | None,
+) -> ShortRun | None:
+    """Меняет план на контекстный, если текущий синтезировал цель «в вакууме».
+
+    Смысл шага: у короткой фразы модели не хватает просодического контекста, и она
+    может не договорить окончание. Контекст того же спикера возвращает этот
+    контекст — но не сам по себе, а как **ответ на измеренный провал**: слова
+    проверены по расшифровке, и только если их не хватает, стратегия меняется.
+    Обратный порядок (сразу контекст) даёт более длинную и дорогую реплику без
+    выигрыша — это измерено (`update_2_report.md`).
+    """
+    if current is None or context is None:
+        return None
+    if current.plan.needs_crop or current.fallback:
+        # Уже с контекстом или уже откатились: второй раз то же самое не поможет.
+        return None
+    if not (context.same_speaker_previous or context.same_speaker_next):
+        # Контекста **того же спикера** нет — эскалировать некуда. Кросс-спикерный
+        # сосед здесь не годится: его нельзя прочитать текущим голосом (§27).
+        return None
+    if current.settings.strategy not in (su.STRATEGY_AUTO, su.STRATEGY_DIRECT):
+        return None
+    escalated_settings = replace(current.settings, strategy=su.STRATEGY_SAME_SPEAKER_CONTEXT)
+    plan = short_run_for(replica, engine, replace(settings, short_utterance=escalated_settings),
+                         context=context)
+    if plan is None or not plan.plan.needs_crop:
+        return None
+    return plan
 
 
 def _attempt_score(verdict: su.ShortVerdict | None, wer: float | None) -> tuple:
