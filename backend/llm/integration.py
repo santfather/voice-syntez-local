@@ -341,6 +341,15 @@ class ProjectAnalysisOutcome:
     blocked_reason: str = ""
     unloaded: bool = False
 
+    @property
+    def failed(self) -> list[dict]:
+        """Реплики, которые модель не разобрала, с причиной каждой."""
+        return [
+            {"replica_index": index, "error": item.error or "разбор не удался"}
+            for index, item in sorted(self.analyses.items())
+            if item.status == STATUS_FAILED
+        ]
+
     def to_dict(self) -> dict:
         return {
             "status": self.status,
@@ -353,6 +362,8 @@ class ProjectAnalysisOutcome:
             "error": self.error,
             "blocked_reason": self.blocked_reason,
             "unloaded": self.unloaded,
+            "replicas_failed": len(self.failed),
+            "failed": self.failed[:20],
         }
 
 
@@ -483,10 +494,10 @@ class ProjectLlmAnalyzer:
                     analyses[index] = analysis
                     model_tag = analysis.model_tag or model_tag
                     digest = analysis.model_digest or digest
-                    if self._save is not None and analysis.status in (
-                        STATUS_READY,
-                        STATUS_NEEDS_REVIEW,
-                    ):
+                    if self._save is not None:
+                        # Сохраняем и FAILED: причина отказа реплики должна быть
+                        # видна пользователю, а не растворяться в общем «ошибка».
+                        # Кеш такие записи не отдаёт (см. AnalysisCache.lookup).
                         self._save(index, analysis)
         except scheduler_module.HeavyBlockedError as exc:
             # Не «продолжим без LLM»: пользователь обязан увидеть, что анализа не

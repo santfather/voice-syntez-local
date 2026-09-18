@@ -2364,6 +2364,11 @@ def _invalidate_for_rule(rule: PronunciationRule, *, project_id: str | None) -> 
     return affected
 
 
+# Последний отчёт прохода LLM по проекту: интерфейсу нужно не только состояние
+# («что сейчас»), но и результат запуска («сколько вызовов, что упало»).
+_last_llm_report: dict = {}
+
+
 def _llm_analyzer_for(project_id: str):
     """LLM-проход по проекту с кешем из базы: один объект на вызов анализа.
 
@@ -2432,6 +2437,9 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
             model_tag=llm_outcome.model_tag,
             error=llm_outcome.error or llm_outcome.blocked_reason,
         )
+        # Отчёт прохода (вызовы, кеш, время, неудачные реплики) — рядом со сводкой:
+        # без него «FAILED» не объясняет, что именно случилось.
+        _last_llm_report[project["id"]] = llm_outcome.to_dict()
     else:
         # Выключенный анализатор — это тоже состояние проекта, а не отсутствие поля:
         # интерфейс должен сказать «выкл», а не «неизвестно».
@@ -2558,6 +2566,13 @@ async def project_linguistic_analysis(project_id: str) -> dict:
     project = _project_or_404(project_id)
     analyzer = llm_analyzer.get_analyzer()
     candidates = _llm_candidates_of(project)
+    # Причины неудачных разборов лежат в таблице разборов: без них состояние
+    # «FAILED» не объясняет, что именно случилось с репликой.
+    failed = [
+        {"replica_index": int(row["replica_index"]), "error": row["error"] or "разбор не удался"}
+        for row in get_projects_store().llm_analyses(project_id)
+        if row["status"] == llm_analyzer.STATUS_FAILED
+    ]
     return {
         "project_id": project_id,
         "status": project.get("llm_analysis_status") or llm_analyzer.STATUS_DISABLED,
@@ -2576,6 +2591,9 @@ async def project_linguistic_analysis(project_id: str) -> dict:
             1 for item in candidates if item.get("agreement") == llm_integration.AGREEMENT_CONFLICT
         ),
         "candidates": candidates,
+        "replicas_failed": len(failed),
+        "failed": failed[:20],
+        "run": _last_llm_report.get(project_id) or {},
     }
 
 
@@ -2591,6 +2609,7 @@ async def run_project_linguistic_analysis(
     который уходит в синтез.
     """
     response = await analyze_project(project_id, payload)
+    # Состояние — что сейчас в проекте (включая отчёт последнего прохода).
     response["llm"] = await project_linguistic_analysis(project_id)
     return response
 

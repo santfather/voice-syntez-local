@@ -720,3 +720,37 @@ def test_analysis_pass_stops_on_hard_stop_memory():
     assert "HARD STOP" in outcome.error
     assert outcome.calls == 1, "после HARD STOP модель больше не спрашивают"
     assert client.unloaded == ["qwen3:8b"], "модель обязана быть выгружена при остановке"
+
+
+def test_failed_replica_is_stored_and_visible(llm_env, voices, stub, monkeypatch):
+    """Неудачный разбор реплики сохраняется и виден с причиной, а не исчезает.
+
+    Иначе проект показывает «ошибка», а пользователь не знает, какая реплика не
+    разобрана и почему — и не может решить: повторить или продолжать без неё.
+    """
+    from backend.llm.ollama_client import OllamaTimeoutError
+
+    client = llm_env()
+    calls = {"n": 0}
+
+    def flaky(case):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OllamaTimeoutError("модель не ответила за 90 с")
+        return _answer(case)
+
+    client._responder = flaky
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+
+    state = asyncio.run(scenario())
+    assert state["replicas_failed"] >= 1
+    assert state["failed"], "причина отказа должна быть в состоянии"
+    assert "Timeout" in state["failed"][0]["error"] or "не ответила" in state["failed"][0]["error"]
+    assert state["status"] == llm.STATUS_FAILED

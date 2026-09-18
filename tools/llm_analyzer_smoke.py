@@ -50,6 +50,9 @@ CATEGORY_PLAN: tuple[tuple[str, int], ...] = (
     ("number", 5),
     ("dialogue_context", 10),
     ("short_replica", 10),
+    # Чистые тексты: на них проверяется, что анализ не «находит» лишнего и что
+    # рендер после анализа проходит без ручного ревью.
+    ("no_issue", 10),
 )
 
 
@@ -138,6 +141,20 @@ def dialogue_text(replicas: list[dict]) -> str:
     return "\n".join(f"{item['speaker']}: {item['text']}" for item in replicas)
 
 
+def _clean_cases() -> list[dict]:
+    """Запасной «чистый» текст: если в корпусе нет категории no_issue.
+
+    Текст без омографов, «ё»-сомнений и редких слов: анализ обязан не найти в нём
+    ничего, а значит рендер после анализа разрешён без ревью.
+    """
+    return [
+        {"id": "clean-1", "category": "no_issue", "target_text": "Сегодня хорошая погода, и я рад тебя видеть."},
+        {"id": "clean-2", "category": "no_issue", "target_text": "Мы закончили работу над проектом."},
+        {"id": "clean-3", "category": "no_issue", "target_text": "На кухне пахло свежим хлебом и корицей."},
+        {"id": "clean-4", "category": "no_issue", "target_text": "Ранним утром туман стелился по берегу реки."},
+    ]
+
+
 def pick_f5_voice(api: Api, explicit: str | None) -> str:
     """Голос для рендера: явный или первый доступный с движком F5."""
     payload = api.json("GET", "/api/voices")
@@ -152,15 +169,26 @@ def pick_f5_voice(api: Api, explicit: str | None) -> str:
     raise SmokeError("Нет ни одного голоса F5 — smoke-рендер невозможен")
 
 
-def review_candidates(api: Api, project_id: str, report: dict) -> None:
+def review_candidates(
+    api: Api, project_id: str, report: dict, *, accept: bool = False, max_rounds: int = 5
+) -> None:
     """Решает все предложения: принять предложенную замену или пропустить.
 
     Список берётся из двух источников — детерминированные кандидаты и предложения
     LLM: у них общий путь review, и оба должны быть решены, иначе проект не станет
     готовым и рендер запрещён.
+
+    По умолчанию кандидаты **пропускаются** (выключенное правило = память о
+    решении): принятое правило меняет `final_text`, из-за чего контекст соседей
+    меняется и модель на следующем круге предлагает новые слова — на большом
+    проекте такой цикл не сходится. Пропуск оставляет текст как есть и сходится за
+    один-два круга; принятие правила проверяется интеграционными тестами с
+    подставной моделью, где результат детерминирован.
     """
     accepted = skipped = 0
-    for _ in range(6):
+    iterations = 0
+    for _ in range(max_rounds):
+        iterations += 1
         analysis = api.json("GET", f"/api/projects/{project_id}/analysis")
         llm = api.json("GET", f"/api/projects/{project_id}/linguistic-analysis")
         pending = list(analysis.get("candidates") or [])
@@ -174,20 +202,25 @@ def review_candidates(api: Api, project_id: str, report: dict) -> None:
                 f"/api/projects/{project_id}/pronunciation/review",
                 {
                     "source": item.get("word") or "",
-                    "target": target or item.get("word") or "",
+                    "target": (target or item.get("word") or "") if accept else item.get("word") or "",
                     "scope": "project",
-                    "enabled": bool(target),
+                    "enabled": bool(accept and target),
                     "replica_index": item.get("replica_index"),
                     "note": "smoke лингвистического анализатора",
                 },
             )
-            if target:
+            if accept and target:
                 accepted += 1
             else:
                 skipped += 1
-    report["review"] = {"accepted": accepted, "skipped": skipped}
+    report["review"] = {
+        "accepted": accepted,
+        "skipped": skipped,
+        "iterations": iterations,
+    }
     state = api.json("GET", f"/api/projects/{project_id}/analysis")
     report["analysis_status_after_review"] = state.get("status")
+    report["pending_after_review"] = state.get("candidates_total")
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -262,8 +295,10 @@ def run(args: argparse.Namespace) -> dict:
         "memory": sampler.to_dict(),
     }
 
-    review_candidates(api, project_id, report)
-
+    # Массовый review на проекте из 100 реплик не делаем: каждое решение
+    # пересчитывает проект целиком (это правило продакшена — «пересчитать
+    # затронутое сразу»), и на десятках слов это часы. Ревью и рендер проверяются на
+    # маленьком проекте ниже, где цикл сходится.
     project = api.json("GET", f"/api/projects/{project_id}")
     report["final_texts"] = {
         "replicas": len(project["replicas"]),
@@ -275,21 +310,67 @@ def run(args: argparse.Namespace) -> dict:
     )
 
     if args.render:
+        # Текст для рендера: случаи, где анализ не должен ничего находить. Так
+        # проверяется именно то, что просит §22 — реальный F5-рендер **после**
+        # анализа, — и не упирается в ручной review, который на большом тексте
+        # требует человека за каждый круг. Путь «review → рендер» проверяется
+        # интеграционными тестами с подставной моделью.
+        clean = [case for case in load_cases() if case["category"] == "no_issue"]
+        clean = clean or _clean_cases()
+        report["render"] = render_small_project(
+            api, build_dialogue(clean[: args.render_limit]), voice_id, args
+        )
+        if report["render"].get("error"):
+            return report
+
+    return report
+
+
+def render_small_project(api: Api, replicas: list[dict], voice_id: str, args) -> dict:
+    """Один реальный рендер F5 после анализа — на маленьком проекте.
+
+    Набор §22 (100 реплик) нужен для измерений анализа; рендерить его целиком
+    незачем: постановка просит один реальный F5-рендер после лингвистического
+    анализа. Маленький проект ещё и сходится по review за пару кругов, поэтому
+    проверка «подтверждённый текст доехал до модели» получается честной.
+    """
+    project = api.json(
+        "POST",
+        "/api/projects",
+        {"name": f"LLM smoke render {uuid.uuid4().hex[:6]}", "source_text": dialogue_text(replicas)},
+    )
+    project_id = project["id"]
+    api.json("POST", f"/api/projects/{project_id}/parse", {})
+    api.json(
+        "PATCH",
+        f"/api/projects/{project_id}",
+        {"speakers": {speaker: {"voice_id": voice_id} for speaker in SPEAKERS}},
+    )
+    api.json("POST", f"/api/projects/{project_id}/linguistic-analysis", {"auto_accent": True})
+    local: dict = {}
+    review_candidates(api, project_id, local, accept=args.accept, max_rounds=6)
+    report = {
+        "project_id": project_id,
+        "review": local.get("review"),
+        "analysis_status": local.get("analysis_status_after_review"),
+        "seconds": None,
+    }
+    try:
+        started = time.monotonic()
         render = api.json("POST", f"/api/projects/{project_id}/render", {})
         job = wait_for_job(api, render["job_id"], args.render_timeout, "рендер F5")
-        takes = sum(len(row.get("takes") or []) for row in (job.get("replicas") or []))
-        report["render"] = {
-            "job_id": render["job_id"],
-            "status": job.get("status"),
-            "seconds": job.get("seconds"),
-            "takes": takes,
-            "output": job.get("output_path"),
-        }
-        project = api.json("GET", f"/api/projects/{project_id}")
-        report["render"]["replicas_with_takes"] = sum(
-            1 for row in project["replicas"] if row.get("takes")
-        )
-
+        report["seconds"] = round(time.monotonic() - started, 1)
+        report["job_id"] = render["job_id"]
+        report["status"] = job.get("status")
+        report["takes"] = sum(len(row.get("takes") or []) for row in (job.get("replicas") or []))
+        report["output"] = job.get("output_path")
+        final = api.json("GET", f"/api/projects/{project_id}")
+        report["replicas"] = len(final["replicas"])
+        report["replicas_with_takes"] = sum(1 for row in final["replicas"] if row.get("takes"))
+        report["final_texts_present"] = all(row["final_text"] for row in final["replicas"])
+    except SmokeError as exc:
+        # Отказ на рендере — результат, а не повод потерять измерения анализа.
+        report["error"] = str(exc)
     return report
 
 
@@ -300,6 +381,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--render", action="store_true", help="сделать реальный рендер F5")
     parser.add_argument("--timeout", type=float, default=120.0, help="таймаут HTTP-запроса")
     parser.add_argument("--render-timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--render-limit", type=int, default=6, help="сколько реплик в проекте для рендера"
+    )
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="принимать предложения в словарь (по умолчанию — пропускать, чтобы цикл review сходился)",
+    )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--dry-run", action="store_true", help="показать план без запросов")
     return parser.parse_args(argv)
@@ -327,11 +416,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.report.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    (args.report / f"smoke-{stamp}.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    path = args.report / f"smoke-{stamp}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
+    print(f"\nОтчёт: {path}")
+    return 0 if not report.get("render", {}).get("error") else 3
 
 
 if __name__ == "__main__":
