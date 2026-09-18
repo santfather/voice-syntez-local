@@ -486,3 +486,49 @@ def test_fake_client_can_simulate_unavailable_and_setup():
     assert up.loaded_models() == ["qwen3:8b"]
     assert up.unload("qwen3:8b") is True
     assert up.loaded_models() == []
+
+
+def test_ollama_client_reads_model_capabilities():
+    """Паспорт модели (`/api/show`) нужен, чтобы понять, умеет ли модель thinking.
+
+    Ошибка здесь тихая: если capabilities не читаются, runner не отключает скрытое
+    рассуждение, и модель тратит сотни токенов на служебные размышления (у
+    qwen3:8b — 2186 токенов и 102 c на кейс вместо 149 токенов и 6 c).
+    """
+    client = ollama_client.OllamaClient(
+        opener=_opener(
+            {
+                "/api/show": lambda payload: {
+                    "capabilities": ["completion", "thinking"]
+                    if payload.get("model") == "qwen3:8b"
+                    else ["completion", "vision"]
+                }
+            }
+        )
+    )
+    assert client.capabilities("qwen3:8b") == ("completion", "thinking")
+    assert client.capabilities("gemma3:4b") == ("completion", "vision")
+    # Демон ответил не тем, что ожидалось — пустой список, а не падение.
+    broken = ollama_client.OllamaClient(
+        opener=_opener({"/api/show": urllib.error.URLError("нет соединения")})
+    )
+    assert broken.capabilities("qwen3:8b") == ()
+
+
+def test_ollama_client_sends_think_only_when_asked():
+    """`think` уходит в запрос только при явном значении: старые модели его не знают."""
+    chat_route = _ndjson(
+        {"message": {"content": "{}"}, "done": False},
+        done={"done": True, "eval_count": 1, "eval_duration": 1_000_000_000},
+    )
+    sent: list[dict] = []
+
+    def capture(request, timeout=None):
+        sent.append(json.loads(request.data or b"{}"))
+        return _FakeResponse(chat_route)
+
+    client = ollama_client.OllamaClient(opener=capture)
+    client.chat("qwen3:8b", [{"role": "user", "content": "x"}], think=False)
+    client.chat("gemma3:4b", [{"role": "user", "content": "x"}])
+    assert sent[0]["think"] is False
+    assert "think" not in sent[1]

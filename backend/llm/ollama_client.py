@@ -278,8 +278,10 @@ class OllamaClient:
 
     def show(self, tag: str) -> dict:
         """`/api/show`: шаблон, параметры и возможности модели (capabilities)."""
-        data = self._request(
-            "/api/show", {"model": self._normalize_tag(tag)}, timeout=HEALTH_TIMEOUT_SEC
+        data = self._read_json(
+            self._request(
+                "/api/show", {"model": _normalize_tag(tag)}, timeout=HEALTH_TIMEOUT_SEC
+            )
         )
         return data if isinstance(data, dict) else {}
 
