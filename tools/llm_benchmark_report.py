@@ -78,9 +78,6 @@ RESOURCE_TABLE = (
     "latency_mean",
     "latency_max",
     "tokens_per_second",
-    "peak_process_memory",
-    "peak_system_memory_percent",
-    "memory_pressure_events",
 )
 
 
@@ -319,6 +316,8 @@ def build_report(run: dict, *, dataset: dict | None = None) -> str:
         f"- prompt version: `{benchmark.get('prompt_version')}`",
         f"- schema version: `{benchmark.get('schema_version')}`",
         f"- режим схемы: `{(benchmark.get('options') or {}).get('response_format', 'json')}`",
+        f"- скрытое рассуждение: `{(benchmark.get('options') or {}).get('think')}` "
+        + "(auto: выключается у моделей с возможностью thinking)",
         (
             f"- num_ctx: `{(benchmark.get('options') or {}).get('num_ctx')}`, "
             f"temperature: `{(benchmark.get('options') or {}).get('temperature')}`, "
@@ -329,16 +328,22 @@ def build_report(run: dict, *, dataset: dict | None = None) -> str:
     ]
     if benchmark.get("stopped_reason"):
         lines.append(f"- прогон остановлен: {benchmark['stopped_reason']}")
-    lines += ["", "## Модели", "", "| Модель | digest | размер, GiB | кейсов | статус |",
-              "|---|---|---|---|---|"]
+    lines += [
+        "",
+        "## Модели",
+        "",
+        "| Модель | digest | размер, GiB | кейсов | think | статус |",
+        "|---|---|---|---|---|---|",
+    ]
     for tag, data in models.items():
         metadata = data["metadata"]
         status = ((benchmark.get("models") or {}).get(tag) or {}).get("status", "ok")
         planned = (data["metrics"].get("planned_cases")) or data["metrics"].get("cases")
+        think = (metadata.get("options") or {}).get("think")
         lines.append(
             f"| `{tag}` | `{metadata.get('model_digest', '')[:12]}` | "
             f"{metadata.get('model_size_gb')} | {data['metrics'].get('cases')}/{planned} | "
-            f"{status} |"
+            f"{think if think is not None else '—'} | {status} |"
         )
 
     lines += ["", "## Метрики качества", "", "| Модель | " +
@@ -357,6 +362,39 @@ def build_report(run: dict, *, dataset: dict | None = None) -> str:
         metrics = data["metrics"].get("metrics") or {}
         lines.append(
             f"| `{tag}` | " + " | ".join(_fmt(metrics.get(name)) for name in RESOURCE_TABLE) + " |"
+        )
+
+    # Память меряется на уровне системы и Ollama, а не процесса Python: модель
+    # живёт в процессе демона, и RSS CLI о ней ничего не говорит.
+    lines += [
+        "",
+        "## Память",
+        "",
+        (
+            "Пик занятой памяти и события pressure сняты по всем моделям; минимум "
+            "свободной памяти и подтверждение возврата — только там, где поле уже "
+            "существовало в runner'е (пересчитать их из сырых ответов нельзя, замер "
+            "снимается во время работы модели)."
+        ),
+        "",
+        (
+            "| Модель | пик занятой памяти | минимум свободной, GB | события pressure | "
+            "возврат памяти, c | решение |"
+        ),
+        "|---|---|---|---|---|---|",
+    ]
+    for tag, data in models.items():
+        metrics = data["metrics"].get("metrics") or {}
+        memory = data["metrics"].get("memory") or {}
+        release = memory.get("release") or {}
+        decision = memory.get("decision") or {}
+        lines.append(
+            f"| `{tag}` | {_fmt(metrics.get('peak_system_memory_percent'))} % | "
+            f"{_fmt(memory.get('min_available_gb'))} | "
+            f"{_fmt(metrics.get('memory_pressure_events'))} | "
+            f"{_fmt(release.get('waited_sec'))} "
+            f"({'вернулась' if release.get('recovered') else 'не вернулась'}) | "
+            f"{decision.get('level', '—')} |"
         )
 
     lines += ["", "## Критические ошибки", "", "| Модель | всего кейсов | по видам |",

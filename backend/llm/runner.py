@@ -424,6 +424,16 @@ class BenchmarkRunner:
             memory=memory_summary,
         )
         metrics["planned_cases"] = len(cases)
+        # Полная сводка памяти (пик, минимум свободной, возврат, решение) идёт в
+        # файл: `score_run` копирует в плоские метрики только три ключа, а для
+        # отчёта и для калибровки порогов нужен весь замер.
+        metrics["memory"] = memory_summary
+        if not reports:
+            # Ни одного нового кейса (повторный `--resume`): замеров памяти в этом
+            # запуске нет, и затирать прежние нулями нельзя — «нет данных» хуже
+            # сохранённого факта. Метрики качества пересчитываются из raw.jsonl, а
+            # память берётся из прошлого прогона.
+            metrics["memory"] = self._previous_memory(model_dir) or memory_summary
         # Паспорт пишется до метрик: метрики ссылаются на него, и файл метрик
         # обязан быть самодостаточным (с версиями и digest модели внутри).
         self._write_metadata(model, info, metrics, model_dir)
@@ -520,6 +530,18 @@ class BenchmarkRunner:
             error=error,
             options=dict(self.options),
         )
+
+    def _previous_memory(self, model_dir: Path) -> dict:
+        """Сводка памяти из прошлого прогона модели, если файл метрик уже есть."""
+        path = model_dir / METRICS_FILE
+        if not path.exists():
+            return {}
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+        memory = previous.get("memory")
+        return dict(memory) if isinstance(memory, dict) and memory else {}
 
     def _think_for(self, model: str) -> bool | None:
         """Нужно ли отключать скрытое рассуждение у этой модели.

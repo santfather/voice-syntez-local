@@ -583,3 +583,24 @@ def test_benchmark_disables_thinking_only_for_models_that_can_think(tmp_path):
 def test_benchmark_rejects_unknown_think_mode(tmp_path):
     with pytest.raises(runner_mod.BenchmarkError, match="размышления"):
         _runner(tmp_path, client=_perfect_client(_cases(1)), think="может быть")
+
+
+def test_benchmark_resume_keeps_previous_memory_measurements(tmp_path):
+    """Повторный `--resume` без новых кейсов не затирает замеры памяти нулями.
+
+    Замеры памяти нельзя пересчитать из сырых ответов — они снимались во время
+    прогона. Поэтому повторный запуск, который ничего не выполнил, обязан сохранить
+    прежнюю сводку: «нет данных» хуже сохранённого факта.
+    """
+    first = _runner(tmp_path, client=_perfect_client(_cases(2)))
+    first.run(["qwen3:4b"])
+    metrics_path = tmp_path / "qwen3-4b" / "metrics.json"
+    before = json.loads(metrics_path.read_text(encoding="utf-8"))
+    before["memory"] = {"peak_system_memory_percent": 84.7, "min_available_gb": 2.58}
+
+    metrics_path.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
+    second = _runner(tmp_path, client=_perfect_client(_cases(2)))
+    second.run(["qwen3:4b"], resume=True)
+    after = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert after["memory"]["peak_system_memory_percent"] == 84.7
+    assert after["memory"]["min_available_gb"] == 2.58
