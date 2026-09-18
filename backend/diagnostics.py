@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, resource_guard
+from . import config, resource_guard, synthesis_trace
 from . import short_utterance as su
 from .accentizer import Accentizer
 from .db.store import get_projects_store
@@ -493,6 +493,42 @@ def _environment_slice() -> dict:
     return data
 
 
+TRACE_NAME = "synthesis/trace.jsonl"
+TRACE_SUMMARY_NAME = "synthesis/summary.json"
+
+
+def _trace_slice(job_id: str) -> tuple[dict[str, bytes], list[str]]:
+    """Трейс стадий синтеза задачи, если он есть: где теряется слово.
+
+    Кладётся без аудио стадий: аудио реплик в архиве уже есть, а срезы стадий
+    удвоили бы размер архива. Текстовый трейс отвечает на главный вопрос разбора —
+    срезан ли звучащий край и совпало ли первое/последнее слово.
+    """
+    if not job_id:
+        return {}, []
+    root = Path(config.OUTPUT_DIR) / "trace" / "".join(
+        char if char.isalnum() or char in "-_" else "_" for char in str(job_id)
+    )
+    files: dict[str, bytes] = {}
+    warnings: list[str] = []
+    for name, target in (("trace.jsonl", TRACE_NAME), ("summary.json", TRACE_SUMMARY_NAME)):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            files[target] = path.read_bytes()
+        except OSError as exc:
+            warnings.append(f"трейс {name} не прочитан: {exc}")
+    if not files and synthesis_trace.enabled():
+        # Предупреждение только когда трейс был включён, а данных нет: иначе каждый
+        # архив пользователя, который трейсом не пользуется, начинался бы с упрёка.
+        warnings.append(
+            "трейс стадий включён, но для этой задачи не найден: рендер мог быть "
+            "выполнен до его включения"
+        )
+    return files, warnings
+
+
 def _log_slice(log_path: Path | None, limit: int) -> tuple[str, list[str]]:
     """Хвост лога приложения. Пусто — строка о причине, а не пустой файл."""
     warnings: list[str] = []
@@ -560,6 +596,7 @@ def _readme(bundle_name: str, project: dict, warnings: list[str], included: dict
             "память, состояние Ollama |"
         ),
         f"| `{LOG_NAME}` | Хвост журнала сервера — там видно причины отказов слоя |",
+        f"| `{TRACE_NAME}` | Трейс стадий синтеза: сырой выход, обрезка контекста и краёв, финал |",
         f"| `{FINAL_DIR}/` | Готовый трек рендера |",
         f"| `{TAKE_DIR}/` | Аудио вариантов реплик (сопоставляется по `take_id`) |",
         f"| `{REFERENCE_DIR}/` | Референсы голосов, которыми озвучен проект |",
@@ -669,6 +706,7 @@ def create_diagnostics_archive(
     *,
     render_settings: dict | None = None,
     job_output: Path | None = None,
+    job_id: str = "",
     include_references: bool = True,
     max_audio_mb: float | None = None,
     log_lines: int | None = None,
@@ -679,6 +717,11 @@ def create_diagnostics_archive(
     `job_output` — файл конкретного рендера: именно его пользователь слушал,
     когда решил, что звучит плохо. Без него архив описывает проект целиком, но
     без готового трека.
+
+    `job_id` добавляет трейс стадий синтеза, если он был включён
+    (`TTS_SYNTHESIS_TRACE=1`): текстовый след по стадиям и сводку — без аудио
+    стадий, потому что аудио реплик в архиве уже есть, а лишние копии удваивают
+    размер (`trace.jsonl` и `summary.json`).
     """
     if not project:
         raise DiagnosticsError("Проект не найден — диагностику собирать не из чего")
@@ -728,6 +771,8 @@ def create_diagnostics_archive(
 
     log_text, log_warnings = _log_slice(log_path, log_lines or config.DIAGNOSTICS_LOG_LINES)
     warnings.extend(log_warnings)
+    trace_files, trace_warnings = _trace_slice(job_id)
+    warnings.extend(trace_warnings)
 
     files: dict[str, bytes] = {
         PROJECT_NAME: _dump(project_slice),
@@ -738,6 +783,7 @@ def create_diagnostics_archive(
     }
     if log_text:
         files[LOG_NAME] = log_text.encode("utf-8", errors="replace")
+    files.update(trace_files)
 
     name = _unique_name(project, moment)
     included = {
@@ -908,9 +954,9 @@ def clear_archives(project: dict) -> int:
 
 __all__ = [
     "DIAGNOSTICS_VERSION",
-    "archive_prefix",
     "DiagnosticsBundle",
     "DiagnosticsError",
+    "archive_prefix",
     "clear_archives",
     "create_diagnostics_archive",
     "describe_render_settings",

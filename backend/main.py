@@ -2529,6 +2529,9 @@ async def create_project_diagnostics(
             project,
             render_settings=render_settings,
             job_output=job_output,
+            # Идентификатор задачи нужен трейсу стадий: он лежит отдельным
+            # каталогом и отвечает на вопрос «срезан ли звучащий край».
+            job_id=str(payload.job_id or ""),
             include_references=payload.include_references,
             max_audio_mb=payload.max_audio_mb,
         )
