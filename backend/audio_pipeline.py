@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from . import config, qa_screening, take_quality
+from . import config, qa_screening, synthesis_trace, take_quality
 from . import short_utterance as su
 from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
@@ -122,6 +122,10 @@ class QaOutcome:
     # быть: строгий режим идёт в расшифровку сразу, и тогда `screening` — None.
     mode: str = config.QA_MODE_STRICT
     screening: qa_screening.Screening | None = None
+    # Расшифровка куска, если она была. Хранится вместе с итогом, потому что по
+    # ней видно, **что услышал** Whisper: WER отвечает «насколько похоже», а
+    # диагностике нужен ещё и текст — «Да, да, да…» по числу не читается.
+    transcription: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -130,6 +134,7 @@ class QaOutcome:
             "attempts": self.attempts,
             "mode": self.mode,
             "screening": None if self.screening is None else self.screening.to_dict(),
+            "transcription": self.transcription,
         }
 
 
@@ -413,7 +418,37 @@ def _pitch_shift(chunk: np.ndarray, semitones: float) -> np.ndarray:
     )
 
 
-def _trim_edge_silence(chunk: np.ndarray) -> np.ndarray:
+def _edge_bounds(chunk: np.ndarray, margin_ms: float | None = None) -> tuple[int, int] | None:
+    """Границы речи в куске по энергетическому порогу; `None` — резать нечего.
+
+    Выделено из `_trim_edge_silence` ради трейса (§15 UPDATE 2): чтобы объяснить
+    пропажу окончания, нужно знать **сколько** сэмплов снято и с какой стороны, а
+    не только получить обрезанный массив. Логика та же, что была: кадры по
+    `EDGE_SILENCE_FRAME_MS`, порог `EDGE_SILENCE_DB`, запас с обеих сторон.
+
+    `margin_ms` — запас вокруг речи. По умолчанию общий (30 мс); короткая реплика
+    получает более широкий (`SHORT_EDGE_GUARD_MS`): у неё край и есть слово, а
+    цена лишних 30 мс тишины в файле нулевая — паузу всё равно задаёт `pause_ms`.
+    """
+    frame = int(SAMPLE_RATE * config.EDGE_SILENCE_FRAME_MS / 1000)
+    if frame <= 0 or chunk.size < 4 * frame:
+        return None
+    usable = chunk.size - chunk.size % frame
+    frames = chunk[:usable].reshape(-1, frame)
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    loud = np.flatnonzero(rms > 10.0 ** (config.EDGE_SILENCE_DB / 20.0))
+    if loud.size == 0:  # кусок целиком тихий — резать нечего
+        return None
+    guard_ms = config.EDGE_SILENCE_MARGIN_MS if margin_ms is None else margin_ms
+    margin = int(SAMPLE_RATE * max(guard_ms, 0) / 1000)
+    start = max(0, int(loud[0]) * frame - margin)
+    end = min(chunk.size, (int(loud[-1]) + 1) * frame + margin)
+    if end - start < 2 * frame:
+        return None
+    return start, end
+
+
+def _trim_edge_silence(chunk: np.ndarray, margin_ms: float | None = None) -> np.ndarray:
     """Срезает тишину, которую модель оставила на краях куска.
 
     Модель почти всегда добавляет к сгенерированному куску немного тишины, а
@@ -421,31 +456,67 @@ def _trim_edge_silence(chunk: np.ndarray) -> np.ndarray:
     гуляет от куска к куску и звучит неритмично. Обрезка по энергетическому
     порогу делает паузу ровно той, что задал пользователь.
     """
-    frame = int(SAMPLE_RATE * config.EDGE_SILENCE_FRAME_MS / 1000)
-    if frame <= 0 or chunk.size < 4 * frame:
+    bounds = _edge_bounds(chunk, margin_ms)
+    if bounds is None:
         return chunk
-    usable = chunk.size - chunk.size % frame
-    frames = chunk[:usable].reshape(-1, frame)
-    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
-    loud = np.flatnonzero(rms > 10.0 ** (config.EDGE_SILENCE_DB / 20.0))
-    if loud.size == 0:  # кусок целиком тихий — резать нечего
-        return chunk
-    margin = int(SAMPLE_RATE * config.EDGE_SILENCE_MARGIN_MS / 1000)
-    start = max(0, int(loud[0]) * frame - margin)
-    end = min(chunk.size, (int(loud[-1]) + 1) * frame + margin)
-    if end - start < 2 * frame:
-        return chunk
+    start, end = bounds
     return chunk[start:end]
 
 
-def _prepare_chunk(chunk: np.ndarray, settings: SpeakerSettings) -> np.ndarray:
+def _short_guard_ms(text: str) -> float:
+    """Запас обрезки для этого текста: расширенный для коротких реплик.
+
+    Критерий — тот же классификатор, что и у слоя коротких реплик
+    (`classify_utterance`): «край = слово» бывает ровно у коротких фраз, и
+    отдельного порога заводить не нужно.
+    """
+    try:
+        if classify_utterance(text or "").is_short:
+            return max(float(config.SHORT_EDGE_GUARD_MS), float(config.EDGE_SILENCE_MARGIN_MS))
+    except Exception as exc:  # noqa: BLE001 — классификация не повод менять синтез
+        logger.debug("Класс реплики не определён (%s) — беру общий запас обрезки", exc)
+    return float(config.EDGE_SILENCE_MARGIN_MS)
+
+
+def _prepare_chunk(
+    chunk: np.ndarray,
+    settings: SpeakerSettings,
+    *,
+    trace: "synthesis_trace.ReplicaTrace | None" = None,
+    text: str = "",
+) -> np.ndarray:
     """Готовит кусок к склейке: края, тембр и громкость.
 
     Один проход с одной копией: на длинных репликах лишние копии waveform заметны
     и по памяти, и по времени. Gain применяется после нормализации RMS — иначе
     нормализация обнулила бы ручную балансировку громкости.
+
+    `trace` (необязательный) записывает срезы аудио по стадиям и числа обрезки:
+    без него «слово пропало» неотличимо от «модель его не сказала». На сам звук
+    трейс не влияет — только наблюдает.
+
+    `text` — текст реплики: по нему выбирается запас обрезки (у коротких фраз он
+    шире). Пустая строка означает общий запас, то есть прежнее поведение.
     """
-    trimmed = _trim_edge_silence(np.asarray(chunk, dtype=np.float32))
+    raw = np.asarray(chunk, dtype=np.float32)
+    guard_ms = _short_guard_ms(text)
+    bounds = _edge_bounds(raw, guard_ms) if raw.size else None
+    if bounds is not None:
+        start, end = bounds
+        trimmed = raw[start:end]
+    else:
+        trimmed = raw
+    if trace is not None:
+        trace.edge_trim_enabled = True
+        trace.edge_silence_db = float(config.EDGE_SILENCE_DB)
+        trace.edge_fade_ms = float(config.EDGE_FADE_MS)
+        trace.pre_guard_ms = guard_ms
+        trace.post_guard_ms = guard_ms
+        if bounds is None:
+            trace.trim(raw, 0, raw.size, note="резать нечего (короткий кусок или тишина)")
+        else:
+            trace.trim(raw, start, end, note=f"запас {guard_ms:.0f} мс")
+        trace.stage(synthesis_trace.STAGE_TRIM, trimmed)
     result = np.array(_pitch_shift(trimmed, settings.pitch_semitones),
                       dtype=np.float32, copy=True)
 
@@ -466,6 +537,8 @@ def _prepare_chunk(chunk: np.ndarray, settings: SpeakerSettings) -> np.ndarray:
     peak = float(np.max(np.abs(result))) if result.size else 0.0
     if peak > _PEAK_LIMIT:
         result *= _PEAK_LIMIT / peak
+    if trace is not None:
+        trace.stage(synthesis_trace.STAGE_FINAL, result)
     return result
 
 
@@ -1116,6 +1189,22 @@ def short_run_for(
     return ShortRun(plan=plan, settings=short)
 
 
+def _short_trace_fields(trace: "synthesis_trace.ReplicaTrace", short: ShortRun | None) -> None:
+    """Переносит план короткой реплики в трейс: что ушло в модель и как обрезалось."""
+    if trace is None or short is None:
+        return
+    plan = short.plan
+    trace.short_strategy = plan.strategy
+    trace.tts_target_text = plan.target_text
+    trace.tts_context_text = plan.context_text
+    trace.tts_synthesis_text = plan.synthesis_text
+    trace.short_fallback = short.fallback
+    trace.short_attempts = short.attempts
+    if short.boundary is not None:
+        trace.pre_guard_ms = boundary_module.PAD_BEFORE_SEC * 1000
+        trace.post_guard_ms = boundary_module.PAD_AFTER_SEC * 1000
+
+
 async def _synthesize_attempt(
     engine: SynthesisEngine,
     voice: Voice,
@@ -1127,6 +1216,7 @@ async def _synthesize_attempt(
     label: str,
     short: ShortRun | None,
     attempt: int,
+    trace: "synthesis_trace.ReplicaTrace | None" = None,
 ) -> tuple[np.ndarray, int | None]:
     """Одна попытка: синтез плана, обрезка до цели и откат, если границы нет.
 
@@ -1156,7 +1246,18 @@ async def _synthesize_attempt(
         label=label,
         source_text=replica.text,
     )
+    if trace is not None:
+        trace.seed = seed
+        trace.stage(synthesis_trace.STAGE_RAW, chunk)
+        _short_trace_fields(trace, short)
     if not needs_crop:
+        if trace is not None:
+            # Обрезки контекста не было — это факт, а не отсутствие данных.
+            trace.stage(
+                synthesis_trace.STAGE_CONTEXT,
+                None,
+                note="контекст не добавлялся" if not use_plan else "обрезка не нужна",
+            )
         return chunk, seed
 
     # Границу ищем только выбранным методом. «По тишине» production-ready не
@@ -1187,9 +1288,24 @@ async def _synthesize_attempt(
             label=label,
             source_text=replica.text,
         )
+        if trace is not None:
+            trace.seed = seed
+            trace.short_fallback = short.fallback
+            trace.stage(synthesis_trace.STAGE_RAW, chunk, note="после отката: цель отдельно")
+            trace.stage(synthesis_trace.STAGE_CONTEXT, None, note="граница не найдена — откат")
         return chunk, seed
 
     short.boundary = boundary
+    if trace is not None:
+        trace.stage(
+            synthesis_trace.STAGE_CONTEXT,
+            cropped,
+            note=(
+                f"граница {boundary.method}, уверенность {boundary.confidence:.2f}, "
+                f"слов {boundary.matched_words}/{boundary.total_words}"
+            ),
+        )
+        _short_trace_fields(trace, short)
     return cropped, seed
 
 
@@ -1205,6 +1321,7 @@ async def _synthesize_checked(
     on_note: NoteCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
     context: su.ShortUtteranceContext | None = None,
+    trace: "synthesis_trace.ReplicaTrace | None" = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None, ShortRun | None]:
     """Синтез куска: обычный, с проверкой (`settings.qa`) и/или коротким слоем.
 
@@ -1244,10 +1361,27 @@ async def _synthesize_checked(
     short = short_run_for(replica, engine, settings, context=context)
     qa = settings.qa
     use_qa = qa is not None and qa.mode != config.QA_MODE_OFF
+    if trace is not None:
+        # Вход синтеза фиксируется до первой попытки: даже если движок упадёт, в
+        # трейсе останется, что именно ему отправили.
+        trace.prepared_from_final = bool(prepared)
+        trace.word_count = count_words(text)
+        trace.char_count = len(text)
+        trace.utterance_class = (
+            short.plan.utterance_class if short is not None else classify_utterance(text).kind
+        )
+        trace.short_strategy_requested = (
+            settings.short_utterance.strategy if settings.short_utterance else ""
+        )
+        # Куски: реплика, помещающаяся в лимит движка, обязана уходить одним
+        # текстом (§16). Пайплайн не режет текст сам — фиксируем это фактом, чтобы
+        # регресс «короткая реплика внезапно разрезана» был виден в трейсе.
+        trace.text_chunks = 1
+        trace.chunk_boundaries = [0, len(text)]
 
     if short is None and not use_qa:
         chunk, seed = await _synthesize_attempt(
-            engine, voice, replica, text, tuning, settings, position, label, None, 1
+            engine, voice, replica, text, tuning, settings, position, label, None, 1, trace
         )
         return chunk, seed, None, None
 
@@ -1257,7 +1391,10 @@ async def _synthesize_checked(
         short.settings.max_attempts if short is not None else 1,
         1,
     )
-    best: tuple[tuple, np.ndarray, int | None, QaOutcome | None] | None = None
+    # Лучшая попытка: ключ, сырой кусок, измеренный (подготовленный) кусок, сид,
+    # итог проверки. Подготовленный хранится рядом, чтобы финальная проверка и
+    # трейс смотрели на то же аудио, по которому принималось решение.
+    best: tuple[tuple, np.ndarray, np.ndarray, int | None, QaOutcome | None] | None = None
     attempts = 0
     status = QA_ATTEMPTS
     screening: qa_screening.Screening | None = None
@@ -1279,11 +1416,19 @@ async def _synthesize_checked(
             on_note(f"Реплика {position}: {reason}, попытка {attempt} из {limit}")
 
         chunk, seed = await _synthesize_attempt(
-            engine, voice, replica, text, tuning, settings, position, label, short, attempt
+            engine, voice, replica, text, tuning, settings, position, label, short, attempt, trace
         )
         attempts = attempt
         if short is not None:
             short.attempts = attempt
+        # Проверка измеряет то, что попадёт в файл, а не сырой выход модели:
+        # подготовка (обрезка краёв, кроссфейд, нормализация) стоит между ними, и
+        # дефект, внесённый ею, иначе не видел бы никто — «QA прошёл, а слово
+        # пропало». Подготовка детерминирована, поэтому вызывающий получит из
+        # этого же сырого куска ровно тот же результат.
+        measured = await asyncio.to_thread(
+            _prepare_chunk, chunk, tuning, text=replica.final_text or replica.text
+        )
         screening = None
         qa_outcome: QaOutcome | None = None
         transcription: str | None = None
@@ -1292,7 +1437,9 @@ async def _synthesize_checked(
         if use_qa and qa.smart:
             # Отбор идёт в потоке: на длинном куске это автокорреляция, и в
             # event loop ей делать нечего.
-            screening = await asyncio.to_thread(qa_screening.screen_chunk, chunk, replica.text)
+            screening = await asyncio.to_thread(
+                qa_screening.screen_chunk, measured, replica.text
+            )
             if not screening.suspicious:
                 logger.info("Реплика %s: отбор не нашёл брака — расшифровка не нужна", position)
                 qa_outcome = QaOutcome(
@@ -1305,7 +1452,7 @@ async def _synthesize_checked(
                 )
         if use_qa and qa_outcome is None:
             try:
-                transcription, wer = await _transcribe_and_measure(chunk, replica.text)
+                transcription, wer = await _transcribe_and_measure(measured, replica.text)
             except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не губит задачу
                 logger.warning(
                     "Реплика %s: проверка недоступна (%s: %s) — принимаю без проверки",
@@ -1328,6 +1475,7 @@ async def _synthesize_checked(
                     attempts=attempt,
                     mode=qa.mode,
                     screening=screening,
+                    transcription=transcription or "",
                 )
                 if on_note:
                     on_note(f"Реплика {position}: проверка {attempt} из {limit}, WER {wer:.2f}")
@@ -1336,7 +1484,7 @@ async def _synthesize_checked(
         if short is not None:
             verdict = await asyncio.to_thread(
                 su.check_chunk,
-                chunk,
+                measured,
                 short.plan.target_text,
                 transcription=transcription,
                 wer=wer,
@@ -1371,15 +1519,18 @@ async def _synthesize_checked(
                 attempts=attempt,
                 mode=qa.mode,
                 screening=screening,
+                transcription=transcription or "",
             )
         key = _attempt_score(verdict, wer)
         if best is None or key > best[0]:
-            best = (key, chunk, seed, qa_outcome)
+            best = (key, chunk, measured, seed, qa_outcome)
 
     assert best is not None  # первая попытка выполняется всегда
-    _, chunk, seed, qa_outcome = best
+    _, chunk, measured, seed, qa_outcome = best
     if short is not None:
-        short.verdict = su.check_chunk(chunk, short.plan.target_text)
+        # Финальный вердикт — по подготовленному аудио лучшей попытки: именно оно
+        # уходит в файл, и «слово потеряно» должно относиться к нему.
+        short.verdict = su.check_chunk(measured, short.plan.target_text)
     # Итог цикла: «бюджет исчерпан» важнее статуса последней попытки, потому что
     # именно он объясняет, почему попыток больше не было. Число попыток — общее,
     # а не той, что оказалась лучшей.
@@ -1397,8 +1548,25 @@ async def _synthesize_checked(
             attempts=attempts,
             mode=qa_outcome.mode,
             screening=qa_outcome.screening,
+            transcription=qa_outcome.transcription,
         )
     )
+    if trace is not None:
+        # Итог проверки в трейс: статус, WER и то, что услышал Whisper. Ровно здесь
+        # видно расхождение «QA прошёл по сырому куску» → «в файл пошёл
+        # подготовленный» (см. §18 пакета UPDATE 2).
+        trace.qa_status = final_status
+        trace.qa_wer = None if final_outcome is None else final_outcome.wer
+        if final_outcome is not None:
+            trace.qa_transcript = final_outcome.transcription
+        if short is not None and short.verdict is not None:
+            verdict = short.verdict
+            trace.repetition_detected = su.REASON_REPETITION in verdict.reasons
+            trace.qa_transcript = trace.qa_transcript or verdict.transcription
+            trace.first_word_ok = verdict.first_word_ok
+            trace.last_word_ok = verdict.last_word_ok
+            trace.expected_words = list(verdict.expected_words)
+            trace.asr_words = list(verdict.asr_words)
     logger.info(
         "Реплика %s: проверка — %s, попыток %s, стратегия %s",
         position, final_status if final_outcome is not None else "не гонялась", attempts,
@@ -1568,6 +1736,12 @@ async def render_dialogue(
     # конкретную реплику `interrupted` и назвать её в диагностике.
     current_index: int | None = None
 
+    # Трейс стадий (§14–§15 UPDATE 2). Он включается переменной окружения и по
+    # умолчанию выключен: без него `trace is None`, и ни одна ветка ниже не
+    # выполняется. Включённый — записывает аудио стадий и числа обрезки, чтобы
+    # «слово пропало» можно было разделить на «модель не сказала» и «пайплайн срезал».
+    trace = synthesis_trace.start(job_id)
+
     try:
         for index, replica in enumerate(replicas, start=1):
             if index <= done_before:
@@ -1584,6 +1758,21 @@ async def render_dialogue(
             settings_for_replica = per_replica[index - 1]
             voice = resolved[settings_for_replica.voice_id]
             engine = engines[voice.engine]
+            replica_trace = None
+            if trace is not None:
+                replica_trace = trace.replica(
+                    index,
+                    project_id=getattr(settings, "project_id", "") or "",
+                    speaker=replica.voice,
+                    voice_id=voice.id,
+                    engine=engine.id,
+                    label=replica.label,
+                    position=f"{index} из {total}",
+                    source_text=replica.text or "",
+                    final_text=replica.final_text or "",
+                    reference_audio=voice.audio_path.name,
+                    reference_text=voice.ref_text or "",
+                )
 
             started = time.monotonic()
             chunk, seed, qa_outcome, short_run = await _synthesize_checked(
@@ -1597,6 +1786,7 @@ async def render_dialogue(
                 wait_for_memory=wait_for_memory,
                 on_note=on_note,
                 context=short_contexts[index - 1] if short_contexts else None,
+                trace=replica_trace,
             )
             if short_run is not None:
                 short_runs[index - 1] = short_run
@@ -1606,7 +1796,21 @@ async def render_dialogue(
             if pieces and pause:
                 pieces.append(np.zeros(pause, dtype=np.float32))
                 cursor += pause
-            prepared = await asyncio.to_thread(_prepare_chunk, chunk, settings_for_replica)
+            prepared = await asyncio.to_thread(
+                _prepare_chunk,
+                chunk,
+                settings_for_replica,
+                trace=replica_trace,
+                text=replica.final_text or replica.text,
+            )
+            if replica_trace is not None:
+                replica_trace.speed = settings_for_replica.speed
+                replica_trace.engine_params = dict(settings_for_replica.engine_params or {})
+                replica_trace.seconds = time.monotonic() - started
+                # Аудио стадий уже сохранено вызовами `stage()` — здесь только
+                # запись итога на диск, чтобы падение на следующей реплике не
+                # потеряло уже собранные данные.
+                trace.write(replica_trace)
             # Диагностика считается по подготовленному куску — по тому, что реально
             # попадёт в файл, а не по сырому выходу модели.
             qualities.append(
@@ -1647,6 +1851,11 @@ async def render_dialogue(
 
     final = await asyncio.to_thread(np.concatenate, pieces)
     final = await asyncio.to_thread(_finalize_track, final)
+    if trace is not None:
+        # Сводка — после успешной сборки: по ней видно, у каких реплик снимались
+        # края и у каких ASR не услышал первое/последнее слово.
+        summary_path = await asyncio.to_thread(trace.write_summary)
+        logger.info("Трейс синтеза: %s", summary_path)
     output_path = await asyncio.to_thread(
         _write_output, job_id, final, settings.output_format, settings.output_name
     )
@@ -1706,7 +1915,9 @@ async def synthesize_replica(
         should_abort=should_abort,
         context=context,
     )
-    prepared = await asyncio.to_thread(_prepare_chunk, chunk, resolved)
+    prepared = await asyncio.to_thread(
+        _prepare_chunk, chunk, resolved, text=replica.final_text or replica.text
+    )
     # Диагностика считается здесь, где под рукой и сырой выход модели, и
     # подготовленный кусок: перегруз подготовки не виден, и перемерить его
     # снаружи уже нечем (см. `take_quality.measure`).
@@ -1755,7 +1966,9 @@ async def synthesize_take(
     return chunk, seed, qa_outcome
 
 
-def write_take(path: Path, chunk: np.ndarray, tuning: SpeakerSettings) -> float:
+def write_take(
+    path: Path, chunk: np.ndarray, tuning: SpeakerSettings, text: str = ""
+) -> float:
     """Записывает отдельный take wav и возвращает его длительность.
 
     Take готовится так же, как кусок трека (края, тембр, RMS, затем LUFS и
@@ -1763,7 +1976,7 @@ def write_take(path: Path, chunk: np.ndarray, tuning: SpeakerSettings) -> float:
     выбор решала бы громкость, а не голос.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    prepared = _prepare_chunk(chunk, tuning)
+    prepared = _prepare_chunk(chunk, tuning, text=text)
     final = _finalize_track(prepared)
     _write_audio(path, final, "wav")
     return final.size / SAMPLE_RATE

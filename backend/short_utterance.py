@@ -666,6 +666,12 @@ REASON_DURATION_LONG = "duration_long"
 REASON_REPETITION = "repetition"
 REASON_MISSING_WORDS = "missing_words"
 REASON_EXTRA_WORDS = "extra_words"
+# Потеря именно первого или последнего слова. Отдельно от «части слов»: у обрыва
+# короткой реплики есть два характерных вида, и лечатся они по-разному —
+# потерянное начало указывает на обрезку атаки, потерянный конец на обрыв хвоста.
+REASON_START_TRUNCATION = "start_truncation"
+REASON_END_TRUNCATION = "end_truncation"
+REASON_WORD_ORDER = "word_order"
 
 # Русские подписи — для лога и сообщения в интерфейсе.
 REASON_TITLES = {
@@ -676,6 +682,9 @@ REASON_TITLES = {
     REASON_REPETITION: "слово повторяется в озвучке",
     REASON_MISSING_WORDS: "в озвучке не слышно части слов",
     REASON_EXTRA_WORDS: "в озвучке слышны лишние слова",
+    REASON_START_TRUNCATION: "потеряно начало фразы",
+    REASON_END_TRUNCATION: "потерян конец фразы",
+    REASON_WORD_ORDER: "слова идут не в том порядке",
     # Причины отбора `qa_screening` приходят как есть: они уже названы.
     "too_short": "аудио короче нижней границы",
     "level": "уровень вне допустимого диапазона",
@@ -701,7 +710,14 @@ def expected_duration(chars: int, *, chars_per_sec: float | None = None) -> floa
 
 @dataclass(frozen=True)
 class ShortVerdict:
-    """Вердикт короткой реплики: годна ли она и почему нет."""
+    """Вердикт короткой реплики: годна ли она и что именно услышано.
+
+    Кроме «годна/нет» вердикт называет слова: ожидаемые, распознанные, потерянные
+    и лишние, а также совпало ли первое и последнее слово и не нарушен ли порядок.
+    Это требование §21 UPDATE 2: общего WER мало — на «Да.» одна ошибка
+    распознавания даёт WER 1.0, и по числу не видно, потеряно слово или оно
+    просто иначе расслышано.
+    """
 
     ok: bool
     reasons: tuple[str, ...] = ()
@@ -709,6 +725,13 @@ class ShortVerdict:
     expected_sec: float = 0.0
     wer: float | None = None
     transcription: str = ""
+    expected_words: tuple[str, ...] = ()
+    asr_words: tuple[str, ...] = ()
+    missing_words: tuple[str, ...] = ()
+    extra_words: tuple[str, ...] = ()
+    first_word_ok: bool | None = None
+    last_word_ok: bool | None = None
+    word_order_ok: bool | None = None
 
     @property
     def score(self) -> tuple[int, float]:
@@ -726,6 +749,13 @@ class ShortVerdict:
             "duration_sec": round(self.duration_sec, 3),
             "expected_sec": round(self.expected_sec, 3),
             "wer": self.wer,
+            "expected_words": list(self.expected_words),
+            "asr_words": list(self.asr_words),
+            "missing_words": list(self.missing_words),
+            "extra_words": list(self.extra_words),
+            "first_word_ok": self.first_word_ok,
+            "last_word_ok": self.last_word_ok,
+            "word_order_ok": self.word_order_ok,
         }
 
 
@@ -776,14 +806,22 @@ def check_chunk(
     if duration > expected * config.QA_SCREEN_LONG_RATIO and REASON_DURATION_LONG not in reasons:
         reasons.append(REASON_DURATION_LONG)
 
+    target_words = _words(expected_text)
+    heard_words = _words(transcription or "")
+    missing_words: tuple[str, ...] = ()
+    extra_words: tuple[str, ...] = ()
+    first_word_ok: bool | None = None
+    last_word_ok: bool | None = None
+    order_ok: bool | None = None
+
     if transcription is not None and transcription.strip():
-        target_words = _words(expected_text)
-        heard_words = _words(transcription)
         heard_set = set(heard_words)
         target_set = set(target_words)
-        if any(word not in heard_set for word in target_words):
+        missing_words = tuple(word for word in target_words if word not in heard_set)
+        extra_words = tuple(word for word in heard_words if word not in target_set)
+        if missing_words:
             reasons.append(REASON_MISSING_WORDS)
-        if any(word not in target_set for word in heard_words):
+        if extra_words:
             reasons.append(REASON_EXTRA_WORDS)
         # «Да, да, да…»: слово, которое в тексте встречается один раз, а в озвучке
         # повторяется — самый частый дефект коротких реплик.
@@ -791,6 +829,22 @@ def check_chunk(
             if heard_words.count(word) >= 3 and target_words.count(word) <= 1:
                 reasons.append(REASON_REPETITION)
                 break
+        # Первое и последнее слово — отдельно от «части слов»: обрыв короткой
+        # реплики почти всегда виден именно на краю, и по этим двум флагам
+        # выбирается лечение (шире запас обрезки, повтор, откат на DIRECT).
+        if target_words:
+            first_word_ok = target_words[0] in heard_set
+            last_word_ok = target_words[-1] in heard_set
+            if not first_word_ok:
+                reasons.append(REASON_START_TRUNCATION)
+            if not last_word_ok and len(target_words) > 1:
+                # Для однословной реплики потеря единственного слова — это уже
+                # «не слышно слова», а не «потерян конец»: различать их нужно,
+                # иначе «Да.» получало бы два названия одной проблемы.
+                reasons.append(REASON_END_TRUNCATION)
+            order_ok = _order_ok(target_words, heard_words)
+            if order_ok is False:
+                reasons.append(REASON_WORD_ORDER)
 
     # Порядок причин стабилен: один и тот же дефект даёт одну и ту же строку.
     unique = tuple(dict.fromkeys(reasons))
@@ -801,7 +855,44 @@ def check_chunk(
         expected_sec=expected,
         wer=wer,
         transcription=transcription or "",
+        expected_words=tuple(target_words),
+        asr_words=tuple(heard_words),
+        missing_words=missing_words,
+        extra_words=extra_words,
+        first_word_ok=first_word_ok,
+        last_word_ok=last_word_ok,
+        word_order_ok=order_ok,
     )
+
+
+def _order_ok(target: list[str], heard: list[str]) -> bool | None:
+    """Идут ли ожидаемые слова в распознанном тексте в том же порядке.
+
+    Сравнивается подпоследовательность, а не равенство списков: лишнее слово
+    («ну, красивая») — не нарушение порядка, а вот перестановка («пройти дайте»)
+    — нарушение. `None` — ожидаемых слов меньше двух, порядок не о чем говорит.
+    """
+    if len(target) < 2:
+        return None
+    position = 0
+    for word in heard:
+        if position < len(target) and word == target[position]:
+            position += 1
+    # Совпала ли последовательность целиком: если да, порядок не нарушен.
+    if position == len(target):
+        return True
+    # Часть слов не прозвучала — об этом говорят `missing_words`; здесь важно
+    # только то, не переставлены ли прозвучавшие.
+    sounding = [word for word in target if word in set(heard)]
+    return _subsequence(sounding, heard)
+
+
+def _subsequence(needle: list[str], haystack: list[str]) -> bool:
+    position = 0
+    for word in haystack:
+        if position < len(needle) and word == needle[position]:
+            position += 1
+    return position == len(needle)
 
 
 def should_retry_short(*, attempt: int, max_attempts: int, verdict: ShortVerdict | None) -> bool:

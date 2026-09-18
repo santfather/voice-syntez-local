@@ -275,7 +275,9 @@ async def _run_engine(
         )
         render_sec = time.monotonic() - started
         path = take_path(run.id, engine_id)
-        duration = await asyncio.to_thread(audio_pipeline.write_take, path, chunk, tuning)
+        duration = await asyncio.to_thread(
+            audio_pipeline.write_take, path, chunk, tuning, text
+        )
     except audio_pipeline.JobCancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — движок может упасть на самом синтезе

@@ -319,8 +319,15 @@ def test_qa_passes_on_first_attempt(stub, fake_store, monkeypatch):
     result = _render([_replica()], {"#1": _speaker()}, _qa_render())
 
     assert len(stub.calls) == 1  # порог взят — повторять нечего
+    # Расшифровка теперь едет вместе с итогом проверки: по ней видно, **что
+    # услышал** Whisper, а не только насколько это похоже на текст (§14 UPDATE 2).
     assert result.qa == [
-        audio_pipeline.QaOutcome(status=audio_pipeline.QA_PASSED, wer=0.0, attempts=1)
+        audio_pipeline.QaOutcome(
+            status=audio_pipeline.QA_PASSED,
+            wer=0.0,
+            attempts=1,
+            transcription="Привет это тест",
+        )
     ]
 
 
