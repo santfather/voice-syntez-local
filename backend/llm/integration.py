@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from . import memory_policy as memory
 from . import scheduler as scheduler_module
 from . import schemas as s
-from .analysis_cache import AnalysisKey, dictionary_hash, text_hash
+from .analysis_cache import AnalysisKey, dictionary_hash, rule_fields, text_hash
 from .analyzer import (
     STATUS_DISABLED,
     STATUS_FAILED,
@@ -64,17 +64,27 @@ def llm_candidates(
     *,
     replica_index: int,
     preparation=None,
+    rules: Sequence[object] = (),
 ) -> list[dict]:
     """Превращает разбор в кандидаты словаря, не меняя ни текст, ни правила.
 
     `target` остаётся подсказкой: у омографа это словарная форма чтения, у «ё» —
     форма с «ё», у имени может быть пустым (тогда пользователь впишет чтение сам).
     Пустой `target` — не ошибка: кандидат означает «проверьте это слово».
+
+    `rules` — **все** правила проекта и глобальные, включая выключенные: выключенное
+    правило это память об отклонённом предложении, и повторно предлагать то же слово
+    значит спрашивать одно и то же по кругу. Кандидат при этом не исчезает из
+    разбора: он остаётся с `resolved_by`, чтобы решение было видно в интерфейсе.
     """
     candidates: list[dict] = []
     for item in analysis.items:
-        opinion, detail = deterministic_opinion(item, preparation)
+        opinion, detail, resolved_by = cross_check(item, preparation, rules)
         reason = item.meaning or item.reason_code or item.type
+        if resolved_by == "agreement":
+            reason = f"{reason} — согласие с детерминированным слоем"
+        elif resolved_by == "rejected":
+            reason = f"{reason} — уже отклонено при подготовке"
         candidates.append(
             {
                 "word": item.source,
@@ -88,7 +98,11 @@ def llm_candidates(
                 "source": LLM_SOURCE,
                 "type": item.type,
                 "meaning": item.meaning,
-                "needs_review": bool(item.needs_review),
+                # Решённое детерминированным слоем не требует решения человека:
+                # согласие — потому что стороны совпали, отклонение — потому что
+                # человек уже отказался от этого слова.
+                "needs_review": bool(item.needs_review) and not resolved_by,
+                "resolved_by": resolved_by,
                 "reason_code": item.reason_code,
                 "span_start": item.span_start,
                 "span_end": item.span_end,
@@ -120,11 +134,77 @@ def llm_candidates(
                 "replica_index": replica_index,
                 "agreement": AGREEMENT_NONE,
                 "agreement_detail": "",
+                "resolved_by": "",
                 "model_tag": analysis.model_tag,
                 "model_digest": analysis.model_digest,
             }
         )
     return candidates
+
+
+def cross_check(
+    item: s.Annotation,
+    preparation,
+    rules: Sequence[object] = (),
+) -> tuple[str, str, str]:
+    """Сверяет предложение модели со словарём и «ё»-стадией (§10).
+
+    Возвращает `(согласие, пояснение, resolved_by)`, где `resolved_by` — почему
+    предложение не требует решения человека:
+    `agreement` — словарь или «ё»-стадия дают то же чтение;
+    `rejected` — правило по этому слову уже есть, но выключено (человек отказался);
+    пустая строка — решение за человеком.
+    """
+    words = _rule_targets(item.source, rules)
+    if words:
+        for target, enabled in words:
+            if _same_reading(item.suggested_form, target):
+                if enabled:
+                    return AGREEMENT_AGREE, f"словарь: «{item.source}» → «{target}»", "agreement"
+                return AGREEMENT_NONE, "слово уже отклонено при подготовке", "rejected"
+        target, enabled = words[0]
+        if enabled:
+            return (
+                AGREEMENT_CONFLICT,
+                f"словарь даёт «{target}», модель — «{item.suggested_form}»",
+                "",
+            )
+        return AGREEMENT_NONE, "слово уже отклонено при подготовке", "rejected"
+    opinion, detail = deterministic_opinion(item, preparation)
+    if opinion == AGREEMENT_AGREE:
+        return opinion, detail, "agreement"
+    return opinion, detail, ""
+
+
+def _rule_targets(source: str, rules: Sequence[object]) -> list[tuple[str, bool]]:
+    """Правила словаря, покрывающие это слово: (target, включено).
+
+    Проверяются и выключенные правила: они хранят память об отклонённом предложении,
+    иначе одно и то же слово предлагалось бы после каждого анализа.
+    """
+    if not source:
+        return []
+    from ..text_normalization import pronunciation as pronunciation_rules
+
+    found: list[tuple[str, bool]] = []
+    for rule in rules:
+        fields = rule_fields(rule)
+        compiled = pronunciation_rules.compile_rule(
+            pronunciation_rules.PronunciationRule(
+                source=str(fields.get("source") or ""),
+                target=str(fields.get("target") or ""),
+                case_sensitive=bool(fields.get("case_sensitive", False)),
+                whole_word=bool(fields.get("whole_word", True)),
+                enabled=bool(fields.get("enabled", True)),
+            )
+        )
+        if compiled is None:
+            continue
+        if compiled.pattern.search(source):
+            found.append(
+                (str(fields.get("target") or ""), bool(fields.get("enabled", True)))
+            )
+    return found
 
 
 def deterministic_opinion(item: s.Annotation, preparation) -> tuple[str, str]:

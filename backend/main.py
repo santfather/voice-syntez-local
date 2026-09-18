@@ -2402,7 +2402,13 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
             # Кандидаты LLM добавляются к детерминированным, но стадии текста не
             # трогаются: модель ничего не применяет, только предлагает.
             candidates = llm_integration.llm_candidates(
-                llm_outcome.analyses[index], replica_index=index, preparation=preparation
+                llm_outcome.analyses[index],
+                replica_index=index,
+                preparation=preparation,
+                # Правила передаются целиком (включая выключенные): выключенное
+                # правило — память об отклонённом предложении, и предлагать это
+                # слово снова значило бы спрашивать одно и то же по кругу.
+                rules=rules,
             )
             preparation = llm_integration.merge_preparation_candidates(
                 preparation, candidates

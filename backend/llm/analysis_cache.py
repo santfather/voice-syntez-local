@@ -32,7 +32,7 @@ import hashlib
 import json
 import logging
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,25 +42,45 @@ from .analyzer import STATUS_STALE, ReplicaAnalysis, context_hash, text_hash
 logger = logging.getLogger("tts.llm.cache")
 
 
-def dictionary_hash(rules: Iterable[dict]) -> str:
+def rule_fields(rule: object) -> dict:
+    """Канонические поля правила словаря: правило приходит объектом или словарём.
+
+    Возвращаются только поля, влияющие на чтение. Заметка и время правки остаются
+    за бортом: они меняют запись, но не произношение, и не должны инвалидировать
+    готовый разбор (§18).
+    """
+    if isinstance(rule, Mapping):
+        get = rule.get
+    else:
+
+        def get(name: str, default: object = None) -> object:
+            return getattr(rule, name, default)
+
+    return {
+        "source": str(get("source") or ""),
+        "target": str(get("target") or ""),
+        "case_sensitive": bool(get("case_sensitive", False)),
+        "whole_word": bool(get("whole_word", True)),
+        "enabled": bool(get("enabled", True)),
+        "project_id": get("project_id") or "",
+    }
+
+
+def dictionary_hash(rules: Iterable[object]) -> str:
     """Хеш словаря, влияющего на реплику: правила проекта и глобальные.
 
     Учитываются только поля, которые меняют чтение (`source`, `target`,
     `case_sensitive`, `whole_word`, `enabled`): заметка или время правки на разбор
     не влияют и не должны его инвалидировать.
     """
-    payload = [
-        {
-            "source": rule.get("source", ""),
-            "target": rule.get("target", ""),
-            "case_sensitive": bool(rule.get("case_sensitive", False)),
-            "whole_word": bool(rule.get("whole_word", True)),
-            "enabled": bool(rule.get("enabled", True)),
-            "project_id": rule.get("project_id") or "",
-        }
-        for rule in rules
-    ]
-    payload.sort(key=lambda item: (item["project_id"], item["source"], item["target"]))
+    payload = [rule_fields(rule) for rule in rules]
+    payload.sort(
+        key=lambda item: (
+            str(item.get("project_id") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        )
+    )
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 

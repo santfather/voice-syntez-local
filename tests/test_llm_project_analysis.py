@@ -401,3 +401,122 @@ def test_analyze_keeps_working_when_llm_module_disabled(llm_env, voices, stub, m
     assert state["llm_status"] == llm.STATUS_DISABLED
     assert state["llm_candidates_total"] == 0
     assert state["candidates_total"] >= 0
+
+
+def test_llm_candidate_review_creates_project_rule_and_reanalyzes(
+    llm_env, voices, stub, monkeypatch
+):
+    """Принятие предложения LLM создаёт правило проекта и пересчитывает реплики.
+
+    Это единственный способ, которым предложение модели попадает в словарь: сама
+    модель писать в словарь не может (§3.4, §27 Task 2).
+    """
+    client = llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            state = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+            candidate = next(
+                item for item in state["candidates"] if item["source"] == "llm" and item["word"]
+            )
+            review = await api.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={
+                    "source": candidate["word"],
+                    "target": "зам+ок",
+                    "scope": "project",
+                    "replica_index": candidate["replica_index"],
+                    "note": "принято из предложения LLM",
+                },
+            )
+            assert review.status_code == 200, review.text
+            entries = (await api.get("/api/pronunciation", params={"project_id": project["id"]})).json()
+            full = (await api.get(f"/api/projects/{project['id']}")).json()
+            return {
+                "review": review.json(),
+                "entries": entries,
+                "full": full,
+                "word": candidate["word"],
+            }
+
+    result = asyncio.run(scenario())
+    entry = result["review"]["entry"]
+    # Источник — ровно форма из текста: правило словаря сопоставляется по границам
+    # слова, поэтому «замка» и «замок» — разные записи, и подменять одну другой нельзя.
+    assert entry["source"] == result["word"]
+    assert entry["target"] == "зам+ок"
+    assert entry["enabled"] is True
+    assert entry["project_id"] == result["full"]["id"]
+    # Правило проекта видно в списке правил проекта: словарь один, второго нет.
+    assert any(item["source"] == result["word"] for item in result["entries"]["entries"])
+    assert len(client.calls) > 0
+
+
+def test_llm_candidate_review_global_scope_is_explicit(llm_env, voices, stub, monkeypatch):
+    """Глобальный словарь меняется только при явном `scope: global`."""
+    llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            project_review = await api.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={"source": "замок", "target": "зам+ок", "scope": "project"},
+            )
+            global_review = await api.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={"source": "термин", "target": "т+ермин", "scope": "global"},
+            )
+            return {
+                "project": project_review.json()["entry"],
+                "global": global_review.json()["entry"],
+            }
+
+    result = asyncio.run(scenario())
+    assert result["project"]["project_id"] is not None
+    assert result["global"].get("project_id") in (None, ""), (
+        "глобальное правило не должно быть привязано к проекту"
+    )
+
+
+def test_llm_candidates_respect_rejected_dictionary_memory(llm_env, voices, stub, monkeypatch):
+    """Отклонённое слово не предлагается снова, но остаётся видимым как решённое."""
+    llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            before = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+            word = next(item["word"] for item in before["candidates"] if item["source"] == "llm")
+            # Пользователь отказался от слова: выключенное правило = память решения.
+            # Источник — ровно та форма, что предложила модель: правило словаря
+            # сопоставляется по границам слова, и «замок» не покроет «замка».
+            await api.post(
+                f"/api/projects/{project['id']}/pronunciation/review",
+                json={"source": word, "target": "", "scope": "project"},
+            )
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            state = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+            return {"state": state, "word": word}
+
+    result = asyncio.run(scenario())
+    state, word = result["state"], result["word"]
+    words = [item for item in state["candidates"] if item["source"] == "llm" and item["word"]]
+    assert words, "кандидат остаётся в разборе как диагностика"
+    rejected = [item for item in words if item["word"] == word]
+    assert rejected, "отклонённое слово должно остаться видимым"
+    assert all(item["resolved_by"] == "rejected" for item in rejected)
+    assert all(item["needs_review"] is False for item in rejected), (
+        "повторно спрашивать про отклонённое слово нельзя"
+    )
+    assert state["needs_review_total"] == 0
