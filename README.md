@@ -1758,8 +1758,10 @@ WER отвечает не на каждый вопрос: кусок может 
   (границы, совпадение `source` с текстом, известные типы, отсутствие перекрытий) и
   разбор gold-корпуса. В схеме **нет поля для нового текста** — переписать реплику
   невозможно на уровне протокола;
-- `backend/llm/prompt.py` + `benchmarks/russian_linguistics/prompts/analyzer.v1.txt` —
-  версионный prompt: один и тот же для benchmark'а и для Analyzer;
+- `backend/llm/prompt.py` + `benchmarks/russian_linguistics/prompts/analyzer.v2.txt` —
+  версионный prompt: один и тот же для benchmark'а и для Analyzer. Схема ответа подставляется
+  плейсхолдером `{{schema}}` из того же `analysis_json_schema()`, по которому backend проверяет
+  ответ, поэтому prompt и валидатор не могут разойтись. Файл v1 оставлен для истории прогонов;
 - `backend/llm/versioning.py` — паспорт прогона (версии benchmark/dataset/prompt/schema,
   git-коммит, ОС, чип, память, версия Ollama, тег и **digest** модели, контекст,
   temperature, seed) и сравнение с baseline;
@@ -1912,6 +1914,13 @@ backend обязан искать слово в тексте сам, а `span_st
 
 Baseline сохранён: `benchmarks/russian_linguistics/results/full/baseline.v1.json`
 (модель `qwen3:8b`, версии dataset/prompt/schema), сравнение — `--compare-baseline`.
+
+Документы задачи: `llm_benchmark_report.md` (числа), `llm_russian_benchmark.md` (база знаний
+и выводы для Analyzer'а), `ollama_memory_policy.md` (совместное использование Ollama/TTS/Whisper).
+Следующий шаг — **Task 2, Local LLM Russian Linguistic Analyzer** (фазы 1–7 в
+`02_LOCAL_LLM_RUSSIAN_LINGUISTIC_ANALYZER.md`); production-интеграция начинается только после
+этого benchmark'а, и главный его вывод для неё: backend ищет слово в тексте сам, а
+`span_start/span_end` от модели использует как подсказку.
 
 ## API
 
@@ -2299,6 +2308,15 @@ VOICE_SYNTEZ/
 │   ├── engine_lifecycle.py  # выгрузка движков: решение по простою и фоновая задача
 │   ├── cache_cleanup.py     # очистка своего кеша: output/, benchmarks/, временные файлы (без весов и кеша HF)
 │   ├── settings_resolution.py # иерархия настроек: движок → голос → спикер → реплика, с источником значения
+│   ├── llm/                 # локальная LLM (Ollama) — опциональная зависимость, HTTP API
+│   │   ├── ollama_client.py # единственное место общения с Ollama: HTTP API, поток, отмена, выгрузка
+│   │   ├── schemas.py       # контракт анализа: аннотации, span/source-проверки, gold-корпус, JSON-схема
+│   │   ├── prompt.py        # версионный prompt: один файл для benchmark и Analyzer, плейсхолдеры {{schema}}/{{case}}
+│   │   ├── versioning.py    # паспорт прогона: версии, git-коммит, машина, тег и digest модели, сравнение с baseline
+│   │   ├── metrics.py       # метрики качества, риска, протокола и ресурсов + отчёт и trade-off
+│   │   ├── memory_policy.py # NORMAL/WARNING/CRITICAL/HARD STOP, резерв памяти, тяжёлый gate (LLM/TTS/Whisper)
+│   │   ├── runner.py        # последовательный прогон моделей: память до запуска, выгрузка, resume, сырые ответы
+│   │   └── fake_client.py   # подставной клиент: тесты и --dry-run без моделей и сети
 │   ├── job_queue.py         # asyncio-очередь с приоритетами, единственный воркер, отмена задач
 │   ├── resource_guard.py    # watchdog по RSS/CPU и проверка заполненности памяти системы
 │   ├── voices_store.py      # CRUD над voices.json и файлами референсов
@@ -2320,12 +2338,17 @@ VOICE_SYNTEZ/
 ├── requirements-denoise.txt # опциональный DeepFilterNet (ставится с --no-deps)
 ├── pytest.ini               # конфиг pytest: ищем тесты в tests/, корень проекта — в pythonpath
 ├── tests/                   # юнит-тесты на движке-заглушке, модели не поднимаются
+├── benchmarks/
+│   └── russian_linguistics/ # Task 1: gold-корпус (339 кейсов), prompt'ы, schema, results/ прогонов (в git не попадают)
 ├── tools/                   # инструменты на живом сервисе и без моделей:
 │   ├── launcher.py          # помощники лаунчера: Python 3.11+, хеш requirements.txt, порт, замок
 │   ├── doctor.py            # самопроверка окружения одной командой (--json), модели не поднимает
 │   ├── smoke.py             # ручной end-to-end сценарий §7 на реальных моделях (--dry-run безопасен)
 │   ├── loadtest.py          # нагрузочный тест живого сервиса
-│   └── memory_check.py      # замер памяти при загрузке и выгрузке движков
+│   ├── memory_check.py      # замер памяти при загрузке и выгрузке движков
+│   ├── build_llm_dataset.py # сборка gold-корпуса русской лингвистики: таблицы → JSONL, spans считает генератор
+│   ├── llm_benchmark.py     # прогон моделей Ollama: --dry-run/--smoke/--full, --resume, схема, thinking, baseline
+│   └── llm_benchmark_report.py # отчёт по сохранённым результатам и выбор primary/fallback с допусками
 ├── VOICE_SYNTEZ.command     # лёгкий лаунчер для macOS: двойной клик из Finder
 └── run.sh
 ```

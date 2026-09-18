@@ -39,7 +39,7 @@
 |---|---|
 | `dataset.v1.jsonl` | сами кейсы, одна строка — один кейс |
 | `schema.json` | схема кейса (по ней валидируется корпус) |
-| `prompts/analyzer.v1.txt` | версионный prompt (общий с production Analyzer) |
+| `prompts/analyzer.v2.txt` | версионный prompt (общий с production Analyzer), v1 оставлен для истории |
 | `expected/analyzer.response.schema.json` | схема ответа модели для Ollama `format` |
 | `expected/summary.json` | счётчики и список кейсов на проверку |
 | `expected/review.md` | список кейсов для проверки человеком до полного прогона |
