@@ -349,6 +349,7 @@ def parse_analysis(
     target_text: str | None = None,
     allowed_types: Iterable[str] = ANNOTATION_TYPES,
     check_schema_version: bool = True,
+    check_spans: bool = True,
 ) -> tuple[LinguisticAnalysis | None, list[str]]:
     """Разбирает и валидирует ответ модели.
 
@@ -356,6 +357,12 @@ def parse_analysis(
     применяется целиком или не применяется вовсе. Это осознанная строгость: одна
     принятая аннотация из сломанного ответа — это изменение пользовательского
     текста без основания.
+
+    `check_spans=False` — режим Analyzer'а: структура и типы проверяются строго, а
+    границы и перекрытия нет, потому что их определяет backend по `source`
+    (benchmark показал, что модели почти не умеют считать символы). Решение о том,
+    что делать с неверными границами, принимает `analyzer.locate_annotations`:
+    найти слово самому или отбросить аннотацию с причиной.
     """
     payload, errors = _extract_json(raw_text)
     if payload is None:
@@ -394,7 +401,7 @@ def parse_analysis(
             errors.append(ERROR_CONFIDENCE_RANGE)
         if not item.source:
             errors.append(ERROR_EMPTY_SOURCE)
-        if target_text is not None:
+        if target_text is not None and check_spans:
             if item.span_start < 0 or item.span_end > len(target_text) or item.span_end <= item.span_start:
                 errors.append(ERROR_SPAN_BOUNDS)
             elif target_text[item.span_start : item.span_end] != item.source:
@@ -402,10 +409,13 @@ def parse_analysis(
         items.append(item)
 
     # Пересекающиеся аннотации — конфликт: неясно, какая из них описывает текст.
-    ordered = sorted(items, key=lambda item: (item.span_start, item.span_end))
-    for previous, current in itertools.pairwise(ordered):
-        if current.span_start < previous.span_end:
-            errors.append(ERROR_OVERLAP)
+    # В режиме Analyzer'а перекрытия разрешает `locate_annotations` по фактическим
+    # позициям слов, поэтому здесь они проверяются только при check_spans.
+    if check_spans:
+        ordered = sorted(items, key=lambda item: (item.span_start, item.span_end))
+        for previous, current in itertools.pairwise(ordered):
+            if current.span_start < previous.span_end:
+                errors.append(ERROR_OVERLAP)
 
     utterance_raw = payload.get("utterance")
     if isinstance(utterance_raw, dict) and set(utterance_raw) - set(UTTERANCE_FIELDS):

@@ -60,6 +60,7 @@ from .job_queue import (
     JobStatus,
     get_queue,
 )
+from .llm import analyzer as llm_analyzer
 from .model_manager import (
     ModelBusyError,
     ModelNotDownloadableError,
@@ -493,6 +494,29 @@ app.mount("/static", StaticFiles(directory=config.FRONTEND_DIR), name="static")
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(config.FRONTEND_DIR / "index.html")
+
+
+@app.get("/api/llm/status")
+async def llm_status() -> dict:
+    """Готовность локального языкового анализатора: без запуска анализа и моделей.
+
+    Отвечает на вопросы интерфейса и диагностики: включён ли Analyzer, доступна ли
+    Ollama, какая модель выбрана (primary или fallback), какие версии prompt/schema.
+    Ручка обязана работать и когда Ollama выключена — иначе дашборд ломался бы
+    вместе с необязательной зависимостью.
+    """
+    return await asyncio.to_thread(llm_analyzer.get_analyzer().status)
+
+
+@app.get("/api/llm/models")
+async def llm_models() -> dict:
+    """Скачанные локальные модели с ролями primary/fallback (для экрана настроек)."""
+    analyzer = llm_analyzer.get_analyzer()
+    return {
+        "models": await asyncio.to_thread(analyzer.models),
+        "selected": analyzer.selected_model(),
+        "settings": analyzer.settings.to_dict(),
+    }
 
 
 @app.get("/api/status")
