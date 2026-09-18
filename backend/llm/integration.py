@@ -1,0 +1,416 @@
+"""Встраивание LLM-анализа в подготовку проекта: кандидаты, сверка, подстатус.
+
+Три задачи этого модуля, и все они про одно: LLM предлагает, backend решает.
+
+1. **Кандидаты.** Разбор превращается в те же кандидаты в словарь, что уже умеет
+   интерфейс (`pronunciation_candidates`), с пометкой источника `llm`. Пользователь
+   видит предложение рядом с предложениями детерминированного слоя и решает сам.
+2. **Сверка с детерминированным слоем (§10).** Если словарь или «ё»-стадия уже
+   дали тот же ответ — это согласие; если дали другой — конфликт, и он уходит в
+   review. Молча предпочесть одну сторону нельзя: обе стороны ошибаются по-своему,
+   а цена ошибки — неверное чтение в озвучке.
+3. **Подстатус проекта (§12).** `DISABLED/PENDING/RUNNING/READY/NEEDS_REVIEW/FAILED`
+   — отдельная ось от готовности текста. Ошибка LLM не ломает проект: детерминированная
+   подготовка остаётся, но пользователь видит, что анализа не было.
+
+Чего здесь нет и не должно быть: записи в словарь. LLM создаёт только кандидата;
+принять его в проектный или глобальный словарь может лишь явное действие человека
+(фаза 6).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+
+from . import memory_policy as memory
+from . import scheduler as scheduler_module
+from . import schemas as s
+from .analysis_cache import AnalysisKey, dictionary_hash, text_hash
+from .analyzer import (
+    STATUS_DISABLED,
+    STATUS_FAILED,
+    STATUS_NEEDS_REVIEW,
+    STATUS_READY,
+    LinguisticAnalyzer,
+    ReplicaAnalysis,
+    build_context,
+    context_hash,
+)
+
+logger = logging.getLogger("tts.llm.integration")
+
+LLM_SOURCE = "llm"
+# Виды согласия с детерминированным слоем (§10): согласие, конфликт, «своего мнения
+# нет». Третье состояние обязательно: чаще всего словарь просто не знает слова, и
+# называть это согласием значило бы врать в интерфейсе.
+AGREEMENT_AGREE = "agree"
+AGREEMENT_CONFLICT = "conflict"
+AGREEMENT_NONE = "none"
+
+# Порядок подстатусов при сведении по репликам: худшее побеждает.
+_STATUS_SEVERITY = {
+    STATUS_DISABLED: 0,
+    STATUS_READY: 1,
+    STATUS_NEEDS_REVIEW: 2,
+    STATUS_FAILED: 3,
+}
+
+
+def llm_candidates(
+    analysis: ReplicaAnalysis,
+    *,
+    replica_index: int,
+    preparation=None,
+) -> list[dict]:
+    """Превращает разбор в кандидаты словаря, не меняя ни текст, ни правила.
+
+    `target` остаётся подсказкой: у омографа это словарная форма чтения, у «ё» —
+    форма с «ё», у имени может быть пустым (тогда пользователь впишет чтение сам).
+    Пустой `target` — не ошибка: кандидат означает «проверьте это слово».
+    """
+    candidates: list[dict] = []
+    for item in analysis.items:
+        opinion, detail = deterministic_opinion(item, preparation)
+        reason = item.meaning or item.reason_code or item.type
+        candidates.append(
+            {
+                "word": item.source,
+                "target": item.suggested_form,
+                "kind": f"{LLM_SOURCE}_{item.type}",
+                "reason": reason,
+                "alternatives": [],
+                "confidence": item.confidence,
+                # Поля ниже нужны интерфейсу и review, а детерминированным
+                # кандидатам они не нужны — там нет модели и её уверенности.
+                "source": LLM_SOURCE,
+                "type": item.type,
+                "meaning": item.meaning,
+                "needs_review": bool(item.needs_review),
+                "reason_code": item.reason_code,
+                "span_start": item.span_start,
+                "span_end": item.span_end,
+                "replica_index": replica_index,
+                "agreement": opinion,
+                "agreement_detail": detail,
+                "model_tag": analysis.model_tag,
+                "model_digest": analysis.model_digest,
+            }
+        )
+    for dropped in analysis.dropped:
+        # Отброшенные аннотации тоже показываем: «модель предложила слово, которого
+        # нет в тексте» — это диагностика, а не тишина.
+        candidates.append(
+            {
+                "word": str(dropped.get("source") or ""),
+                "target": "",
+                "kind": f"{LLM_SOURCE}_dropped",
+                "reason": f"предложение отброшено: {dropped.get('reason', '')}",
+                "alternatives": [],
+                "confidence": None,
+                "source": LLM_SOURCE,
+                "type": str(dropped.get("type") or ""),
+                "meaning": "",
+                "needs_review": True,
+                "reason_code": str(dropped.get("reason") or ""),
+                "span_start": None,
+                "span_end": None,
+                "replica_index": replica_index,
+                "agreement": AGREEMENT_NONE,
+                "agreement_detail": "",
+                "model_tag": analysis.model_tag,
+                "model_digest": analysis.model_digest,
+            }
+        )
+    return candidates
+
+
+def deterministic_opinion(item: s.Annotation, preparation) -> tuple[str, str]:
+    """Что об этом слове думает детерминированный слой (§10).
+
+    Сравниваются только те решения, которые уже приняты в подготовке: правило
+    словаря (`dictionary_matches`) и восстановленная «ё» (стадия `yo_text`). Ничего
+    не пересчитывается: второй расчёт мог бы разойтись с тем, что уйдёт в модель.
+    """
+    if preparation is None:
+        return AGREEMENT_NONE, ""
+    word = item.source
+    for match in getattr(preparation, "dictionary_matches", []) or []:
+        source = str(match.get("source") or "")
+        if not source or source.lower() != word.lower():
+            continue
+        target = str(match.get("target") or "")
+        if item.suggested_form and target and _same_reading(item.suggested_form, target):
+            return AGREEMENT_AGREE, f"словарь проекта/глобальный: «{source}» → «{target}»"
+        if target:
+            return AGREEMENT_CONFLICT, f"словарь даёт «{target}», модель — «{item.suggested_form}»"
+    if item.type == s.TYPE_YO:
+        yo_text = getattr(preparation, "yo_text", "") or ""
+        source_text = getattr(preparation, "source_text", "") or ""
+        if yo_text and source_text and item.suggested_form:
+            # «Ё»-стадия уже восстановила эту форму — значит модель подтверждает
+            # детерминированный результат, а не спорит с ним.
+            if item.suggested_form.lower() in yo_text.lower() and item.source.lower() not in yo_text.lower():
+                return AGREEMENT_AGREE, "«ё» восстановлена детерминированной стадией"
+            if item.source.lower() in yo_text.lower():
+                return AGREEMENT_CONFLICT, "«ё»-стадия оставила «е» как есть"
+    return AGREEMENT_NONE, ""
+
+
+def _same_reading(left: str, right: str) -> bool:
+    """Совпадают ли чтения: слово и место ударения.
+
+    Сравнивать «просто слова» нельзя: в проекте ударение кодируется знаком `+` перед
+    ударной гласной, и `зам+ок` (запор) отличается от `з+амок` (строение) только
+    позицией знака. Поэтому оба написания приводятся к паре «слово + индекс ударной
+    гласной»: `+` перед гласной и комбинирующий акут после неё (так пишет RUAccent)
+    дают один и тот же индекс. Если ударение не указано ни с одной стороны, слова
+    считаются совпадающими: у словаря просто нет мнения о месте ударения.
+    """
+    left_word, left_stress = _reading_key(left)
+    right_word, right_stress = _reading_key(right)
+    if left_word != right_word:
+        return False
+    if left_stress is None or right_stress is None:
+        return True
+    return left_stress == right_stress
+
+
+def _reading_key(text: str) -> tuple[str, int | None]:
+    """Слово и индекс ударной гласной (None — ударение не указано)."""
+    stress: int | None = None
+    plus = text.find("+")
+    word = text.replace("+", "")
+    if plus >= 0:
+        stress = plus
+    acute = word.find("\u0301")
+    if acute >= 0:
+        stress = acute - 1
+        word = word.replace("\u0301", "")
+    return word.strip().lower(), stress
+
+
+def merge_preparation_candidates(preparation, extra: Sequence[dict]):
+    """Добавляет LLM-кандидатов к детерминированным, не трогая стадии текста.
+
+    Детерминированные кандидаты идут первыми: они воспроизводимы и не зависят от
+    модели, поэтому в интерфейсе их видно раньше предложений LLM.
+    """
+    from dataclasses import replace as _replace
+
+    existing = list(getattr(preparation, "pronunciation_candidates", []) or [])
+    return _replace(preparation, pronunciation_candidates=existing + list(extra))
+
+
+def worst_status(statuses: Iterable[str], *, enabled: bool) -> str:
+    """Сводит подстатусы реплик в один статус проекта: худшее побеждает."""
+    if not enabled:
+        return STATUS_DISABLED
+    worst = STATUS_READY
+    for status in statuses:
+        if _STATUS_SEVERITY.get(status, 0) > _STATUS_SEVERITY.get(worst, 0):
+            worst = status
+    return worst
+
+
+@dataclass
+class ProjectAnalysisOutcome:
+    """Итог LLM-прохода по проекту: разборы, подстатус и что было с кешем."""
+
+    status: str
+    model_tag: str = ""
+    model_digest: str = ""
+    analyses: dict[int, ReplicaAnalysis] = field(default_factory=dict)
+    seconds: float = 0.0
+    error: str = ""
+    from_cache: int = 0
+    calls: int = 0
+    blocked_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "model_tag": self.model_tag,
+            "model_digest": self.model_digest,
+            "replicas": len(self.analyses),
+            "from_cache": self.from_cache,
+            "calls": self.calls,
+            "seconds": round(self.seconds, 3),
+            "error": self.error,
+            "blocked_reason": self.blocked_reason,
+        }
+
+
+class ProjectLlmAnalyzer:
+    """LLM-проход по репликам проекта: кеш, слот, анализ, подстатус.
+
+    Класс не знает про SQLite и FastAPI: кеш приходит двумя функциями
+    (`lookup`/`save`), слот — планировщиком, модель — анализатором. Так его можно
+    проверить без базы и без модели, а политику хранения менять отдельно.
+    """
+
+    def __init__(
+        self,
+        *,
+        analyzer: LinguisticAnalyzer | None = None,
+        scheduler: scheduler_module.HeavyScheduler | None = None,
+        lookup: Callable[[int, AnalysisKey], ReplicaAnalysis | None] | None = None,
+        save: Callable[[int, ReplicaAnalysis], None] | None = None,
+        model_size_gb: float | None = None,
+        clock=time.monotonic,
+    ) -> None:
+        self.analyzer = analyzer or LinguisticAnalyzer()
+        self.scheduler = scheduler or scheduler_module.get_scheduler()
+        self._lookup = lookup
+        self._save = save
+        self.model_size_gb = model_size_gb
+        self.clock = clock
+
+    def run(
+        self,
+        *,
+        project_id: str,
+        replicas: Sequence[Mapping[str, object]],
+        rules: Sequence[Mapping[str, object]] = (),
+        on_progress: Callable[[str], None] | None = None,
+    ) -> ProjectAnalysisOutcome:
+        """Анализирует реплики проекта: кеш → слот → модель → сохранение.
+
+        Если Analyzer выключен, ничего не делается: `DISABLED` — честный статус, а
+        не «тихо пропустили». Если память или слот не дают начать, разбор не
+        подменяется детерминированным результатом: статус `FAILED` с причиной.
+        """
+        settings = self.analyzer.settings
+        if not settings.enabled:
+            return ProjectAnalysisOutcome(status=STATUS_DISABLED)
+        report = on_progress or (lambda message: logger.info("%s", message))
+        started = self.clock()
+        rules_digest = dictionary_hash(rules)
+        texts = [str(row.get("text") or "") for row in replicas]
+        analyses: dict[int, ReplicaAnalysis] = {}
+        from_cache = 0
+        calls = 0
+        model_tag = ""
+        digest = ""
+
+        # Слот берётся на весь проход: держать модель загруженной между репликами
+        # дешевле, чем грузить её заново на каждую, а параллельно с синтезом она
+        # всё равно работать не должна (§14.2).
+        try:
+            with self.scheduler.hold(
+                memory.HEAVY_LLM,
+                model_size_gb=self.model_size_gb,
+                owner=f"analysis:{project_id}",
+            ):
+                for position, row in enumerate(replicas):
+                    index = int(row.get("index") or position)
+                    target = texts[position]
+                    context = build_context(
+                        target,
+                        texts[max(0, position - settings.context_replicas) : position],
+                        texts[position + 1 : position + 1 + settings.context_replicas],
+                        limit=settings.context_replicas,
+                        budget_chars=settings.context_chars,
+                    )
+                    key = AnalysisKey(
+                        source_text_hash=text_hash(target),
+                        context_hash=context_hash(context),
+                        dictionary_hash=rules_digest,
+                        # Digest модели ещё не известен до первого ответа: кеш по
+                        # нему проверяется на втором проходе, а здесь он берётся из
+                        # уже сохранённого разбора при поиске.
+                        model_digest=digest,
+                        prompt_version=self.analyzer.prompt.version,
+                        schema_version=s.SCHEMA_VERSION,
+                    )
+                    cached = self._lookup_analysis(index, key) if self._lookup else None
+                    if cached is not None:
+                        analyses[index] = cached
+                        from_cache += 1
+                        model_tag = model_tag or cached.model_tag
+                        digest = digest or cached.model_digest
+                        continue
+                    analysis = self.analyzer.analyze_replica(
+                        replica_id=int(row.get("replica_id") or 0) or index + 1,
+                        target_text=target,
+                        before=context["context_before"],
+                        after=context["context_after"],
+                        dictionary_digest=rules_digest,
+                    )
+                    calls += 1
+                    analyses[index] = analysis
+                    model_tag = analysis.model_tag or model_tag
+                    digest = analysis.model_digest or digest
+                    if self._save is not None and analysis.status in (
+                        STATUS_READY,
+                        STATUS_NEEDS_REVIEW,
+                    ):
+                        self._save(index, analysis)
+        except scheduler_module.HeavyBlockedError as exc:
+            # Не «продолжим без LLM»: пользователь обязан увидеть, что анализа не
+            # было, и повторить его позже.
+            report(f"LLM-анализ не запущен: {exc}")
+            return ProjectAnalysisOutcome(
+                status=STATUS_FAILED,
+                analyses=analyses,
+                seconds=self.clock() - started,
+                error=str(exc),
+                blocked_reason=exc.decision.memory_reason or str(exc),
+                from_cache=from_cache,
+                calls=calls,
+            )
+        except Exception as exc:  # noqa: BLE001 — LLM не должна ронять подготовку
+            logger.warning("LLM-анализ проекта %s не удался: %s", project_id, exc)
+            return ProjectAnalysisOutcome(
+                status=STATUS_FAILED,
+                analyses=analyses,
+                seconds=self.clock() - started,
+                error=f"{type(exc).__name__}: {exc}",
+                from_cache=from_cache,
+                calls=calls,
+            )
+
+        status = worst_status((item.status for item in analyses.values()), enabled=True)
+        if not analyses:
+            status = STATUS_READY
+        return ProjectAnalysisOutcome(
+            status=status,
+            model_tag=model_tag,
+            model_digest=digest,
+            analyses=analyses,
+            seconds=self.clock() - started,
+            from_cache=from_cache,
+            calls=calls,
+        )
+
+    def _lookup_analysis(self, index: int, key: AnalysisKey) -> ReplicaAnalysis | None:
+        """Поиск в кеше с учётом digest модели: он известен из прошлого разбора.
+
+        Ключ поиска требует digest, но до первого ответа его взять неоткуда. Поэтому
+        поиск идёт в два шага: сначала по входу без digest (модель та же, что была),
+        и результат принимается, только если сохранённый digest совпал с текущей
+        выбранной моделью.
+        """
+        if self._lookup is None:
+            return None
+        current = self._analyzer_digest()
+        candidate_key = AnalysisKey(
+            source_text_hash=key.source_text_hash,
+            context_hash=key.context_hash,
+            dictionary_hash=key.dictionary_hash,
+            model_digest=current,
+            prompt_version=key.prompt_version,
+            schema_version=key.schema_version,
+        )
+        return self._lookup(index, candidate_key)
+
+    def _analyzer_digest(self) -> str:
+        try:
+            model = self.analyzer.selected_model()
+            info = self.analyzer.client.model_info(model)
+        except Exception as exc:  # noqa: BLE001 — паспорт модели не критичен
+            logger.debug("Не удалось прочитать digest модели: %s", exc)
+            return ""
+        return info.digest if info is not None else ""

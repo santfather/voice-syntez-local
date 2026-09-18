@@ -30,6 +30,11 @@ def _row_to_project(row: sqlite3.Row, replicas: int = 0) -> dict:
         "analysis_error": row["analysis_error"],
         "analysis_started_at": row["analysis_started_at"],
         "analysis_finished_at": row["analysis_finished_at"],
+        # Подстатус LLM-анализа (Task 2): отдельная ось, см. миграцию 8.
+        "llm_analysis_status": row["llm_analysis_status"],
+        "llm_analysis_model": row["llm_analysis_model"],
+        "llm_analysis_error": row["llm_analysis_error"],
+        "llm_analysis_updated_at": row["llm_analysis_updated_at"],
         "replicas_count": replicas,
     }
 
@@ -131,6 +136,12 @@ class ProjectsRepository:
             "analysis_error",
             "analysis_started_at",
             "analysis_finished_at",
+            # Подстатус LLM пишется только через `store`: он обязан меняться
+            # согласованно с сохранёнными разборами и статусом подготовки.
+            "llm_analysis_status",
+            "llm_analysis_model",
+            "llm_analysis_error",
+            "llm_analysis_updated_at",
         }
         values: dict[str, object] = {}
         for key, value in fields.items():

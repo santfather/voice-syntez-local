@@ -61,8 +61,10 @@ from .job_queue import (
     get_queue,
 )
 from .llm import analyzer as llm_analyzer
+from .llm import integration as llm_integration
 from .llm import memory_policy as llm_memory
 from .llm import scheduler as llm_scheduler
+from .llm import schemas as llm_schemas
 from .model_manager import (
     ModelBusyError,
     ModelNotDownloadableError,
@@ -2306,6 +2308,31 @@ def _invalidate_for_rule(rule: PronunciationRule, *, project_id: str | None) -> 
     return affected
 
 
+def _llm_analyzer_for(project_id: str):
+    """LLM-проход по проекту с кешем из базы: один объект на вызов анализа.
+
+    Кеш подключается функциями стора, а не SQL внутри анализатора: транзакции живут
+    в одном месте (`store`), а планировка «что и когда считать» — здесь.
+    """
+    store = get_projects_store()
+
+    def lookup(index: int, key) -> "llm_analyzer.ReplicaAnalysis | None":
+        """Действительный разбор из кеша или None.
+
+        Кеш возвращает не только разбор, но и причину отказа (`CacheLookup`):
+        причина нужна интерфейсу, а интегратору — только сам разбор.
+        """
+        found = store.lookup_llm_analysis(project_id, index, key)
+        return found.analysis if found.hit else None
+
+    return llm_integration.ProjectLlmAnalyzer(
+        analyzer=llm_analyzer.get_analyzer(),
+        scheduler=llm_scheduler.get_scheduler(),
+        lookup=lookup,
+        save=lambda index, analysis: store.save_llm_analysis(project_id, index, analysis),
+    )
+
+
 def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool | None):
     """Готовит реплики проекта каноническим проходом — без синтеза и моделей.
 
@@ -2324,11 +2351,41 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
         else project["render_settings"].get("auto_accent", True)
     )
     wanted = None if indexes is None else {int(index) for index in indexes}
+    selected = [
+        row
+        for row in project["replicas"]
+        if wanted is None or int(row["index"]) in wanted
+    ]
+
+    # LLM-проход идёт по той же выборке реплик, что и подготовка: если пользователь
+    # пересчитывает одну реплику, модель читает контекст соседей, но разбор
+    # сохраняется только для выбранных.
+    llm_outcome = None
+    if llm_analyzer.get_analyzer().settings.enabled:
+        llm_outcome = _llm_analyzer_for(project["id"]).run(
+            project_id=project["id"],
+            replicas=[
+                {"index": int(row["index"]), "text": row["text"], "replica_id": int(row["id"])}
+                for row in selected
+            ],
+            rules=rules,
+        )
+        get_projects_store().set_llm_analysis_state(
+            project["id"],
+            status=llm_outcome.status,
+            model_tag=llm_outcome.model_tag,
+            error=llm_outcome.error or llm_outcome.blocked_reason,
+        )
+    else:
+        # Выключенный анализатор — это тоже состояние проекта, а не отсутствие поля:
+        # интерфейс должен сказать «выкл», а не «неизвестно».
+        get_projects_store().set_llm_analysis_state(
+            project["id"], status=llm_analyzer.STATUS_DISABLED
+        )
+
     preparations = []
-    for row in project["replicas"]:
+    for row in selected:
         index = int(row["index"])
-        if wanted is not None and index not in wanted:
-            continue
         replica = Replica(
             voice=row["speaker"],
             text=row["text"],
@@ -2338,11 +2395,19 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
         )
         voice = _effective_voice(project, row, voices)
         speaker = speakers.get(row["speaker"]) or SpeakerSettings()
-        preparations.append(
-            project_analysis.prepare_replica(
-                replica, speaker, voice, index=index, rules=rules, auto_accent=enabled
-            )
+        preparation = project_analysis.prepare_replica(
+            replica, speaker, voice, index=index, rules=rules, auto_accent=enabled
         )
+        if llm_outcome is not None and index in llm_outcome.analyses:
+            # Кандидаты LLM добавляются к детерминированным, но стадии текста не
+            # трогаются: модель ничего не применяет, только предлагает.
+            candidates = llm_integration.llm_candidates(
+                llm_outcome.analyses[index], replica_index=index, preparation=preparation
+            )
+            preparation = llm_integration.merge_preparation_candidates(
+                preparation, candidates
+            )
+        preparations.append(preparation)
     return project_analysis.summarize(preparations)
 
 
@@ -2410,6 +2475,64 @@ async def analyze_project(project_id: str, payload: ProjectAnalyzeRequest | None
     return response
 
 
+def _llm_candidates_of(project: dict) -> list[dict]:
+    """Кандидаты LLM из сохранённой подготовки: отдельный список для review."""
+    return [
+        {**candidate, "replica_index": int(row["index"])}
+        for row in project["replicas"]
+        for candidate in (row.get("pronunciation_candidates") or [])
+        if candidate.get("source") == llm_integration.LLM_SOURCE
+    ]
+
+
+@app.get("/api/projects/{project_id}/linguistic-analysis")
+async def project_linguistic_analysis(project_id: str) -> dict:
+    """Состояние лингвистического анализа LLM: только чтение, без запуска модели.
+
+    Отдаёт подстатус (§12), модель, причину отказа и кандидатов с пометкой
+    согласия/конфликта с детерминированным слоем. Интерфейсу этого достаточно, чтобы
+    показать блок «Лингвистический анализ» и объяснить, почему рендер ждёт.
+    """
+    project = _project_or_404(project_id)
+    analyzer = llm_analyzer.get_analyzer()
+    candidates = _llm_candidates_of(project)
+    return {
+        "project_id": project_id,
+        "status": project.get("llm_analysis_status") or llm_analyzer.STATUS_DISABLED,
+        "model": project.get("llm_analysis_model") or "",
+        "error": project.get("llm_analysis_error") or "",
+        "updated_at": project.get("llm_analysis_updated_at"),
+        "enabled": analyzer.settings.enabled,
+        "required_for_render": analyzer.settings.required_for_render,
+        "primary_model": analyzer.settings.primary_model,
+        "fallback_model": analyzer.settings.fallback_model,
+        "prompt_version": analyzer.prompt.version,
+        "schema_version": llm_schemas.SCHEMA_VERSION,
+        "candidates_total": len(candidates),
+        "needs_review_total": sum(1 for item in candidates if item.get("needs_review")),
+        "conflicts_total": sum(
+            1 for item in candidates if item.get("agreement") == llm_integration.AGREEMENT_CONFLICT
+        ),
+        "candidates": candidates,
+    }
+
+
+@app.post("/api/projects/{project_id}/linguistic-analysis")
+async def run_project_linguistic_analysis(
+    project_id: str, payload: ProjectAnalyzeRequest | None = None
+) -> dict:
+    """Запускает лингвистический анализ проекта.
+
+    Это **тот же** канонический проход, что и `/analyze` (детерминированная
+    подготовка + LLM-разбор в одном месте): отдельный «второй pipeline» для LLM
+    запрещён постановкой, и разойдись они — модель анализировала бы не тот текст,
+    который уходит в синтез.
+    """
+    response = await analyze_project(project_id, payload)
+    response["llm"] = await project_linguistic_analysis(project_id)
+    return response
+
+
 @app.get("/api/projects/{project_id}/analysis")
 async def project_analysis_state(project_id: str) -> dict:
     """Состояние подготовки проекта без пересчёта: что готово, что требует решения.
@@ -2424,11 +2547,17 @@ async def project_analysis_state(project_id: str) -> dict:
         for row in replicas
         for candidate in (row.get("pronunciation_candidates") or [])
     ]
+    llm_candidates = _llm_candidates_of(project)
     return {
         "project_id": project_id,
         "status": project["analysis_status"],
         "analysis_version": project["analysis_version"],
         "analysis_error": project["analysis_error"],
+        "llm_status": project.get("llm_analysis_status") or llm_analyzer.STATUS_DISABLED,
+        "llm_model": project.get("llm_analysis_model") or "",
+        "llm_error": project.get("llm_analysis_error") or "",
+        "llm_candidates_total": len(llm_candidates),
+        "llm_needs_review_total": sum(1 for item in llm_candidates if item.get("needs_review")),
         "analysis_started_at": project["analysis_started_at"],
         "analysis_finished_at": project["analysis_finished_at"],
         "replicas_total": len(replicas),
@@ -2481,6 +2610,22 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
     if missing:
         names = ", ".join(f"«{key}»" for key in missing)
         raise HTTPException(status_code=400, detail=f"Не назначен голос для: {names}")
+
+    analyzer = llm_analyzer.get_analyzer()
+    if analyzer.settings.enabled and analyzer.settings.required_for_render:
+        llm_status = project.get("llm_analysis_status") or llm_analyzer.STATUS_DISABLED
+        if llm_status != llm_analyzer.STATUS_READY:
+            # Никакого тихого перехода в детерминированный режим: проект настроен на
+            # обязательный анализ, значит пользователь должен увидеть причину и
+            # решить её (повторить анализ или разобрать предложения).
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Лингвистический анализ обязателен перед рендером, "
+                    f"но его состояние — {llm_status}. "
+                    + (project.get("llm_analysis_error") or "")
+                ).strip(),
+            )
 
     status = project["analysis_status"]
     if status != config.PROJECT_ANALYSIS_READY:

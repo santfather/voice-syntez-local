@@ -244,6 +244,17 @@ CREATE INDEX IF NOT EXISTS idx_llm_analyses_project ON llm_analyses(project_id, 
 CREATE INDEX IF NOT EXISTS idx_llm_analyses_status ON llm_analyses(status);
 """
 
+# Подстатус LLM-анализа живёт рядом с подготовкой текста, но отдельной осью: без него
+# интерфейс не смог бы отличить «подготовлено детерминированно» от «LLM ещё не
+# смотрела» и «LLM нашла спорное». Модель и digest хранятся здесь же: результат
+# анализа нельзя трактовать, не зная, чей он.
+_MIGRATION_8 = """
+ALTER TABLE projects ADD COLUMN llm_analysis_status TEXT NOT NULL DEFAULT 'DISABLED';
+ALTER TABLE projects ADD COLUMN llm_analysis_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN llm_analysis_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN llm_analysis_updated_at TEXT;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -252,6 +263,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
     (7, _MIGRATION_7),
+    (8, _MIGRATION_8),
 )
 
 

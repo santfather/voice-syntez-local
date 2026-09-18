@@ -22,6 +22,7 @@ from .repositories.replicas import ReplicasRepository
 from .repositories.takes import TakesRepository
 
 if TYPE_CHECKING:  # pragma: no cover — только для аннотаций
+    from ..llm.analysis_cache import AnalysisKey, CacheLookup
     from ..llm.analyzer import ReplicaAnalysis
 
 
@@ -473,6 +474,44 @@ class ProjectsStore:
             return AnalysisCache(LlmAnalysesRepository(connection)).save(
                 project_id, replica_index, analysis
             )
+
+    def lookup_llm_analysis(
+        self, project_id: str, replica_index: int, key: "AnalysisKey"
+    ) -> "CacheLookup":
+        """Ищет действительный разбор реплики: сравнение входа целиком (§18)."""
+        from ..llm.analysis_cache import AnalysisCache, CacheLookup
+
+        with transaction() as connection:
+            return AnalysisCache(LlmAnalysesRepository(connection)).lookup(
+                project_id, replica_index, key
+            )
+
+    def set_llm_analysis_state(
+        self,
+        project_id: str,
+        *,
+        status: str,
+        model_tag: str = "",
+        error: str = "",
+    ) -> dict:
+        """Пишет подстатус LLM-анализа проекта (Task 2 §12).
+
+        Отдельный метод, а не прямой `update_project`: подстатус обязан меняться
+        согласованно с сохранёнными разборами, и это должно быть видно в одном
+        месте, а не собираться из нескольких вызовов в обработчике запроса.
+        """
+        with transaction() as connection:
+            projects = ProjectsRepository(connection)
+            if projects.get(project_id) is None:
+                raise KeyError(project_id)
+            projects.update(
+                project_id,
+                llm_analysis_status=status,
+                llm_analysis_model=model_tag,
+                llm_analysis_error=error,
+                llm_analysis_updated_at=_now_iso(),
+            )
+        return self.get_project(project_id)  # type: ignore[return-value]
 
     def mark_llm_analyses_stale(
         self, project_id: str, indexes: list[int] | None = None
