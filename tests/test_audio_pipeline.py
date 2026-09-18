@@ -277,12 +277,16 @@ def test_render_dialogue_aborts_between_replicas(stub, fake_store):
 
 
 def test_synthesize_replica_returns_seed_and_prepared_chunk(stub, fake_store):
-    prepared, seed, qa, quality, short_run = asyncio.run(
+    prepared, seed, qa, quality, short_run, reference = asyncio.run(
         audio_pipeline.synthesize_replica(_replica(), _speaker(), RenderSettings(), 0)
     )
     assert isinstance(seed, int)
     assert qa is None  # проверка выключена — отметки нет
     assert short_run is None  # слой коротких реплик не запрашивали
+    # Референс едет вместе с куском: пересинтез обязан записать в метаданные
+    # варианта, каким профилем получено это звучание (UPDATE 2 §12).
+    assert reference.profile_id.endswith("-neutral")
+    assert reference.resolved_emotion == "NEUTRAL"
     assert prepared.dtype == np.float32
     assert _rms(prepared) == pytest.approx(config.DEFAULT_TARGET_RMS, abs=0.002)
     # Диагностика едет вместе с куском: у вызывающего сырого выхода модели нет.

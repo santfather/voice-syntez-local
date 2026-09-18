@@ -1978,7 +1978,7 @@ async def synthesize_replica(
         "Реплика %s (%s) пересинтезирована: %.2f c аудио, сид %s",
         index + 1, replica.label, prepared.size / SAMPLE_RATE, seed,
     )
-    return prepared, seed, qa_outcome, quality, short_run
+    return prepared, seed, qa_outcome, quality, short_run, reference
 
 
 async def synthesize_take(

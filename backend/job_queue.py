@@ -1126,6 +1126,18 @@ class JobQueue:
         job.message = f"{title}{where}"
 
     @staticmethod
+    def _reference_parameters(reference) -> dict:
+        """Паспорт референса для метаданных варианта (§12)."""
+        if reference is None:
+            return {}
+        return {
+            "reference_profile_id": reference.profile_id,
+            "reference_emotion": reference.resolved_emotion,
+            "reference_fallback_used": reference.fallback_used,
+            "emotion_requested": reference.requested_emotion,
+        }
+
+    @staticmethod
     def _reference_dict(result: audio_pipeline.RenderResult, index: int) -> dict:
         """Паспорт референса варианта: профиль, эмоция, был ли откат.
 
@@ -1412,7 +1424,7 @@ class JobQueue:
             await self._keep_current(job, task.index, job.payload.settings, job.output_path)
             if self._cancelled(job.id):
                 raise audio_pipeline.JobCancelledError("Отменено до синтеза")
-            prepared, seed, qa_outcome, quality, short_run = (
+            prepared, seed, qa_outcome, quality, short_run, _reference = (
                 await audio_pipeline.synthesize_replica(
                     replica=replica,
                     speaker=speaker,
@@ -1542,7 +1554,7 @@ class JobQueue:
             # Реплика помечается занятой до передачи воркеру: после падения видно,
             # какую именно реплику собирали (creash_report §7).
             self._set_replica_status(task.project_id, task.index, config.REPLICA_STATUS_RENDERING)
-            prepared, seed, qa_outcome, quality, short_run = (
+            prepared, seed, qa_outcome, quality, short_run, reference = (
                 await audio_pipeline.synthesize_replica(
                     replica=task.replica,
                     speaker=speaker,
@@ -1580,6 +1592,10 @@ class JobQueue:
                     "parameters": {
                         **audio_pipeline.chunk_parameters(task.replica, speaker),
                         **(self._short_plan_dict(short_run) or {}),
+                        # Паспорт варианта: с каким референсом и эмоцией он получен.
+                        # Без этого после смены эмоции реплики нельзя понять, чем
+                        # один вариант отличается от другого (UPDATE 2 §12).
+                        **(self._reference_parameters(reference)),
                     },
                     "duration_sec": variant.duration_sec,
                     "qa": qa_outcome.to_dict() if qa_outcome is not None else None,
