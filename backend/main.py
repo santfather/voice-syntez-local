@@ -1572,6 +1572,53 @@ async def generate(payload: GenerateRequest) -> dict:
     return {"job_id": job.id, "status": job.status.value, "total_replicas": job.total_replicas}
 
 
+def _analyze_text_chunks(text: str, chunks: list[str]) -> dict:
+    """Лингвистический анализ сплошного текста тем же Analyzer'ом, что и диалог.
+
+    Проект для этого не создаётся: у сплошного текста его нет, а разбору нужен лишь
+    стабильный ключ кеша — им становится хеш текста. Результат **не применяется** к
+    тексту: аннотации только показываются в ответе (и участвуют в review через
+    словарь), потому что применять предложения модели без решения человека нельзя.
+    """
+    analyzer = llm_analyzer.get_analyzer()
+    if not analyzer.settings.enabled:
+        return {"status": llm_analyzer.STATUS_DISABLED, "candidates_total": 0}
+    key = f"text-{llm_analyzer.text_hash(text)}"
+    store = get_projects_store()
+
+    def lookup(index: int, cache_key):
+        found = store.lookup_llm_analysis(key, index, cache_key)
+        return found.analysis if found.hit else None
+
+    outcome = llm_integration.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=llm_scheduler.get_scheduler(),
+        lookup=lookup,
+        save=lambda index, analysis: store.save_llm_analysis(key, index, analysis),
+    ).run(
+        project_id=key,
+        replicas=[{"index": index, "text": chunk} for index, chunk in enumerate(chunks)],
+    )
+    report = outcome.to_dict()
+    report["candidates"] = [
+        candidate
+        for index in sorted(outcome.analyses)
+        for candidate in llm_integration.llm_candidates(
+            outcome.analyses[index], replica_index=index
+        )
+    ]
+    report["candidates_total"] = len(report["candidates"])
+    report["needs_review_total"] = sum(
+        1 for item in report["candidates"] if item["needs_review"]
+    )
+    if analyzer.settings.required_for_render and outcome.status != llm_analyzer.STATUS_READY:
+        report["required_block"] = (
+            "Лингвистический анализ обязателен перед рендером, но его состояние — "
+            f"{outcome.status}. " + (outcome.error or outcome.blocked_reason or "")
+        ).strip()
+    return report
+
+
 @app.post("/api/render-text", status_code=202)
 async def render_text(payload: RenderTextRequest) -> dict:
     """Озвучка сплошного текста одним голосом — без спикеров и маркеров."""
@@ -1587,6 +1634,10 @@ async def render_text(payload: RenderTextRequest) -> dict:
     chunks = split_into_chunks(text, config.chunk_chars(payload.chunk_strategy))
     if not chunks:
         raise HTTPException(status_code=400, detail="Текст пуст — нечего озвучивать")
+
+    llm_report = _analyze_text_chunks(text, chunks)
+    if llm_report.get("required_block"):
+        raise HTTPException(status_code=409, detail=llm_report["required_block"])
 
     job_payload = JobPayload(
         replicas=[
@@ -1608,7 +1659,12 @@ async def render_text(payload: RenderTextRequest) -> dict:
         job = get_queue().submit(job_payload, priority=priority)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"job_id": job.id, "status": job.status.value, "total_replicas": job.total_replicas}
+    return {
+        "job_id": job.id,
+        "status": job.status.value,
+        "total_replicas": job.total_replicas,
+        "llm": llm_report,
+    }
 
 
 # --- сравнение движков --------------------------------------------------------

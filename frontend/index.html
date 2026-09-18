@@ -211,6 +211,18 @@
           <div class="alert error" id="analyze-error"></div>
           <div id="prepare-summary" class="prepare-summary" hidden></div>
 
+          <!-- Лингвистический анализ локальной LLM: отдельная ось от готовности
+               текста. Показываем состояние, модель и предложения с решениями;
+               при выключенном Analyzer'е блок честно говорит «выкл». -->
+          <div id="llm-panel" class="review-panel" hidden>
+            <div class="row between">
+              <span class="muted">Лингвистический анализ</span>
+              <span class="badge" id="llm-badge">—</span>
+            </div>
+            <div class="muted" id="llm-state"></div>
+            <div id="llm-list"></div>
+          </div>
+
           <!-- Предложения для словаря: неоднозначные слова, которые нельзя
                разрешать молча. Пока они не подтверждены или не пропущены,
                проект не станет готовым, и синтез останется недоступным. -->
@@ -538,6 +550,16 @@
             небольшой сброс темпа — это свойство блочной генерации.
           </p>
           <div class="alert error" id="text-error"></div>
+
+          <!-- Тот же лингвистический анализ, что в диалоге: один backend Analyzer
+               на обе вкладки, дублирования логики во фронтенде нет. -->
+          <div id="text-llm-panel" class="review-panel" hidden>
+            <div class="row between">
+              <span class="muted">Лингвистический анализ</span>
+              <span class="badge" id="text-llm-badge">—</span>
+            </div>
+            <div class="muted" id="text-llm-state"></div>
+          </div>
         </div>
       </section>
 

@@ -520,3 +520,55 @@ def test_llm_candidates_respect_rejected_dictionary_memory(llm_env, voices, stub
         "повторно спрашивать про отклонённое слово нельзя"
     )
     assert state["needs_review_total"] == 0
+
+
+def test_continuous_text_uses_same_analyzer(llm_env, voices, stub, monkeypatch):
+    """Сплошной текст анализируется тем же Analyzer'ом и не создаёт проект.
+
+    Второй вкладке нужен тот же разбор, что и диалогу: иначе «Сплошной текст» тихо
+    оставался бы без лингвистического анализа, а постановка требует общего пути.
+    При этом текст **не меняется**: аннотации только показываются, применять их без
+    решения человека нельзя.
+    """
+    client = llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            response = await api.post(
+                "/api/render-text",
+                json={
+                    "text": "Мы гуляли вокруг старого замка на холме.",
+                    "voice_id": F5_VOICE,
+                    "engine": "f5",
+                },
+            )
+            assert response.status_code == 202, response.text
+            projects = (await api.get("/api/projects")).json()["projects"]
+            return {"body": response.json(), "projects": projects}
+
+    result = asyncio.run(scenario())
+    report = result["body"]["llm"]
+    assert report["status"] in {llm.STATUS_READY, llm.STATUS_NEEDS_REVIEW}
+    assert report["candidates_total"] >= 1
+    assert report["candidates"][0]["source"] == "llm"
+    assert result["projects"] == [], "сплошной текст не создаёт проект"
+    assert len(client.calls) > 0
+
+
+def test_continuous_text_skips_analysis_when_disabled(llm_env, voices, stub, monkeypatch):
+    """Выключенный Analyzer: сплошной текст рендерится как раньше, без модели."""
+    client = llm_env(enabled=False)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            response = await api.post(
+                "/api/render-text",
+                json={"text": "Сегодня хорошая погода.", "voice_id": F5_VOICE, "engine": "f5"},
+            )
+            assert response.status_code == 202, response.text
+            return response.json()
+
+    body = asyncio.run(scenario())
+    assert body["llm"]["status"] == llm.STATUS_DISABLED
+    assert client.calls == []
+    assert body["job_id"]

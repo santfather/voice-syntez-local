@@ -18,6 +18,7 @@ const state = {
   replicaTimer: null,
   takeKey: null,       // "индекс:take_id" варианта, играющего в плеере реплик
   analysis: null,      // последний ответ /analysis: состояние подготовки диалога
+  llm: null,           // последний ответ /linguistic-analysis: разбор локальной LLM
   analyzeBusy: false,  // анализ в полёте — кнопка заблокирована
   timeline: null,      // последний ответ /timeline: дорожки спикеров и сегменты реплик
   timelineBusy: false, // запрос таймлайна в полёте — кнопка «обновить» заблокирована
@@ -375,6 +376,11 @@ function switchTab(name) {
   // запрашивать его на каждом старте дашборда незачем.
   if (name === 'dictionary') {
     loadDictionary().catch((error) => showAlert($('dictionary-error'), error.message));
+  }
+  // Лингвистический анализ — общая ось обеих вкладок озвучки: обновляем состояние
+  // при входе, чтобы блок не показывал устаревшее «выкл» или чужой проект.
+  if (name === 'text' || name === 'dialogue') {
+    refreshLlmAnalysis();
   }
   // Модели — так же: список весов нужен только тому, кто пришёл его смотреть,
   // а обход каталогов с гигабайтными файлами на старте дашборда незачем.
@@ -2520,7 +2526,144 @@ async function refreshAnalysis() {
   }
   updateAnalysisBar();
   updateGenerateButton();
+  await refreshLlmAnalysis();
   return state.analysis;
+}
+
+// Подписи состояний лингвистического анализа (§12 Task 2). Отдельный словарь, а не
+// переиспользование ANALYSIS_LABELS: это другая ось — «LLM смотрела или нет», а не
+// «текст подготовлен или нет».
+const LLM_LABELS = {
+  DISABLED: 'выкл',
+  PENDING: 'ожидает',
+  RUNNING: 'анализ',
+  READY: 'готов',
+  NEEDS_REVIEW: 'требует проверки',
+  FAILED: 'ошибка',
+  STALE: 'устарел',
+};
+
+async function refreshLlmAnalysis() {
+  const panel = $('llm-panel');
+  if (!panel) return null;
+  if (!state.project) {
+    state.llm = null;
+    renderLlmPanel();
+    return null;
+  }
+  try {
+    state.llm = await api(`/api/projects/${state.project.id}/linguistic-analysis`);
+  } catch (error) {
+    // Состояние анализа — вспомогательная информация: не смогли прочитать, панель
+    // просто не показываем, работа с репликами не блокируется.
+    state.llm = null;
+  }
+  renderLlmPanel();
+  return state.llm;
+}
+
+function renderLlmPanel() {
+  const panel = $('llm-panel');
+  if (!panel) return;
+  const data = state.llm;
+  const textPanel = $('text-llm-panel');
+  // Во вкладке сплошного текста проекта нет: там показываем только состояние
+  // анализатора из /api/llm/status, а разбор появляется в ответе рендера.
+  if (textPanel && !state.project) {
+    textPanel.hidden = false;
+    renderLlmStatusLine($('text-llm-badge'), $('text-llm-state'), null);
+  } else if (textPanel) {
+    textPanel.hidden = false;
+    renderLlmStatusLine($('text-llm-badge'), $('text-llm-state'), data);
+  }
+  if (!data) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  renderLlmStatusLine($('llm-badge'), $('llm-state'), data, true);
+  const list = $('llm-list');
+  const candidates = (data.candidates || []).filter((item) => item.needs_review);
+  if (!candidates.length) {
+    list.innerHTML = '<div class="muted">Спорных слов нет — модель ничего не требует подтверждать.</div>';
+    return;
+  }
+  list.innerHTML = candidates
+    .map(
+      (item, index) => `
+      <div class="card review-row" data-llm-index="${index}">
+        <div class="row between">
+          <span><b>${esc(item.word)}</b>${item.target ? ` → <span class="muted">${esc(item.target)}</span>` : ''}</span>
+          <span class="muted">реплика ${(item.replica_index || 0) + 1}</span>
+        </div>
+        <div class="muted review-reason">${esc(item.reason || '')}${
+          item.agreement === 'conflict' ? ' · <b>конфликт со словарём</b>' : ''
+        }</div>
+        <div class="row">
+          <button class="tiny primary" data-llm-review="project">Только в этот проект</button>
+          <button class="tiny ghost" data-llm-review="global">Во все проекты</button>
+          <button class="tiny ghost" data-llm-review="skip">Пропустить</button>
+        </div>
+      </div>`
+    )
+    .join('');
+  // Действия — через тот же review-путь, что и у детерминированных кандидатов:
+  // второго способа писать в словарь быть не должно.
+  list.querySelectorAll('[data-llm-review]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const card = button.closest('[data-llm-index]');
+      reviewLlmCandidate(Number(card.dataset.llmIndex), button.dataset.llmReview);
+    });
+  });
+}
+
+function renderLlmStatusLine(badge, text, data, detailed = false) {
+  if (!badge || !text) return;
+  if (!data) {
+    badge.textContent = '—';
+    badge.className = 'badge';
+    text.textContent = 'Состояние анализатора читается при открытии проекта';
+    return;
+  }
+  const status = data.status || 'DISABLED';
+  badge.textContent = LLM_LABELS[status] || status;
+  badge.className = `badge analysis-${status === 'READY' ? 'ready' : status === 'NEEDS_REVIEW' ? 'needs_review' : status === 'FAILED' ? 'error' : 'raw'}`;
+  const parts = [];
+  if (data.model) parts.push(`модель: ${data.model}`);
+  if (detailed) {
+    parts.push(`предложений: ${data.candidates_total || 0}`);
+    parts.push(`на проверку: ${data.needs_review_total || 0}`);
+    if (data.conflicts_total) parts.push(`конфликтов со словарём: ${data.conflicts_total}`);
+  }
+  if (data.error) parts.push(`причина: ${data.error}`);
+  if (!data.enabled) parts.push('анализатор выключен (LLM_ANALYZER_ENABLED=0)');
+  text.textContent = parts.join(' · ');
+}
+
+async function reviewLlmCandidate(index, action) {
+  const candidates = (state.llm && state.llm.candidates || []).filter((item) => item.needs_review);
+  const item = candidates[index];
+  if (!item || !state.project) return;
+  const accepted = action !== 'skip' && Boolean((item.target || '').trim());
+  try {
+    await api(`/api/projects/${state.project.id}/pronunciation/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: item.word,
+        target: item.target || item.word,
+        scope: action === 'global' ? 'global' : 'project',
+        enabled: accepted,
+        replica_index: item.replica_index,
+        note: 'решение по предложению локальной LLM',
+      }),
+    });
+    await applyProject(await api(`/api/projects/${state.project.id}`), { analysis: false });
+    await refreshAnalysis();
+    if (typeof loadDictionary === 'function') loadDictionary().catch(() => {});
+  } catch (error) {
+    showAlert($('analyze-error'), error.message);
+  }
 }
 
 async function analyzeDialogue() {
