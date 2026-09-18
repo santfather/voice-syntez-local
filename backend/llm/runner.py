@@ -52,6 +52,14 @@ logger = logging.getLogger("tts.llm.runner")
 RESPONSE_FORMAT_JSON = "json"
 RESPONSE_FORMAT_SCHEMA = "schema"
 RESPONSE_FORMATS: tuple[str, ...] = (RESPONSE_FORMAT_JSON, RESPONSE_FORMAT_SCHEMA)
+# Режим «размышления» модели:
+# - `auto` — выключить, если модель умеет thinking (иначе она тратит сотни токенов
+#   на скрытое рассуждение: у qwen3:8b это 2186 токенов и 102 c на один кейс);
+# - `off`/`on` — принудительно.
+THINK_AUTO = "auto"
+THINK_OFF = "off"
+THINK_ON = "on"
+THINK_MODES: tuple[str, ...] = (THINK_AUTO, THINK_OFF, THINK_ON)
 DEFAULT_NUM_CTX = 8192
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_SEED = 0
@@ -178,6 +186,7 @@ class BenchmarkRunner:
         sensor: memory.Sensor | None = None,
         max_repairs: int = DEFAULT_MAX_REPAIRS,
         response_format: str = RESPONSE_FORMAT_JSON,
+        think: str = THINK_AUTO,
         check_memory: bool = True,
         dataset_version: str = "1",
         on_progress: Callable[[str], None] | None = None,
@@ -199,7 +208,11 @@ class BenchmarkRunner:
         self.sensor = sensor
         if response_format not in RESPONSE_FORMATS:
             raise BenchmarkError(f"неизвестный режим схемы: {response_format}")
+        if think not in THINK_MODES:
+            raise BenchmarkError(f"неизвестный режим размышления: {think}")
         self.response_format = response_format
+        self.think_mode = think
+        self._think_by_model: dict[str, bool | None] = {}
         self.max_repairs = max_repairs
         # `check_memory=False` — только для путей без настоящей модели (--dry-run):
         # там политика памяти не защищает ни от чего, зато делает результат
@@ -314,6 +327,8 @@ class BenchmarkRunner:
             result.metrics = {"memory": decision.to_dict()}
             return result
 
+        think = self._think_for(model)
+        self._think_by_model[model] = think
         unloaded = []
         try:
             unloaded = self.client.unload_others(keep=model)
@@ -506,6 +521,26 @@ class BenchmarkRunner:
             options=dict(self.options),
         )
 
+    def _think_for(self, model: str) -> bool | None:
+        """Нужно ли отключать скрытое рассуждение у этой модели.
+
+        `auto` опирается на паспорт модели (`/api/show` → capabilities): если модель
+        умеет thinking, оно выключается. Это не «настройка под модель ради
+        результата», а устранение чистых потерь: задача — короткие аннотации с
+        ограниченной задержкой, а не рассуждение. Моделям без такой возможности
+        параметр не отправляется вовсе.
+        """
+        if self.think_mode == THINK_OFF:
+            return False
+        if self.think_mode == THINK_ON:
+            return True
+        try:
+            capabilities = self.client.capabilities(model)
+        except Exception as exc:  # noqa: BLE001 — паспорт модели не критичен
+            logger.debug("Не удалось прочитать capabilities %s: %s", model, exc)
+            return None
+        return False if "thinking" in capabilities else None
+
     def _schema_text(self) -> str:
         """Та же схема, что и в валидаторе, — текстом для prompt'а."""
         import json as _json
@@ -522,6 +557,7 @@ class BenchmarkRunner:
             options=dict(self.options),
             keep_alive=DEFAULT_KEEP_ALIVE,
             cancel=cancel,
+            think=self._think_by_model.get(model),
         )
 
     # -- вспомогательное --------------------------------------------------------
@@ -671,7 +707,11 @@ class BenchmarkRunner:
             temperature=float(self.options.get("temperature", DEFAULT_TEMPERATURE)),
             seed=self.options.get("seed"),
             # Режим схемы — часть условий прогона: без него числа невоспроизводимы.
-            options={**self.options, "response_format": self.response_format},
+            options={
+                **self.options,
+                "response_format": self.response_format,
+                "think": self._think_by_model.get(model),
+            },
         )
         versioning.write_run_metadata(model_dir / RUN_FILE, metadata)
         metrics_report["metadata"] = metadata.to_dict()

@@ -276,6 +276,22 @@ class OllamaClient:
             )
         return model
 
+    def show(self, tag: str) -> dict:
+        """`/api/show`: шаблон, параметры и возможности модели (capabilities)."""
+        data = self._request(
+            "/api/show", {"model": self._normalize_tag(tag)}, timeout=HEALTH_TIMEOUT_SEC
+        )
+        return data if isinstance(data, dict) else {}
+
+    def capabilities(self, tag: str) -> tuple[str, ...]:
+        """Возможности модели. Ошибка чтения — пустой список, а не падение."""
+        try:
+            raw = self.show(tag).get("capabilities") or []
+        except Exception as exc:  # noqa: BLE001 — паспорт модели не критичен
+            logger.debug("Не удалось прочитать capabilities %s: %s", tag, exc)
+            return ()
+        return tuple(str(item) for item in raw)
+
     def running_models(self) -> list[dict]:
         """/api/ps: что сейчас загружено и сколько занимает — для memory policy."""
         payload = self._read_json(self._request("/api/ps", timeout=HEALTH_TIMEOUT_SEC))
@@ -341,6 +357,7 @@ class OllamaClient:
         timeout: float | None = None,
         cancel: Callable[[], bool] | None = None,
         on_token: Callable[[str], None] | None = None,
+        think: bool | None = None,
     ) -> ChatResult:
         """Один запрос к модели со структурированным выходом.
 
@@ -358,6 +375,12 @@ class OllamaClient:
         }
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        if think is not None:
+            # `thinking`-модели (Qwen3) по умолчанию тратят сотни токенов на
+            # скрытое рассуждение. Для анализа это чистые потери: ответ нужен
+            # короткий, а задержка ограничена. Моделям без этой возможности
+            # параметр не отправляем вовсе.
+            payload["think"] = think
 
         started = time.monotonic()
         response = self._request("/api/chat", payload, timeout=timeout, stream=True)

@@ -103,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=runner_mod.RESPONSE_FORMAT_JSON,
         help="как передавать схему ответа: текстом в prompt (json) или грамматикой Ollama (schema)",
     )
+    parser.add_argument(
+        "--think",
+        choices=list(runner_mod.THINK_MODES),
+        default=runner_mod.THINK_AUTO,
+        help="скрытое рассуждение модели: auto — выключать, если модель это умеет",
+    )
     parser.add_argument("--num-ctx", type=int, default=8192, help="размер контекста")
     parser.add_argument("--temperature", type=float, default=0.0, help="temperature")
     parser.add_argument("--seed", type=int, default=0, help="seed")
@@ -180,6 +186,7 @@ def run_benchmark(args: argparse.Namespace, *, client=None) -> int:
         output_dir=output_dir,
         options=options,
         response_format=args.response_format,
+        think=args.think,
         check_memory=not args.dry_run,
         dataset_version=versioning.BENCHMARK_VERSION,
         on_progress=progress,

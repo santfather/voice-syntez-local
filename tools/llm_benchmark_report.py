@@ -37,12 +37,22 @@ DEFAULT_RESULTS = ROOT / "benchmarks" / "russian_linguistics" / "results" / "ful
 REPORT_PATH = ROOT / "llm_benchmark_report.md"
 # Порядок критериев выбора (Phase 6). Первое отличие решает; задержка — последняя,
 # потому что «быстрее» не значит «правильнее».
-RANKING: tuple[tuple[str, bool], ...] = (
+#
+# Допуски нужны, чтобы не принимать решение по шуму: на 339 кейсах разница
+# issue_f1 в 0.02 — это одно-два совпадения, а не «лучшая модель». Внутри допуска
+# модели считаются равными по качеству, и тогда решают риск, память и задержка.
+QUALITY_CRITERIA: tuple[tuple[str, bool], ...] = (
     ("issue_f1", True),
     ("homograph_accuracy", True),
     ("yo_f1", True),
+)
+RISK_CRITERIA: tuple[tuple[str, bool], ...] = (
     ("critical_error_rate", False),
     ("false_positive_rate", False),
+)
+QUALITY_TOLERANCE = 0.03
+RISK_TOLERANCE = 0.05
+RESOURCE_CRITERIA: tuple[tuple[str, bool], ...] = (
     ("schema_valid_rate", True),
     ("peak_process_memory", False),
     ("latency_p95", False),
@@ -116,21 +126,32 @@ def span_diagnostics(results_dir: Path, model_dir_name: str, cases: dict) -> dic
 
 
 def load_run(results_dir: Path) -> dict:
+    """Собирает все модели, у которых есть метрики, а не только последний прогон.
+
+    `benchmark.json` пишется каждой командой запуска и содержит только её модели:
+    если прогон выполнялся в несколько заходсов (`--resume` с разными `--model`),
+    ориентироваться на него нельзя. Источник истины — каталоги с `metrics.json`, а
+    условия прогона берутся из `benchmark.json`, если он покрывает модель.
+    """
     benchmark_path = results_dir / "benchmark.json"
-    if not benchmark_path.exists():
-        raise SystemExit(f"нет сводки прогона: {benchmark_path}")
-    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
+    benchmark = (
+        json.loads(benchmark_path.read_text(encoding="utf-8"))
+        if benchmark_path.exists()
+        else {}
+    )
     models: dict[str, dict] = {}
-    for tag in benchmark.get("models") or {}:
-        model_dir = results_dir / metrics_mod_slug(tag)
-        metrics_path = model_dir / "metrics.json"
-        if not metrics_path.exists():
+    for model_dir in sorted(results_dir.iterdir()):
+        if not (model_dir / "metrics.json").exists():
             continue
+        metadata = json.loads((model_dir / "run.json").read_text(encoding="utf-8"))
+        tag = str(metadata.get("model_tag") or model_dir.name)
         models[tag] = {
-            "metrics": json.loads(metrics_path.read_text(encoding="utf-8")),
-            "metadata": json.loads((model_dir / "run.json").read_text(encoding="utf-8")),
-            "slowest": json.loads((model_dir / "run.json").read_text(encoding="utf-8")),
+            "metrics": json.loads((model_dir / "metrics.json").read_text(encoding="utf-8")),
+            "metadata": metadata,
+            "dir": model_dir.name,
         }
+    if not models:
+        raise SystemExit(f"нет результатов прогона: {results_dir}")
     return {"benchmark": benchmark, "models": models}
 
 
@@ -142,40 +163,144 @@ def metrics_mod_slug(tag: str) -> str:
 
 
 def rank_models(models: dict) -> list[tuple[str, list[str]]]:
-    """Сортирует модели по критериям Phase 6 и объясняет порядок словами."""
-    def sort_key(item: tuple[str, dict]):
-        values = []
-        for name, higher_is_better in RANKING:
-            value = (item[1]["metrics"].get("metrics") or {}).get(name)
-            if value is None:
-                # «Нет данных» — худший случай: метрику не на чем было считать.
-                value = -1.0 if higher_is_better else 1e9
-            values.append(-value if higher_is_better else value)
-        return tuple(values)
+    """Ранжирует модели по Phase 6 и объясняет порядок словами.
 
-    ranked = sorted(models.items(), key=sort_key)
+    Сначала качество на русском, но с допуском: если модели отличаются на один-два
+    кейса, объявлять одну «лучшей» нельзя. Внутри допуска сравнивается риск
+    (критические ошибки и ложные срабатывания), затем надёжность схемы, память и
+    задержка. Скорость сама по себе модель не выбирает.
+    """
+    def value(tag: str, name: str) -> float | None:
+        raw = (models[tag]["metrics"].get("metrics") or {}).get(name)
+        return float(raw) if isinstance(raw, (int, float)) else None
+
+    def worst(name: str, higher_is_better: bool) -> float:
+        return -1e9 if higher_is_better else 1e9
+
+    def sort_key(tag: str, criteria):
+        keys = []
+        for name, higher_is_better in criteria:
+            raw = value(tag, name)
+            if raw is None:
+                raw = worst(name, higher_is_better)
+            keys.append(-raw if higher_is_better else raw)
+        return tuple(keys)
+
+    ordered = sorted(models, key=lambda tag: sort_key(tag, QUALITY_CRITERIA))
+    # Полосы качества: лидер полосы задаёт эталон, остальные попадают в неё, если
+    # близки к нему по всем метрикам качества.
+    tiers: list[list[str]] = []
+    for tag in ordered:
+        placed = False
+        for tier in tiers:
+            leader = tier[0]
+            if all(
+                _within(
+                    value(tag, name),
+                    value(leader, name),
+                    QUALITY_TOLERANCE,
+                    higher_is_better,
+                )
+                for name, higher_is_better in QUALITY_CRITERIA
+            ):
+                tier.append(tag)
+                placed = True
+                break
+        if not placed:
+            tiers.append([tag])
+
+    ranked: list[tuple[str, int, int]] = []
+    for tier_index, tier in enumerate(tiers):
+        # Внутри полосы качества — полосы риска: одинаковая опасность не должна
+        # решаться в пользу модели, которая просто дороже.
+        risk_sorted = sorted(tier, key=lambda tag: sort_key(tag, RISK_CRITERIA))
+        risk_tiers: list[list[str]] = []
+        for tag in risk_sorted:
+            placed = False
+            for group in risk_tiers:
+                leader = group[0]
+                if all(
+                    _within(
+                        value(tag, name),
+                        value(leader, name),
+                        RISK_TOLERANCE,
+                        higher_is_better,
+                    )
+                    for name, higher_is_better in RISK_CRITERIA
+                ):
+                    group.append(tag)
+                    placed = True
+                    break
+            if not placed:
+                risk_tiers.append([tag])
+        for risk_index, group in enumerate(risk_tiers):
+            for tag in sorted(group, key=lambda tag: sort_key(tag, RESOURCE_CRITERIA)):
+                ranked.append((tag, tier_index, risk_index))
+
     reasons: list[tuple[str, list[str]]] = []
-    for tag, data in ranked:
-        metrics = data["metrics"].get("metrics") or {}
+    for index, (tag, tier_index, risk_index) in enumerate(ranked):
+        metrics = models[tag]["metrics"].get("metrics") or {}
+        if index == 0:
+            note = "лучший по совокупности: качество, риск, надёжность, память, задержка"
+        elif tier_index > 0:
+            note = "качество ниже лидера за пределами допуска"
+        elif risk_index > 0:
+            note = (
+                "качество в пределах допуска "
+                f"({QUALITY_TOLERANCE}), но риск существенно выше"
+            )
+        else:
+            note = (
+                "качество и риск в пределах допуска — решают надёжность схемы, "
+                "память и задержка"
+            )
         reasons.append(
             (
                 tag,
                 [
+                    note,
                     f"issue_f1={_fmt(metrics.get('issue_f1'))}",
+                    f"совпало аннотаций={metrics.get('matched_annotations')} "
+                    + f"из {metrics.get('gold_annotations')}",
                     f"critical_error_rate={_fmt(metrics.get('critical_error_rate'))}",
                     f"false_positive_rate={_fmt(metrics.get('false_positive_rate'))}",
                     f"schema_valid_rate={_fmt(metrics.get('schema_valid_rate'))}",
+                    f"peak_process_memory={_fmt(metrics.get('peak_process_memory'))} MB",
                     f"latency_p95={_fmt(metrics.get('latency_p95'))} c",
-                    f"peak_system_memory_percent={_fmt(metrics.get('peak_system_memory_percent'))}",
                 ],
             )
         )
     return reasons
 
 
+def _within(
+    candidate: float | None, leader: float | None, tolerance: float, higher_is_better: bool
+) -> bool:
+    """Попадает ли значение в допуск от лидера.
+
+    «Нет данных» у обеих моделей — это не различие, а общее свойство корпуса
+    (например, `yo_f1` не на чем считать, если ни одна модель не предложила «ё»):
+    такие метрики не должны разводить модели по разным полосам качества.
+    """
+    if candidate is None and leader is None:
+        return True
+    if candidate is None or leader is None:
+        return False
+    return abs(candidate - leader) <= tolerance
+
+
 def build_report(run: dict, *, dataset: dict | None = None) -> str:
-    benchmark = run["benchmark"]
+    benchmark = dict(run["benchmark"])
     models = run["models"]
+    fallback = next(iter(models.values()))["metadata"] if models else {}
+    for name, value in (
+        ("dataset_version", fallback.get("dataset_version")),
+        ("prompt_version", fallback.get("prompt_version")),
+        ("schema_version", fallback.get("schema_version")),
+        ("ollama_version", fallback.get("ollama_version")),
+        ("options", fallback.get("options")),
+    ):
+        benchmark.setdefault(name, value)
     ranked = rank_models(models)
     lines: list[str] = [
         "# Benchmark локальных LLM для подготовки русского текста к синтезу",
@@ -208,11 +333,12 @@ def build_report(run: dict, *, dataset: dict | None = None) -> str:
               "|---|---|---|---|---|"]
     for tag, data in models.items():
         metadata = data["metadata"]
-        status = (benchmark.get("models") or {}).get(tag) or {}
+        status = ((benchmark.get("models") or {}).get(tag) or {}).get("status", "ok")
+        planned = (data["metrics"].get("planned_cases")) or data["metrics"].get("cases")
         lines.append(
             f"| `{tag}` | `{metadata.get('model_digest', '')[:12]}` | "
-            f"{metadata.get('model_size_gb')} | {data['metrics'].get('cases')} | "
-            f"{status.get('status', '')} |"
+            f"{metadata.get('model_size_gb')} | {data['metrics'].get('cases')}/{planned} | "
+            f"{status} |"
         )
 
     lines += ["", "## Метрики качества", "", "| Модель | " +
@@ -345,8 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         else {}
     )
     run["diagnostics"] = {
-        tag: span_diagnostics(args.results, metrics_mod_slug(tag), cases)
-        for tag in run["models"]
+        tag: span_diagnostics(args.results, data.get("dir") or metrics_mod_slug(tag), cases)
+        for tag, data in run["models"].items()
     }
     report = build_report(run, dataset=dataset)
     if args.stdout:

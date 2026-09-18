@@ -53,6 +53,7 @@ class FakeOllamaClient:
         responses_by_model: dict[str, str] | None = None,
         gold_by_replica: dict[int, list[dict]] | None = None,
         utterance_by_replica: dict[int, str] | None = None,
+        capabilities: dict[str, tuple[str, ...]] | None = None,
         available: bool = True,
         error: str = "",
         latency_sec: float = 0.0,
@@ -62,6 +63,7 @@ class FakeOllamaClient:
         self._responses = dict(responses_by_model or {})
         self._gold = dict(gold_by_replica or {})
         self._utterance = dict(utterance_by_replica or {})
+        self._capabilities = dict(capabilities or {})
         if models is not None:
             self._models = list(models)
         elif self._responses:
@@ -118,6 +120,12 @@ class FakeOllamaClient:
             raise OllamaModelMissingError(f"Модель «{tag}» не найдена локально.")
         return model
 
+    def show(self, tag: str) -> dict:
+        return {"model": tag, "capabilities": list(self._capabilities.get(tag, ()))}
+
+    def capabilities(self, tag: str) -> tuple[str, ...]:
+        return tuple(self._capabilities.get(tag, ()))
+
     def running_models(self) -> list[dict]:
         return [{"name": tag, "size": 1024**3} for tag in self._loaded]
 
@@ -146,9 +154,16 @@ class FakeOllamaClient:
         timeout: float | None = None,
         cancel: Callable[[], bool] | None = None,
         on_token: Callable[[str], None] | None = None,
+        think: bool | None = None,
     ) -> ChatResult:
         self.calls.append(
-            {"model": model, "messages": messages, "schema": schema, "options": dict(options or {})}
+            {
+                "model": model,
+                "messages": messages,
+                "schema": schema,
+                "options": dict(options or {}),
+                "think": think,
+            }
         )
         if self._fail_on_call is not None and len(self.calls) == self._fail_on_call:
             raise OllamaUnavailableError("fake: сбой на вызове")

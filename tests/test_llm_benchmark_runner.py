@@ -543,3 +543,43 @@ def test_benchmark_records_min_available_memory(tmp_path):
     memory = report["models"]["qwen3:4b"]["memory"]
     assert memory["min_available_gb"] == 3.1
     assert memory["peak_system_memory_percent"] == 80.0
+
+
+def test_benchmark_disables_thinking_only_for_models_that_can_think(tmp_path):
+    """`auto` выключает скрытое рассуждение там, где оно есть, и не трогает других.
+
+    qwen3:8b по умолчанию тратит ~2200 токенов на скрытое рассуждение и 100 c на
+    кейс, а задача — короткие аннотации с ограниченной задержкой. У gemma3:4b
+    возможности thinking нет, и отправлять ей параметр нельзя.
+    """
+    cases = _cases(1)
+    client = RecordingClient(
+        models=[
+            OllamaModel(tag="qwen3:8b", digest="q8", size_bytes=5 * 1024**3),
+            OllamaModel(tag="gemma3:4b", digest="g4", size_bytes=3 * 1024**3),
+        ],
+        gold_by_replica=_gold(cases),
+        capabilities={"qwen3:8b": ("completion", "tools", "thinking"), "gemma3:4b": ("completion",)},
+    )
+    runner = _runner(tmp_path, client=client)
+    report = runner.run(["qwen3:8b", "gemma3:4b"], limit=1)
+    thinks = {(call["model"]): call["think"] for call in client.calls}
+    assert thinks["qwen3:8b"] is False
+    assert thinks["gemma3:4b"] is None
+    metadata = json.loads((tmp_path / "qwen3-8b" / "run.json").read_text(encoding="utf-8"))
+    assert metadata["options"]["think"] is False
+    assert report["models"]["gemma3:4b"]["status"] == "ok"
+
+    # Принудительные режимы не зависят от паспорта модели.
+    forced = RecordingClient(
+        models=[OllamaModel(tag="gemma3:4b", digest="g4", size_bytes=3 * 1024**3)],
+        gold_by_replica=_gold(cases),
+        capabilities={"gemma3:4b": ("completion",)},
+    )
+    _runner(tmp_path / "on", client=forced, think="on").run(["gemma3:4b"], limit=1)
+    assert forced.calls[0]["think"] is True
+
+
+def test_benchmark_rejects_unknown_think_mode(tmp_path):
+    with pytest.raises(runner_mod.BenchmarkError, match="размышления"):
+        _runner(tmp_path, client=_perfect_client(_cases(1)), think="может быть")
