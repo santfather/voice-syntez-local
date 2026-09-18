@@ -2912,6 +2912,9 @@ function applyProject(project, { speakers = true, analysis = true } = {}) {
   // проекта (словарь, инвалидация), поэтому обновляем его вместе с карточками.
   // Вызывающий, который уже получил свежий ответ, просит не повторять запрос.
   if (analysis) refreshAnalysis().catch(() => {});
+  // Список архивов диагностики — принадлежность проекта: при переключении проекта
+  // в списке не должно остаться файлов соседнего.
+  loadDiagnostics();
 }
 
 async function refreshProject() {
@@ -3971,6 +3974,9 @@ async function generate() {
     output_format: $('output-format').value,
     chunk_strategy: $('chunk-strategy').value,
     short_utterance: shortUtterancePayload(),
+    // Имя готового файла: свойство запуска, а не проекта. Пустое поле означает
+    // прежнее поведение — имя из номера задачи.
+    output_name: $('output-name').value.trim(),
   };
 
   $('btn-generate').disabled = true;
@@ -4052,7 +4058,9 @@ async function pollJob() {
       $('player').hidden = false;
       const link = $('download-link');
       link.href = `${job.audio_url}?download=true`;
-      link.download = `dialogue.${job.output_format}`;
+      // Имя файла с бэкенда: если пользователь задал своё, оно уже там;
+      // `output_format` остаётся запасным вариантом для старых ответов.
+      link.download = job.file_name || `dialogue.${job.output_format}`;
       link.hidden = false;
       // Куски рендера сохранены вариантами реплик проекта — забираем проект,
       // чтобы карточки показали новое звучание активным, а прежнее осталось
@@ -4118,9 +4126,17 @@ const EXPORT_FALLBACK_NAMES = {
 function updateExportButtons() {
   const ready = Boolean(state.project && (state.project.replicas || []).length);
   const button = $('btn-export-project');
-  if (!button) return;
-  button.disabled = !ready || state.exportBusy === true;
-  button.title = ready ? '' : 'Сначала разберите текст на реплики';
+  if (button) {
+    button.disabled = !ready || state.exportBusy === true;
+    button.title = ready ? '' : 'Сначала разберите текст на реплики';
+  }
+  // Диагностика возможна и на проекте без take'ов: тогда в архиве не будет аудио,
+  // но текст, настройки и журнал останутся — а именно их чаще всего и не хватает.
+  const diagnosticsButton = $('btn-diagnostics');
+  if (diagnosticsButton) {
+    diagnosticsButton.disabled = !state.project;
+    diagnosticsButton.title = state.project ? '' : 'Сначала создайте проект';
+  }
 }
 
 // Имя файла берём из Content-Disposition: бэкенд уже сделал его безопасным и
@@ -4211,6 +4227,8 @@ async function importProject(file) {
 function bindExportEvents() {
   const exportButton = $('btn-export-project');
   if (exportButton) exportButton.addEventListener('click', exportProject);
+  const diagnosticsButton = $('btn-diagnostics');
+  if (diagnosticsButton) diagnosticsButton.addEventListener('click', exportDiagnostics);
   const importButton = $('btn-import-project');
   const importInput = $('import-file');
   if (importButton && importInput) {
@@ -4224,6 +4242,101 @@ function bindExportEvents() {
     });
   }
   updateExportButtons();
+}
+
+// --- диагностика качества озвучки ----------------------------------------------
+// Архив диагностики собирается на сервере, а не в браузере: только там есть
+// настройки рендера, план коротких реплик и готовое аудио. Браузер просит собрать
+// (POST) и забирает готовый файл (GET), потому что сборка — это работа, а не
+// скачивание: тело ответа с параметрами и списком архивов интерфейсу тоже нужно.
+function diagnosticsJobId() {
+  // Сначала задача этой сессии: именно её звучание слушал пользователь. Затем
+  // последний рендер проекта — он переживает перезапуск приложения.
+  return state.jobId || (state.project && state.project.job_id) || null;
+}
+
+function renderDiagnosticsList(archives = []) {
+  const mount = $('diagnostics-list');
+  if (!mount) return;
+  mount.innerHTML = '';
+  if (!archives.length) return;
+  const title = document.createElement('span');
+  title.className = 'muted';
+  title.textContent = 'Собранные архивы:';
+  mount.appendChild(title);
+  const list = document.createElement('ul');
+  list.className = 'muted';
+  archives.forEach((item) => {
+    const row = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = `/api/projects/${state.project.id}/diagnostics/${encodeURIComponent(item.name)}`;
+    link.textContent = `${item.name} (${item.size_mb} МБ)`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'link-button';
+    remove.textContent = 'удалить';
+    remove.addEventListener('click', () => deleteDiagnostics(item.name));
+    row.append(link, document.createTextNode(' '), remove);
+    list.appendChild(row);
+  });
+  mount.appendChild(list);
+}
+
+async function exportDiagnostics() {
+  if (!state.project) {
+    showAlert($('export-error'), 'Проект ещё не создан — диагностику собирать не из чего.');
+    return;
+  }
+  const button = $('btn-diagnostics');
+  showAlert($('export-error'), '');
+  button.disabled = true;
+  $('diagnostics-status').textContent = 'собираю архив…';
+  try {
+    const payload = {
+      job_id: diagnosticsJobId(),
+      include_references: $('diagnostics-references').checked,
+    };
+    const result = await api(`/api/projects/${state.project.id}/diagnostics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await downloadExport(result.download_url, 'diagnostics.zip');
+    const warnings = (result.bundle && result.bundle.warnings) || [];
+    $('diagnostics-status').textContent =
+      `архив ${result.bundle.name} · ${result.bundle.size_mb} МБ · ${result.path}`
+      + (warnings.length ? ` · предупреждений: ${warnings.length}` : '');
+    renderDiagnosticsList(result.archives || []);
+  } catch (error) {
+    $('diagnostics-status').textContent = '—';
+    showAlert($('export-error'), error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteDiagnostics(name) {
+  showAlert($('export-error'), '');
+  try {
+    await api(
+      `/api/projects/${state.project.id}/diagnostics/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    );
+    $('diagnostics-status').textContent = `архив ${name} удалён`;
+    await loadDiagnostics();
+  } catch (error) {
+    showAlert($('export-error'), error.message);
+  }
+}
+
+async function loadDiagnostics() {
+  if (!state.project || !$('diagnostics-list')) return;
+  try {
+    const data = await api(`/api/projects/${state.project.id}/diagnostics`);
+    renderDiagnosticsList(data.archives || []);
+  } catch (_) {
+    // Список архивов вторичен: без него кнопка «Собрать» всё равно работает.
+  }
 }
 
 // --- отметки и подписи звучаний ------------------------------------------------
@@ -4463,6 +4576,7 @@ async function renderText() {
     short_utterance: shortUtterancePayload('text-'),
     output_format: $('text-output-format').value,
     chunk_strategy: $('text-chunk-strategy').value,
+    output_name: $('text-output-name').value.trim(),
   };
 
   $('btn-render-text').disabled = true;
@@ -4523,7 +4637,7 @@ async function pollTextJob() {
       $('text-player').hidden = false;
       const link = $('text-download-link');
       link.href = `${job.audio_url}?download=true`;
-      link.download = `text.${job.output_format}`;
+      link.download = job.file_name || `text.${job.output_format}`;
       link.hidden = false;
       showTextQaNote(job.replicas);
     }

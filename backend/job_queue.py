@@ -191,6 +191,10 @@ class Job:
             # чтобы UI не повторял правила склонения у себя.
             "eta_text": eta.format_eta(self.eta_sec) if self.eta_sec else None,
             "output_format": self.output_format,
+            # Имя готового файла. Интерфейс подписывает им ссылку «скачать»: имя,
+            # заданное пользователем, не должно теряться по дороге в браузер.
+            # None — файла ещё нет (или задача не дошла до записи).
+            "file_name": self.output_path.name if self.output_path else None,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

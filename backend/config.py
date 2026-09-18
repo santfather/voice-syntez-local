@@ -45,8 +45,30 @@ PROJECTS_OUTPUT_DIR = OUTPUT_DIR / "projects"
 # файлам верхнего уровня (см. audio_pipeline.cleanup_output), поэтому результат
 # сравнения не пропадает посреди сессии, пока пользователь его слушает.
 BENCHMARKS_DIR = OUTPUT_DIR / "benchmarks"
+# Диагностические архивы (качество озвучки): проект, настройки, план коротких
+# реплик, take'ы и аудио в одном ZIP. Отдельный каталог по той же причине, что и
+# у сравнения движков: архив нужен пользователю после разбора, а не до TTL.
+DIAGNOSTICS_DIR = Path(os.environ.get("TTS_DIAGNOSTICS_DIR", OUTPUT_DIR / "diagnostics"))
+# Сколько аудио кладётся в архив. Предел нужен не ради места на диске, а ради
+# того, чтобы архив открывался: полный набор take'ов длинного диалога плюс
+# референсы легко переваливает за гигабайт, и такой файл уже не отправить.
+DIAGNOSTICS_MAX_AUDIO_MB = float(os.environ.get("TTS_DIAGNOSTICS_MAX_AUDIO_MB", "400"))
+# Сколько последних строк лога попадает в архив. Лог — главный источник причин
+# («граница цели не найдена», «attempts_exhausted»), но целиком он не нужен.
+DIAGNOSTICS_LOG_LINES = int(os.environ.get("TTS_DIAGNOSTICS_LOG_LINES", "600"))
+# Лог приложения: run.sh пишет stdout в этот файл. Пустой путь или отсутствующий
+# файл — не ошибка: архив собирается без логов, а причина указывается в README.
+LOG_PATH = Path(os.environ.get("TTS_LOG_PATH", BASE_DIR / "logs" / "voice_syntez.log"))
 
-for _d in (MODELS_DIR, VOICES_DIR, OUTPUT_DIR, DATA_DIR, PROJECTS_OUTPUT_DIR, BENCHMARKS_DIR):
+for _d in (
+    MODELS_DIR,
+    VOICES_DIR,
+    OUTPUT_DIR,
+    DATA_DIR,
+    PROJECTS_OUTPUT_DIR,
+    BENCHMARKS_DIR,
+    DIAGNOSTICS_DIR,
+):
     _d.mkdir(parents=True, exist_ok=True)
 
 # Режим проекта: диалог со спикерами или сплошной текст одним голосом.

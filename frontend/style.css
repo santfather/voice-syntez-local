@@ -454,6 +454,17 @@ button.tiny { padding: 5px 9px; font-size: 9px; letter-spacing: 0.05em; }
 button.danger:hover:not(:disabled) { border-color: var(--pink); color: var(--pink); }
 
 .outline-button { padding: 9px 14px; color: #aaa8b2; background: #141419; border: 1px solid var(--line-2); }
+/* Текстовая кнопка внутри строки списка («удалить» рядом с архивом): рамка здесь
+   спорила бы с ссылкой, стоящей в той же строке. */
+.link-button {
+  padding: 0;
+  color: var(--muted);
+  background: none;
+  border: none;
+  font-size: 11px;
+  text-decoration: underline;
+}
+.link-button:hover:not(:disabled) { color: var(--pink); }
 .parse-button { flex: 0 0 auto; margin-left: auto; padding: 9px; color: #cbb9ff; background: #312151; border: 1px solid #7454b2; font-size: 9px; }
 
 .test-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
@@ -481,6 +492,9 @@ button.danger:hover:not(:disabled) { border-color: var(--pink); color: var(--pin
 .row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .row.between { justify-content: space-between; }
 .muted { color: var(--muted); font-size: 11px; }
+/* Список архивов диагностики: ссылка и «удалить» в одной строке. */
+#diagnostics-list ul { margin: 6px 0 0; padding-left: 18px; }
+#diagnostics-list li { margin-top: 2px; }
 .muted.err { color: #ffb3d1; }
 .muted.warn { color: var(--amber); }
 .hint { margin: 10px 0 0; line-height: 1.75; }

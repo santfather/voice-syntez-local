@@ -349,6 +349,21 @@
             </label>
           </div>
           <label class="field" style="margin-top: 12px">
+            <span>Имя файла</span>
+            <input
+              type="text"
+              id="output-name"
+              maxlength="60"
+              autocomplete="off"
+              placeholder="например, диалог-1 (пусто — имя из номера задачи)"
+            />
+            <span class="muted">
+              Имя готового файла. Расширение подставляется по формату вывода, а занятое
+              имя не перезаписывается: второй файл с тем же именем получит хвост «-2».
+              Имя не запоминается в проекте — оно относится к этому запуску.
+            </span>
+          </label>
+          <label class="field" style="margin-top: 12px">
             <span>Проверка качества реплик</span>
             <select id="qa">
               <option value="off">выключена</option>
@@ -511,6 +526,31 @@
             <span class="muted" id="export-status">—</span>
           </div>
           <div class="alert error" id="export-error"></div>
+
+          <!-- Диагностика качества: архив для разбора «почему звучит плохо».
+               Отдельно от «Экспорта»: это не перенос проекта, а срез с настройками,
+               решением слоя коротких реплик и аудио для внешнего разбора. -->
+          <div class="field" style="margin-top: 16px">
+            <span>Диагностика качества озвучки</span>
+            <div class="row">
+              <button id="btn-diagnostics" class="outline-button" type="button" disabled>
+                Собрать архив диагностики
+              </button>
+              <label class="toggle" style="margin: 0">
+                <input type="checkbox" id="diagnostics-references" checked />
+                с референсами голосов
+              </label>
+            </div>
+            <span class="muted" id="diagnostics-status">—</span>
+            <div id="diagnostics-list"></div>
+            <span class="muted">
+              В архив попадают: исходный и подготовленный текст каждой реплики, настройки
+              сборки, параметры вариантов (включая откат слоя коротких реплик), результат
+              проверки качества, хвост журнала, готовый трек последнего рендера и аудио
+              реплик. Архив собирается локально и никуда не отправляется — путь к нему
+              показан выше, его можно открыть и в Finder.
+            </span>
+          </div>
           <p class="hint muted">
             Архив несёт метаданные, спикеров, реплики, take'ы и референсы используемых
             голосов — <b>без весов моделей</b>. При импорте новый проект создаётся рядом:
@@ -607,6 +647,20 @@
               </select>
             </label>
           </div>
+          <label class="field" style="margin-top: 12px">
+            <span>Имя файла</span>
+            <input
+              type="text"
+              id="text-output-name"
+              maxlength="60"
+              autocomplete="off"
+              placeholder="например, глава-1 (пусто — имя из номера задачи)"
+            />
+            <span class="muted">
+              Имя готового файла; расширение подставляется по формату вывода. Занятое имя
+              не перезаписывается: второй файл получит хвост «-2».
+            </span>
+          </label>
           <label class="field" style="margin-top: 12px">
             <span>Проверка качества кусков</span>
             <select id="text-qa">

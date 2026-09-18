@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -26,6 +27,7 @@ from . import (
     cache_cleanup,
     config,
     denoise,
+    diagnostics,
     engine_lifecycle,
     model_manager,
     project_analysis,
@@ -264,6 +266,8 @@ class GenerateRequest(TrackOptions):
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
     # Короткие реплики (§23): выключено по умолчанию, включается настройкой.
     short_utterance: ShortUtteranceRequest | None = None
+    # Имя готового файла; пусто — имя из id задачи.
+    output_name: str = ""
     # Фоновая задача (Фаза 11): рендер уходит в приоритет 3 и пропускает вперёд
     # preview и перегенерацию. Поле необязательное — без него поведение прежнее.
     background: bool = False
@@ -279,6 +283,8 @@ class RenderTextRequest(SpeakerConfig, TrackOptions):
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
     # См. `GenerateRequest.short_utterance`.
     short_utterance: ShortUtteranceRequest | None = None
+    # См. `GenerateRequest.output_name`.
+    output_name: str = ""
     # См. `GenerateRequest.background`.
     background: bool = False
 
@@ -367,6 +373,9 @@ class ProjectRenderRequest(BaseModel):
     chunk_strategy: ChunkStrategy | None = None
     # Короткие реплики: None — взять сохранённое в проекте (как у остальных ручек).
     short_utterance: ShortUtteranceRequest | None = None
+    # Имя готового файла. В настройках проекта не запоминается (см.
+    # `_resolved_render_settings`): имя выбирают для конкретного файла.
+    output_name: str | None = None
     # Фоновая задача (Фаза 11): приоритет 3. Не запоминается в настройках проекта:
     # это свойство запуска, а не сборки.
     background: bool = False
@@ -1595,6 +1604,7 @@ async def generate(payload: GenerateRequest) -> dict:
             output_format=payload.output_format,
             qa=QaSettings.for_mode(payload.qa),
             short_utterance=_short_settings(payload.short_utterance),
+            output_name=payload.output_name,
         ),
     )
     try:
@@ -1685,6 +1695,7 @@ async def render_text(payload: RenderTextRequest) -> dict:
             output_format=payload.output_format,
             qa=QaSettings.for_mode(payload.qa),
             short_utterance=_short_settings(payload.short_utterance),
+            output_name=payload.output_name,
         ),
     )
     try:
@@ -1897,6 +1908,10 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
         output_format=output_format,
         qa=QaSettings.for_mode(qa),
         short_utterance=short_settings,
+        # Только из запроса: сохранённое имя не подставляется — повторный рендер
+        # без тела должен писать файл как раньше, а не переиспользовать имя
+        # прошлого запуска (иначе второй файл молча стал бы «-2»).
+        output_name=str(payload.output_name or ""),
     )
     remembered = {
         "pause_ms": pause_ms,
@@ -2267,6 +2282,106 @@ async def export_project_subtitles(
     media_type = "application/x-subrip" if file_format == "srt" else "text/vtt"
     name = f"{project_export.safe_name(project.get('name'))}.{file_format}"
     return _attachment(path, media_type, name)
+
+
+# --- диагностика качества озвучки ---------------------------------------------
+class DiagnosticsRequest(BaseModel):
+    """Что именно положить в архив диагностики.
+
+    `job_id` важен: без него архив описывает проект целиком, а с ним — ещё и тот
+    рендер, который пользователь слушал, вместе с его настройками и готовым
+    файлом. Ссылки голосов (`include_references`) можно не класть: они полезны
+    для разбора тембра, но занимают больше всего места.
+    """
+
+    job_id: str | None = None
+    include_references: bool = True
+    max_audio_mb: float | None = None
+
+
+@app.get("/api/projects/{project_id}/diagnostics")
+async def list_project_diagnostics(project_id: str) -> dict:
+    """Собранные архивы диагностики проекта, от свежих к старым."""
+    project = _project_or_404(project_id)
+    return {"project_id": project_id, "archives": diagnostics.list_archives(project)}
+
+
+@app.post("/api/projects/{project_id}/diagnostics", status_code=201)
+async def create_project_diagnostics(
+    project_id: str, payload: DiagnosticsRequest | None = None
+) -> dict:
+    """Собирает архив диагностики: текст, настройки, решение слоя коротких реплик, аудио.
+
+    Архив — ответ на «почему эта реплика звучит плохо»: рядом лежат исходный и
+    подготовленный текст, эффективные настройки рендера, параметры каждого take'а
+    (включая откат слоя коротких реплик), результат проверки качества, хвост
+    журнала и само аудио. Ничего не меняется: только чтение проекта и файлов.
+
+    Сборка идёт в потоке: это чтение базы, файлов и (best-effort) опрос Ollama —
+    в обработчике событий такому месту нечего делать.
+    """
+    project = _project_or_404(project_id)
+    payload = payload or DiagnosticsRequest()
+
+    job = get_queue().get(payload.job_id) if payload.job_id else None
+    if payload.job_id and job is None:
+        # Указывать на исчезнувшую задачу можно, но молча: архив всё равно
+        # соберётся по проекту, а причина видна в предупреждениях.
+        logger.warning("Задача %s для диагностики не найдена — собираю по проекту", payload.job_id)
+    render_settings = None
+    job_output = None
+    if job is not None and job.payload is not None:
+        render_settings = diagnostics.describe_render_settings(job.payload.settings)
+        job_output = job.output_path
+    else:
+        # Без задачи показываем то, с чем проект собрался бы сейчас: это ближе к
+        # делу, чем пустой блок настроек.
+        settings = _resolved_render_settings(project, ProjectRenderRequest())[0]
+        render_settings = diagnostics.describe_render_settings(settings)
+
+    try:
+        bundle = await asyncio.to_thread(
+            diagnostics.create_diagnostics_archive,
+            project,
+            render_settings=render_settings,
+            job_output=job_output,
+            include_references=payload.include_references,
+            max_audio_mb=payload.max_audio_mb,
+        )
+    except diagnostics.DiagnosticsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "project_id": project_id,
+        "bundle": bundle.to_dict(),
+        "download_url": f"/api/projects/{project_id}/diagnostics/{quote(bundle.name)}",
+        "path": str(bundle.path),
+        "archives": diagnostics.list_archives(project),
+    }
+
+
+@app.get("/api/projects/{project_id}/diagnostics/{name}")
+async def download_project_diagnostics(project_id: str, name: str) -> FileResponse:
+    """Отдаёт готовый архив диагностики. Файл остаётся на диске: его можно найти и глазами."""
+    project = _project_or_404(project_id)
+    try:
+        # Проект передаётся в резолвер: архив соседнего проекта по имени не
+        # открывается — принадлежность проверяется там же, где и путь.
+        path = diagnostics.resolve_archive(name, project=project)
+    except diagnostics.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # `media_type` — zip, а имя файла задаёт архив: браузер сохранит его как есть.
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@app.delete("/api/projects/{project_id}/diagnostics/{name}")
+async def delete_project_diagnostics(project_id: str, name: str) -> dict:
+    """Удаляет архив диагностики — разбор закончен, файл больше не нужен."""
+    project = _project_or_404(project_id)
+    try:
+        diagnostics.discard_archive(name, project=project)
+    except diagnostics.DiagnosticsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"deleted": name}
 
 
 @app.post("/api/projects/import", status_code=201)

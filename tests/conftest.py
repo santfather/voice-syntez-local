@@ -109,6 +109,10 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "projects.db")
     monkeypatch.setattr(config, "PROJECTS_OUTPUT_DIR", output_dir / "projects")
     monkeypatch.setattr(config, "BENCHMARKS_DIR", output_dir / "benchmarks")
+    # Каталог диагностики и лог — туда же: архив качества не должен собираться в
+    # рабочий `output/diagnostics`, а чужой лог делал бы тест недетерминированным.
+    monkeypatch.setattr(config, "DIAGNOSTICS_DIR", output_dir / "diagnostics")
+    monkeypatch.setattr(config, "LOG_PATH", tmp_path / "voice_syntez.log")
     # Менеджер моделей держит состояние скачиваний в памяти, а замеры размеров —
     # в кеше модуля: без сброса тесты влияли бы друг на друга.
     model_manager.reset_manager()

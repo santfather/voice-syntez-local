@@ -259,6 +259,11 @@ class RenderSettings:
     # политика приложения (по умолчанию выключено, пока benchmark не покажет
     # улучшение).
     short_utterance: "ShortUtteranceSettings | None" = None
+    # Имя готового файла, заданное пользователем. Свойство запуска, а не сборки:
+    # в настройках проекта оно не запоминается — иначе следующая сборка молча
+    # взяла бы имя, выбранное для прошлого файла, и получила бы «-2» вместо него.
+    # Пустая строка — прежнее поведение: имя из id задачи.
+    output_name: str = ""
 
 
 @dataclass
@@ -1642,7 +1647,9 @@ async def render_dialogue(
 
     final = await asyncio.to_thread(np.concatenate, pieces)
     final = await asyncio.to_thread(_finalize_track, final)
-    output_path = await asyncio.to_thread(_write_output, job_id, final, settings.output_format)
+    output_path = await asyncio.to_thread(
+        _write_output, job_id, final, settings.output_format, settings.output_name
+    )
     return RenderResult(
         output_path=output_path,
         duration_sec=len(final) / SAMPLE_RATE,
@@ -2053,7 +2060,69 @@ def validate_audio_file(path: Path, *, expect_sample_rate: int | None = SAMPLE_R
     }
 
 
-def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
+# Предел имени файла: длинное имя ломает не запись (её лимит больше), а скачивание
+# в браузере и просмотр каталога. Обрезаем по символам, а не по байтам: кириллица
+# в UTF-8 занимает по два байта, и «40 символов» иначе превратились бы в 20.
+OUTPUT_NAME_MAX_CHARS = 60
+# Форматы, которые пользователь может написать в имени по привычке: «диалог.wav»
+# при формате wav не должно дать «диалог.wav.wav».
+_KNOWN_AUDIO_SUFFIXES = (".wav", ".mp3", ".m4a", ".ogg", ".flac")
+
+
+def safe_output_name(name: str) -> str:
+    """Имя файла из пользовательской строки — без пути и запрещённых символов.
+
+    Имя приходит из интерфейса и подставляется в путь, поэтому из него убирается
+    всё, что может увести запись за пределы `output/` (разделители, `..`), и всё,
+    что запрещено в именах файлов. Кириллица сохраняется: имя файла выбирает
+    пользователь, и транслит здесь был бы неожиданностью, а не безопасностью.
+    Возвращается основа без расширения; пустая строка — имени нет.
+    """
+    cleaned = "".join(
+        char if (char.isalnum() or char in " -_().") else "_" for char in str(name or "")
+    )
+    # Точки уходят вместе с остальным: расширение подставляет пайплайн, а точка в
+    # имени — это либо попытка задать расширение, либо скрытый файл.
+    cleaned = cleaned.strip()
+    cleaned = "_".join(cleaned.split())
+    # Повторы подчёркиваний схлопываются: «отчёт: 2025!» — это одно имя, а не
+    # «отчёт__2025». Так имя остаётся читаемым и не зависит от того, сколько
+    # недопустимых символов стояло рядом.
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    cleaned = cleaned.strip("_-. ")
+    cleaned = cleaned[:OUTPUT_NAME_MAX_CHARS].strip("_-. ")
+    for suffix in _KNOWN_AUDIO_SUFFIXES:
+        if cleaned.lower().endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip("_-. ")
+    return cleaned
+
+
+def _output_target(job_id: str, output_format: str, output_name: str = "") -> Path:
+    """Путь готового файла: имя пользователя или id задачи.
+
+    Имя пользователя не перезаписывает чужой файл: два диалога с именем «Тест»
+    должны лежать рядом, а не затирать друг друга. Поэтому занятое имя получает
+    числовой хвост, а не отказ. Имя из id задачи остаётся как было — оно
+    уникально по построению, и повторная запись того же файла ожидаема.
+    """
+    stem = safe_output_name(output_name)
+    if not stem:
+        return config.OUTPUT_DIR / f"{job_id}.{output_format}"
+    target = config.OUTPUT_DIR / f"{stem}.{output_format}"
+    if target.exists():
+        for number in range(2, 100):
+            candidate = config.OUTPUT_DIR / f"{stem}-{number}.{output_format}"
+            if not candidate.exists():
+                logger.info("Имя «%s» занято — файл записан как %s", stem, candidate.name)
+                return candidate
+        return config.OUTPUT_DIR / f"{stem}-{uuid.uuid4().hex[:6]}.{output_format}"
+    return target
+
+
+def _write_output(
+    job_id: str, audio: np.ndarray, output_format: str, output_name: str = ""
+) -> Path:
     """Пишет готовый файл задачи и проверяет его перед объявлением готовности.
 
     Проверка здесь дублирует ту, что уже сделана в `_write_audio` (иначе файл не
@@ -2062,7 +2131,7 @@ def _write_output(job_id: str, audio: np.ndarray, output_format: str) -> Path:
     записи — цена проверки одна операция чтения метаданных.
     """
     output_format = (output_format or "wav").lower()
-    target = config.OUTPUT_DIR / f"{job_id}.{output_format}"
+    target = _output_target(job_id, output_format, output_name)
     expect = SAMPLE_RATE if output_format == "wav" else None
     _write_audio(target, audio, output_format)
     validate_audio_file(target, expect_sample_rate=expect)
