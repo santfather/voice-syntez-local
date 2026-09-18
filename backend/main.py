@@ -61,6 +61,8 @@ from .job_queue import (
     get_queue,
 )
 from .llm import analyzer as llm_analyzer
+from .llm import memory_policy as llm_memory
+from .llm import scheduler as llm_scheduler
 from .model_manager import (
     ModelBusyError,
     ModelNotDownloadableError,
@@ -999,9 +1001,17 @@ async def transcribe_voice(file: UploadFile = File(...)) -> dict:
         tmp.write(audio_bytes)
         tmp_path = Path(tmp.name)
     try:
-        # Для F5-TTS запись всё равно обрезается до ~12 с — расшифровываем ровно
-        # тот фрагмент, который уйдёт в модель (см. transcribe_worker).
-        result = await asyncio.to_thread(transcribe.transcribe_file, tmp_path)
+        # Whisper — тяжёлый inference: он не должен идти одновременно с синтезом или
+        # LLM-анализом (§14.2 Task 2). Слот берётся здесь, потому что распознавание
+        # референса запускается из API, а не из очереди задач.
+        with llm_scheduler.get_scheduler().hold(
+            llm_memory.HEAVY_WHISPER, owner="transcribe"
+        ):
+            # Для F5-TTS запись всё равно обрезается до ~12 с — расшифровываем ровно
+            # тот фрагмент, который уйдёт в модель (см. transcribe_worker).
+            result = await asyncio.to_thread(transcribe.transcribe_file, tmp_path)
+    except llm_scheduler.HeavyBlockedError as exc:
+        raise HTTPException(status_code=409, detail=f"Распознавание сейчас недоступно: {exc}") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     finally:

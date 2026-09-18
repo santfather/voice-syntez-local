@@ -25,6 +25,7 @@ from .dialogue_parser import Replica
 from .engines import worker_protocol as proto
 from .engines.base import STATE_LOADING, STATE_READY
 from .engines.registry import created_engine, created_engines
+from .llm import memory_policy as llm_memory
 from .voices_store import Voice
 
 logger = logging.getLogger(__name__)
@@ -732,18 +733,54 @@ class JobQueue:
                 await self._wait_for_memory(task.job_id)
                 if self._skip_cancelled(task):
                     continue
-                if isinstance(task, RegenerateTask):
-                    await self._regenerate(task)
-                elif isinstance(task, SelectVariantTask):
+                # Слот нужен только там, где реально работает модель. Выбор
+                # варианта — запись в базу: держать его за LLM-анализом значило бы
+                # задерживать отзывчивое действие интерфейса без причины.
+                if isinstance(task, SelectVariantTask):
                     await self._select_variant(task)
-                elif isinstance(task, ProjectTakeTask):
-                    await self._project_take(task)
-                elif isinstance(task, BenchmarkTask):
-                    await self._benchmark(task)
-                else:
-                    await self._render(task)
+                    continue
+                # Один тяжёлый inference за раз: пока идёт LLM-анализ или чужое
+                # распознавание, синтез ждёт своей очереди на слот. Лёгкие API при
+                # этом продолжают отвечать — они слот не занимают.
+                if not await self._wait_for_heavy_slot(task.job_id):
+                    continue
+                with llm_memory.get_gate().hold(
+                    llm_memory.HEAVY_TTS, owner=f"job:{task.job_id}"
+                ):
+                    if isinstance(task, RegenerateTask):
+                        await self._regenerate(task)
+                    elif isinstance(task, ProjectTakeTask):
+                        await self._project_take(task)
+                    elif isinstance(task, BenchmarkTask):
+                        await self._benchmark(task)
+                    else:
+                        await self._render(task)
             finally:
                 queue.task_done()
+
+    async def _wait_for_heavy_slot(self, job_id: str) -> bool:
+        """Ждёт свободный тяжёлый слот (LLM/Whisper/другой синтез).
+
+        Возвращает `False`, если задача отменена во время ожидания. Ждать, а не
+        отказывать: чужая тяжёлая задача конечна (анализ реплики — секунды), а
+        отказ заставил бы пользователя перезапускать рендер вручную.
+        """
+        job = self._jobs.get(job_id)
+        warned = False
+        while True:
+            holder = llm_memory.get_gate().busy()
+            if not holder:
+                if warned:
+                    logger.info("Задача %s: тяжёлый слот свободен, начинаю", job_id)
+                return True
+            if self._cancelled(job_id):
+                return False
+            if job is not None:
+                job.message = f"Ожидание: {holder}"
+            if not warned:
+                warned = True
+                logger.info("Задача %s ждёт тяжёлый слот: %s", job_id, holder)
+            await asyncio.sleep(MEMORY_WAIT_RETRY_SEC)
 
     async def _wait_for_memory(self, job_id: str) -> None:
         """Не начинает задачу, пока память не в порядке (creash_report §20–§22).
