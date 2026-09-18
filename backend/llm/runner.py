@@ -330,6 +330,7 @@ class BenchmarkRunner:
         pressure_events = 0
         peak_rss = 0.0
         peak_percent = 0.0
+        min_available = None
         cancelled = False
         gate_busy = ""
         try:
@@ -350,6 +351,13 @@ class BenchmarkRunner:
                     memory_samples.append(sample)
                     peak_rss = max(peak_rss, float(sample.get("rss_mb") or 0.0))
                     peak_percent = max(peak_percent, float(sample.get("system_percent") or 0.0))
+                    available = sample.get("available_gb")
+                    if isinstance(available, (int, float)):
+                        # Минимум свободной памяти важнее процента: именно он
+                        # показывает, насколько близко прогон подошёл к резерву.
+                        min_available = (
+                            available if min_available is None else min(min_available, available)
+                        )
                     if sample.get("pressure") in (memory.PRESSURE_YELLOW, memory.PRESSURE_RED):
                         pressure_events += 1
                     # Модель уже загружена. Прерываем работу только по жёсткому
@@ -384,6 +392,7 @@ class BenchmarkRunner:
         memory_summary = {
             "peak_process_memory": round(peak_rss, 1),
             "peak_system_memory_percent": round(peak_percent, 1),
+            "min_available_gb": round(min_available, 2) if min_available is not None else None,
             "memory_pressure_events": pressure_events,
             # Считаются только реальные замеры: при dry-run их нет вовсе.
             "samples": sum(1 for sample in memory_samples if sample),
@@ -592,9 +601,16 @@ class BenchmarkRunner:
             return {"waited_sec": 0.0, "recovered": True, "available_gb": None}
         needed = size_gb + self.thresholds.reserve_min_gb
         started = self.clock()
+        max_attempts = int(RELEASE_TIMEOUT_SEC / RELEASE_POLL_SEC) + 1
+        attempts = 0
         decision = memory.decide_current(thresholds=self.thresholds, sensor=self.sensor)
-        while decision.available_gb < needed and self.clock() - started < RELEASE_TIMEOUT_SEC:
+        while (
+            decision.available_gb < needed
+            and self.clock() - started < RELEASE_TIMEOUT_SEC
+            and attempts < max_attempts
+        ):
             self.sleep(RELEASE_POLL_SEC)
+            attempts += 1
             decision = memory.decide_current(thresholds=self.thresholds, sensor=self.sensor)
         waited = round(self.clock() - started, 1)
         recovered = decision.available_gb >= needed

@@ -506,3 +506,40 @@ def test_benchmark_release_wait_is_bounded(tmp_path):
     report = runner.run(["qwen3:4b"])
     assert report["models"]["qwen3:4b"]["status"] == "blocked"
     assert report["models"]["qwen3:4b"]["metrics"]["memory"]["level"] == "WARNING"
+
+
+def test_benchmark_records_min_available_memory(tmp_path):
+    """Минимум свободной памяти важнее процента: он показывает близость к резерву."""
+    samples = [
+        {"system_percent": 60.0, "available_gb": 9.0, "pressure": "green"},
+        {"system_percent": 78.0, "available_gb": 4.2, "pressure": "green"},
+        {"system_percent": 80.0, "available_gb": 3.1, "pressure": "green"},
+    ]
+    state = {"index": 0}
+
+    def sensor():
+        index = min(state["index"], len(samples) - 1)
+        state["index"] += 1
+        return samples[index]
+
+    ticks = {"value": 0.0}
+
+    def clock() -> float:
+        ticks["value"] += runner_mod.RELEASE_POLL_SEC
+        return ticks["value"]
+
+    runner = runner_mod.BenchmarkRunner(
+        client=_perfect_client(_cases(2)),
+        cases=_cases(2),
+        output_dir=tmp_path,
+        sensor=sensor,
+        on_progress=lambda message: None,
+        sleep=lambda seconds: None,
+        clock=clock,
+    )
+    # Память ниже жёсткого резерва на последнем замере — работа прерывается, но
+    # замеренный минимум обязан остаться в отчёте.
+    report = runner.run(["qwen3:4b"])
+    memory = report["models"]["qwen3:4b"]["memory"]
+    assert memory["min_available_gb"] == 3.1
+    assert memory["peak_system_memory_percent"] == 80.0
