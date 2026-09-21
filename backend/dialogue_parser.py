@@ -87,6 +87,19 @@ class Replica:
     emotion_override: str = ""
     # Явный референс-профиль реплики; пустая строка — выбрать по эмоции.
     reference_profile_id: str = ""
+    # Профиль просодии, **рекомендованный** моделью (UPDATE 3 §10, §24). Не
+    # эмоция и не текст: это цель маршрутизации референса. Пустая строка —
+    # решения по рекомендации нет, и резолвер выводит профиль из эмоции.
+    prosody_profile: str = ""
+    # Метаданные просодии (UPDATE 3 §11–§13, §56): уверенность, интенсивность,
+    # темп, тип реплики и её зависимость от контекста. Всё это — диагностика и
+    # подсказки; ни одно значение не становится параметром движка без отдельного
+    # benchmark (§12), и ни одно не попадает в произносимый текст.
+    prosody_confidence: float | None = None
+    prosody_intensity: float | None = None
+    prosody_pace: str = ""
+    dialogue_act: str = ""
+    context_dependency: str = ""
 
     @property
     def emotion_effective(self) -> str:
@@ -94,6 +107,15 @@ class Replica:
         from .emotions import emotion_effective
 
         return emotion_effective(self.emotion_detected, self.emotion_override)
+
+    @property
+    def prosody_effective(self) -> str:
+        """Действующий профиль просодии: override → рекомендация → эмоция (§24)."""
+        from .emotions import prosody_effective
+
+        return prosody_effective(
+            self.emotion_detected, self.emotion_override, self.prosody_profile
+        )
 
     @property
     def label(self) -> str:
@@ -112,6 +134,8 @@ class Replica:
             "emotion_override": self.emotion_override,
             "emotion_effective": self.emotion_effective,
             "reference_profile_id": self.reference_profile_id,
+            "prosody_profile": self.prosody_profile,
+            "prosody_effective": self.prosody_effective,
         }
 
 

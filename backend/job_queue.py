@@ -1127,19 +1127,27 @@ class JobQueue:
 
     @staticmethod
     def _reference_parameters(reference) -> dict:
-        """Паспорт референса для метаданных варианта (§12)."""
+        """Паспорт референса для метаданных варианта (§12, UPDATE 3 §24)."""
         if reference is None:
             return {}
         return {
             "reference_profile_id": reference.profile_id,
+            "reference_profile_key": reference.resolved_emotion,
             "reference_emotion": reference.resolved_emotion,
             "reference_fallback_used": reference.fallback_used,
+            "reference_fallback_reason": reference.fallback_reason,
+            # Действующая просодия и её источник: `requested` — то, что ушло
+            # резолверу (override → рекомендация → эмоция), `resolved` — профиль,
+            # который он выбрал. Различать их нужно затем, чтобы по метаданным
+            # варианта было видно откат, а не «так и хотели».
+            "prosody_effective": reference.requested_emotion,
+            "prosody_resolved": reference.resolved_emotion,
             "emotion_requested": reference.requested_emotion,
         }
 
     @staticmethod
     def _reference_dict(result: audio_pipeline.RenderResult, index: int) -> dict:
-        """Паспорт референса варианта: профиль, эмоция, был ли откат.
+        """Паспорт референса варианта: профиль, интонация, был ли откат.
 
         Пустой индекс — пустой словарь: старые рендеры (до слоя эмоций) писали
         take'ы без этих полей, и подставлять им «NEUTRAL» значило бы выдумывать
@@ -1150,8 +1158,12 @@ class JobQueue:
             return {}
         return {
             "reference_profile_id": str(reference.get("reference_profile_id") or ""),
+            "reference_profile_key": str(reference.get("resolved_emotion") or ""),
             "reference_emotion": str(reference.get("reference_emotion") or ""),
             "reference_fallback_used": bool(reference.get("reference_fallback_used")),
+            "reference_fallback_reason": str(reference.get("reference_fallback_reason") or ""),
+            "prosody_effective": str(reference.get("requested_emotion") or ""),
+            "prosody_resolved": str(reference.get("resolved_emotion") or ""),
             "emotion_requested": str(reference.get("requested_emotion") or ""),
         }
 
@@ -1366,6 +1378,11 @@ class JobQueue:
                             # референсом получено это звучание, даже когда
                             # эмоция реплики уже сменена.
                             **self._reference_dict(result, index),
+                            # Прогрев: префикс, граница цели и откат (UPDATE 3 §15).
+                            # В обычном UI не показывается, но без него «почему эта
+                            # реплика звучит иначе» не связать с тем, что она
+                            # синтезировалась со скрытым контекстом.
+                            **((result.warmups or {}).get(index) or {}),
                         },
                         "duration_sec": (end - start) / audio_pipeline.SAMPLE_RATE,
                         "qa": result.qa[index].to_dict()
@@ -1391,6 +1408,10 @@ class JobQueue:
                         profile_id=str(reference.get("reference_profile_id") or ""),
                         emotion=str(reference.get("reference_emotion") or ""),
                         fallback_used=bool(reference.get("reference_fallback_used")),
+                        # Ключ профиля и причина отката (§55): без них карточка
+                        # знает, что профиль другой, но не знает какой и почему.
+                        profile_key=str(reference.get("resolved_emotion") or ""),
+                        fallback_reason=str(reference.get("reference_fallback_reason") or ""),
                     )
                 except Exception as exc:  # noqa: BLE001 — история кусков важнее
                     logger.warning(

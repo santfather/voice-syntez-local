@@ -7,13 +7,14 @@ loop, но с движком-заглушкой: проверяется рабо
 import asyncio
 import contextlib
 import time
+import types
 from pathlib import Path
 
 import httpx
 from conftest import analyze_project
 
 from backend import config, main
-from backend.job_queue import JobQueue
+from backend.job_queue import JobQueue, JobStatus
 
 DIALOGUE = "ИВАН: Первая реплика.\nМАРГО: Вторая реплика."
 
@@ -257,5 +258,103 @@ def test_generate_endpoint_still_works(stub, fake_store, monkeypatch):
             assert response.status_code == 202
             data = await _wait_job(client, response.json()["job_id"])
             assert len(data["replicas"]) == 2
+
+    _run(scenario)
+
+
+# --- прогрев коротких реплик в API рендера ------------------------------------
+class _CaptureQueue:
+    """Очередь-перехватчик: запоминает JobPayload, но рендер не запускает.
+
+    Тест проверяет, что флаг прогрева доехал от тела запроса до настроек сборки;
+    сам синтез здесь ни при чём, и поднимать его значило бы проверять не то.
+    """
+
+    def __init__(self) -> None:
+        self.payloads: list[object] = []
+
+    def submit(self, payload, priority=None):
+        self.payloads.append(payload)
+        return types.SimpleNamespace(
+            id="job-capture",
+            status=JobStatus.QUEUED,
+            total_replicas=len(payload.replicas),
+        )
+
+
+async def _prepared_project(client, name: str = "Тест") -> dict:
+    """Проект, готовый к рендеру: голоса назначены, текст разобран и подтверждён."""
+    project = await _create_project(client, name=name)
+    await client.patch(
+        f"/api/projects/{project['id']}",
+        json={
+            "speakers": {
+                "ИВАН": {"voice_id": "voice1"},
+                "МАРГО": {"voice_id": "voice1"},
+            }
+        },
+    )
+    await client.post(f"/api/projects/{project['id']}/parse", json={})
+    await analyze_project(client, project["id"])
+    return project
+
+
+def test_render_request_carries_warmup_flag(stub, fake_store, monkeypatch):
+    """Флаг прогрева из тела запроса обязан дойти до RenderSettings, а не потеряться."""
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            project = await _prepared_project(client)
+            queue = _CaptureQueue()
+            monkeypatch.setattr(main, "get_queue", lambda: queue)
+
+            accepted = await client.post(
+                f"/api/projects/{project['id']}/render",
+                json={"warmup_short_replicas": True, "output_format": "wav"},
+            )
+            assert accepted.status_code == 202, accepted.text
+            assert queue.payloads[0].settings.warmup is True
+
+            # Настройка — часть сборки проекта: повторный запуск без тела запроса
+            # должен звучать так же, а не «по дефолтам».
+            saved = (await client.get(f"/api/projects/{project['id']}")).json()["render_settings"]
+            assert saved["warmup_short_replicas"] is True
+
+    _run(scenario)
+
+
+def test_render_without_warmup_field_uses_saved_or_default(stub, fake_store, monkeypatch):
+    """Отсутствие поля не ломает запрос: берётся сохранённое значение, иначе None."""
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            project = await _prepared_project(client)
+            fresh = await _prepared_project(client, name="Свежий")
+            queue = _CaptureQueue()
+            monkeypatch.setattr(main, "get_queue", lambda: queue)
+
+            first = await client.post(
+                f"/api/projects/{project['id']}/render",
+                json={"warmup_short_replicas": True, "output_format": "wav"},
+            )
+            assert first.status_code == 202, first.text
+            # Поле не пришло: запрос проходит и использует запомненное значение.
+            second = await client.post(
+                f"/api/projects/{project['id']}/render", json={"output_format": "wav"}
+            )
+            assert second.status_code == 202, second.text
+            assert queue.payloads[1].settings.warmup is True
+
+            # Свежий проект ничего не помнит: None означает «политика приложения»,
+            # и это не то же самое, что явное False.
+            assert (
+                (await client.get(f"/api/projects/{fresh['id']}")).json()["render_settings"].get(
+                    "warmup_short_replicas"
+                )
+                is None
+            )
+            third = await client.post(
+                f"/api/projects/{fresh['id']}/render", json={"output_format": "wav"}
+            )
+            assert third.status_code == 202, third.text
+            assert queue.payloads[-1].settings.warmup is None
 
     _run(scenario)

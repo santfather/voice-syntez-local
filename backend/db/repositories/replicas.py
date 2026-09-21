@@ -6,6 +6,29 @@ from ... import config, emotions
 from . import dumps, loads
 
 
+def _optional_float(value: object) -> float | None:
+    """Число из колонки, где NULL — «модель не сказала», а 0.0 — значение.
+
+    Разница существенна: интенсивность `0.0` и отсутствие интенсивности — разные
+    факты, и схлопывать их в одно значило бы выдумывать ответ модели.
+    """
+    return None if value is None else float(value)
+
+
+def _number_or_none(value: object) -> float | None:
+    """Число просодии для записи: вне 0..1 или не число — NULL («не сказала»)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if 0.0 <= number <= 1.0 else None
+
+
+def _pace_or_empty(value: object) -> str:
+    """Темп из словаря §12; неизвестное значение — пустая строка, а не догадка."""
+    text = str(value or "").strip().upper()
+    return text if text in config.PROSODY_PACES else ""
+
+
 def row_to_replica(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -55,6 +78,20 @@ def row_to_replica(row: sqlite3.Row) -> dict:
         "emotion_effective": emotions.emotion_effective(
             row["emotion_detected"], row["emotion_override"]
         ),
+        # Просодия (миграция 10). `prosody_profile` — что **рекомендовала** модель,
+        # `prosody_effective` — куда идти резолверу сейчас: ручной выбор сильнее
+        # рекомендации, а без неё работает прежнее правило по эмоции. Вычисляется
+        # здесь по той же причине, что и `emotion_effective`: правило одно на всё
+        # приложение, и колонка-дубликат однажды разошлась бы с ним.
+        "prosody_profile": row["prosody_profile"],
+        "prosody_intensity": _optional_float(row["prosody_intensity"]),
+        "prosody_pace": row["prosody_pace"],
+        "prosody_confidence": _optional_float(row["prosody_confidence"]),
+        "prosody_effective": emotions.prosody_effective(
+            row["emotion_detected"], row["emotion_override"], row["prosody_profile"]
+        ),
+        "reference_profile_key": row["reference_profile_key"],
+        "reference_fallback_reason": row["reference_fallback_reason"],
     }
 
 
@@ -260,16 +297,23 @@ class ReplicasRepository:
         return cursor.rowcount > 0
 
     def save_emotion(self, replica_id: int, emotion: dict) -> bool:
-        """Пишет эмоцию реплики и фактический референс последнего синтеза.
+        """Пишет эмоцию реплики, просодию и фактический референс последнего синтеза.
 
         Отдельным обновлением от текста, а не вместе с `save_analysis`: анализ
         меняет произносимый текст, а эмоция — только выбор референса, и ручная
         смена эмоции не должна требовать пересчёта подготовки (§11).
+
+        Просодия пишется здесь же, потому что приходит из того же ответа модели,
+        что и эмоция: разнести их по двум обновлениям значило бы допустить
+        состояние, где рекомендация профиля уже новая, а эмоция ещё старая.
         """
         cursor = self._conn.execute(
             "UPDATE replicas SET emotion_detected = ?, emotion_confidence = ?,"
             " emotion_override = ?, dialogue_act = ?, context_dependency = ?,"
-            " reference_profile_id = ?, reference_emotion = ?, reference_fallback_used = ?"
+            " prosody_profile = ?, prosody_intensity = ?, prosody_pace = ?,"
+            " prosody_confidence = ?, reference_profile_id = ?, reference_emotion = ?,"
+            " reference_fallback_used = ?, reference_profile_key = ?,"
+            " reference_fallback_reason = ?"
             " WHERE id = ?",
             (
                 emotions.normalize_emotion(emotion.get("emotion_detected"), default=""),
@@ -277,9 +321,15 @@ class ReplicasRepository:
                 emotions.normalize_emotion(emotion.get("emotion_override"), default=""),
                 str(emotion.get("dialogue_act") or ""),
                 str(emotion.get("context_dependency") or ""),
+                emotions.normalize_profile_key(emotion.get("prosody_profile"), default=""),
+                _number_or_none(emotion.get("prosody_intensity")),
+                _pace_or_empty(emotion.get("prosody_pace")),
+                _number_or_none(emotion.get("prosody_confidence")),
                 str(emotion.get("reference_profile_id") or ""),
                 emotions.normalize_emotion(emotion.get("reference_emotion"), default=""),
                 1 if emotion.get("reference_fallback_used") else 0,
+                emotions.normalize_profile_key(emotion.get("reference_profile_key"), default=""),
+                str(emotion.get("reference_fallback_reason") or ""),
                 replica_id,
             ),
         )
@@ -292,10 +342,20 @@ class ReplicasRepository:
         подготовлено в прошлый раз, а `analysis_status = pending` уже говорит, что
         брать этот `final_text` для рендера нельзя. Без списка индексов помечаются
         все реплики проекта — например, когда поменялся движок сразу у всех.
+
+        Просодия — исключение: **рекомендация профиля стирается**. Она не просто
+        «устарела для показа» — она выбирает файл референса, и оставленная молча
+        привела бы к синтезу с интонацией, выведенной по тексту, которого уже нет
+        (§36, §37). Ручной выбор (`emotion_override`) не трогается никогда: он
+        принадлежит пользователю, а не анализу.
         """
+        stale_prosody = (
+            "prosody_profile = '', prosody_intensity = NULL, prosody_pace = '',"
+            " prosody_confidence = NULL"
+        )
         if indexes is None:
             cursor = self._conn.execute(
-                "UPDATE replicas SET analysis_status = ? WHERE project_id = ?",
+                f"UPDATE replicas SET analysis_status = ?, {stale_prosody} WHERE project_id = ?",
                 (config.REPLICA_ANALYSIS_PENDING, project_id),
             )
             return cursor.rowcount
@@ -303,7 +363,7 @@ class ReplicasRepository:
             return 0
         placeholders = ", ".join("?" for _ in indexes)
         cursor = self._conn.execute(
-            f"UPDATE replicas SET analysis_status = ? WHERE project_id = ?"
+            f"UPDATE replicas SET analysis_status = ?, {stale_prosody} WHERE project_id = ?"
             f" AND idx IN ({placeholders})",
             (config.REPLICA_ANALYSIS_PENDING, project_id, *indexes),
         )

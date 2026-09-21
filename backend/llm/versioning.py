@@ -27,10 +27,12 @@ logger = logging.getLogger("tts.llm.versioning")
 
 BENCHMARK_VERSION = "1"
 # Версия prompt'а анализатора: держится в одном шаге с файлом
-# `benchmarks/russian_linguistics/prompts/analyzer.vN.txt` (v3 — эмоция и речевой
-# акт, UPDATE 2 §32). Паспорт прогона обязан называть ту же версию: иначе отчёт
-# benchmark ссылался бы на prompt, которого модель не видела.
-PROMPT_VERSION = "3"
+# `benchmarks/russian_linguistics/prompts/analyzer.vN.txt` (v4 — маршрутизация
+# просодии: записываемый профиль, интенсивность, темп, UPDATE 3 §8–§13).
+# Паспорт прогона обязан называть ту же версию: иначе отчёт benchmark ссылался бы
+# на prompt, которого модель не видела. Обе версии — и prompt, и схема — входят в
+# ключ кеша, поэтому смена любой из них инвалидирует сохранённый анализ (§46).
+PROMPT_VERSION = "4"
 # Версия схемы берётся из `schemas.SCHEMA_VERSION` — единственного источника:
 # паспорт прогона обязан называть ту же схему, по которой backend проверял ответ.
 

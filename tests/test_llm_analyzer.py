@@ -634,3 +634,166 @@ def test_llm_settings_endpoint_toggles_and_resets_analyzer(monkeypatch, tmp_path
     assert result["after"]["enabled"] is True
     assert result["after"]["settings"]["primary_model"] == "qwen3:4b-instruct-2507-q8_0"
     assert result["body"]["saved"]["enabled"] is True
+
+
+# --- окно сцены (§6, §7): один запрос — разборы нескольких реплик --------------
+SCENE = [
+    {"replica_id": 7, "speaker": "Аня", "target_text": "Где вы были вчера?"},
+    {"replica_id": 8, "speaker": "Борис", "target_text": CASTLE},
+]
+
+
+def _window_response(entries: list[dict]) -> str:
+    """Ответ модели на окно: конверт с разбором на каждую реплику (§7)."""
+    return json.dumps(
+        {"schema_version": s.SCHEMA_VERSION, "replicas": entries}, ensure_ascii=False
+    )
+
+
+def _entry(replica_id: int, items: list[dict] | None = None) -> dict:
+    return {
+        "replica_id": replica_id,
+        "items": items or [],
+        "utterance": {"class": "NORMAL", "context_dependency": "LOW"},
+    }
+
+
+def test_window_schema_is_an_envelope_of_replica_analyses():
+    """Схема окна — конверт: элемент тот же разбор, обязателен только `replica_id`."""
+    schema = s.window_json_schema()
+    assert schema["required"] == ["schema_version", "replicas"]
+    entry = schema["properties"]["replicas"]["items"]
+    assert entry["required"] == ["replica_id"]
+    assert "utterance" in entry["properties"], "разбор реплики в окне — тот же объект"
+
+
+def test_window_analysis_is_keyed_by_replica_id():
+    """Ответ окна раскладывается по `replica_id`, а не по порядку в массиве."""
+    raw = _window_response(
+        [_entry(8, [{"span_start": 25, "span_end": 30, "source": "замка",
+                     "type": "homograph", "confidence": 0.9, "needs_review": False}]),
+         _entry(7)]
+    )
+    window, errors = s.parse_window_analysis(raw, replica_ids=[7, 8])
+    assert errors == []
+    by_id = window.by_replica()
+    assert set(by_id) == {7, 8}
+    assert by_id[8].items[0].source == "замка"
+    assert by_id[7].items == ()
+
+
+def test_window_rejects_unknown_replica_id_and_keeps_the_rest():
+    """Чужой id не привязывается «по порядку»: он отброшен, остальные разборы целы."""
+    raw = _window_response([_entry(99), _entry(7)])
+    window, errors = s.parse_window_analysis(raw, replica_ids=[7, 8])
+    assert errors == []
+    assert window.unknown_ids == (99,)
+    assert set(window.by_replica()) == {7}
+
+
+def test_window_rejects_duplicate_replica_id():
+    """Два разбора одной реплики — конфликт: первый принят, второй отброшен с причиной."""
+    raw = _window_response([_entry(7), _entry(7)])
+    window, _ = s.parse_window_analysis(raw, replica_ids=[7, 8])
+    assert set(window.by_replica()) == {7}
+    assert window.rejected_ids() == (7,)
+    assert s.ERROR_DUPLICATE_REPLICA in window.rejected[0]["errors"]
+
+
+def test_window_envelope_error_rejects_the_whole_response():
+    """Ошибка конверта — это «ответ не про сцену»: он не применяется целиком."""
+    wrong_version = json.dumps(
+        {"schema_version": "0", "replicas": [_entry(7)]}, ensure_ascii=False
+    )
+    window, errors = s.parse_window_analysis(wrong_version, replica_ids=[7])
+    assert window is None
+    assert s.ERROR_SCHEMA_VERSION in errors
+
+    extra = json.dumps(
+        {"schema_version": s.SCHEMA_VERSION, "replicas": [_entry(7)], "text": "чужое"},
+        ensure_ascii=False,
+    )
+    window, errors = s.parse_window_analysis(extra, replica_ids=[7])
+    assert window is None
+    assert s.ERROR_UNKNOWN_FIELD in errors
+
+
+def test_window_accepts_single_object_from_small_model():
+    """Маленькая модель отвечает одним разбором вместо конверта — он не теряется."""
+    raw = _response([], replica_id=7)
+    window, errors = s.parse_window_analysis(raw, replica_ids=[7, 8])
+    assert errors == []
+    assert set(window.by_replica()) == {7}
+
+
+def test_analyze_window_makes_one_request_for_the_whole_scene():
+    """Сцена — один запрос: в нём все реплики с говорящими, ответ — по каждой (§7)."""
+    captured: dict = {}
+
+    def responder(case):
+        captured.update(case)
+        return _window_response([_entry(item["replica_id"]) for item in case["replicas"]])
+
+    analyzer, client = _analyzer(responder)
+    results = analyzer.analyze_window(scene=SCENE)
+
+    assert len(client.calls) == 1, "окно — один запрос, а не запрос на реплику"
+    assert set(results) == {7, 8}
+    assert all(item.status == llm.STATUS_READY for item in results.values())
+    assert [item["replica_id"] for item in captured["replicas"]] == [7, 8]
+    assert [item["speaker"] for item in captured["replicas"]] == ["Аня", "Борис"]
+    assert captured["replicas"][1]["target_text"] == CASTLE
+    # Разбор окна принадлежит оконному prompt'у: иначе кеш смешал бы его с одиночным.
+    assert results[7].prompt_version == analyzer.window_prompt.version
+    assert analyzer.window_prompt.version != analyzer.prompt.version
+    assert results[7].context_hash == results[8].context_hash, "контекст у окна общий"
+
+
+def test_analyze_window_replica_failure_does_not_cancel_other_replicas():
+    """Отказ одной реплики не отменяет окно: §47 — «reject field, не падать всем проектом»."""
+    def responder(case):
+        entries = []
+        for item in case["replicas"]:
+            items = []
+            if item["replica_id"] == 7:
+                items = [{"span_start": 0, "span_end": 1, "source": "Г",
+                          "type": "выдуманный", "confidence": 0.5, "needs_review": False}]
+            entries.append(_entry(item["replica_id"], items))
+        return _window_response(entries)
+
+    analyzer, _ = _analyzer(responder)
+    results = analyzer.analyze_window(scene=SCENE)
+
+    assert results[7].status == llm.STATUS_FAILED
+    assert s.ERROR_UNKNOWN_TYPE in results[7].error
+    assert results[8].status == llm.STATUS_READY
+
+
+def test_analyze_window_missing_replica_is_visible_failure():
+    """Реплика, о которой модель не ответила, получает отказ с причиной, а не тишину."""
+    def responder(case):
+        return _window_response([_entry(8)])
+
+    analyzer, _ = _analyzer(responder)
+    results = analyzer.analyze_window(scene=SCENE)
+
+    assert results[7].status == llm.STATUS_FAILED
+    assert "не разобрана" in results[7].error
+    assert results[8].status == llm.STATUS_READY
+
+
+def test_analyze_window_is_disabled_without_calling_the_model():
+    """Выключенный Analyzer не ходит в модель, но состояние видно по каждой реплике."""
+    captured: list = []
+
+    def responder(case):
+        captured.append(case)
+        return _window_response([])
+
+    analyzer, client = _analyzer(responder, settings=_settings(enabled=False))
+    results = analyzer.analyze_window(scene=SCENE)
+
+    assert client.calls == []
+    assert captured == []
+    assert all(item.status == llm.STATUS_DISABLED for item in results.values())
+

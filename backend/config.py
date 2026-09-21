@@ -304,6 +304,24 @@ def _engine_strategies() -> dict[str, str]:
 
 SHORT_UTTERANCE_ENGINE_STRATEGIES = _engine_strategies()
 
+# --- Просодическая маршрутизация (UPDATE 3 §25, §26, §35) --------------------
+# Режим отката резолвера референсов:
+#   `neutral_only` — нужного интонационного профиля нет → NEUTRAL с явной
+#       пометкой. Консервативный режим и значение по умолчанию: §26 разрешает
+#       откат «на соседний профиль» только после Reference Prosody Transfer
+#       Benchmark, а он ещё не подтвердил ни одну цепочку (§35).
+#   `chain` — таблица цепочек (`reference_resolver.FALLBACK_CHAINS`) целиком.
+# Переключается по факту benchmark'а (Phase 11), а не «на глаз»: неподтверждённый
+# откат — это подмена одного звучания другим без доказательства, что оно ближе.
+PROSODY_FALLBACK_MODE_ENV = "TTS_PROSODY_FALLBACK_MODE"
+PROSODY_FALLBACK_MODE = os.environ.get(PROSODY_FALLBACK_MODE_ENV, "neutral_only").strip()
+
+# Темп фразы (§12) — контролируемый словарь приложения. `llm/schemas.py` держит
+# свою копию осознанно: пакет `llm` не импортирует остальное приложение и
+# тестируется без него. Равенство наборов проверяется тестом, поэтому разойтись
+# они не могут.
+PROSODY_PACES: tuple[str, ...] = ("SLOW", "NORMAL", "FAST")
+
 # --- Изоляция синтеза в отдельном процессе (creash_report) --------------------
 # Модель и инференс живут в дочернем процессе. Причина не в архитектурной
 # красоте: падение нативной библиотеки (SIGABRT/SIGSEGV) или убийство процесса
@@ -523,6 +541,52 @@ SHORT_EDGE_GUARD_MS = float(os.environ.get("TTS_SHORT_EDGE_GUARD_MS", "60"))
 # Выключено по умолчанию — трейс пишет файлы и нужен только при разборе.
 SYNTHESIS_TRACE_ENV = "TTS_SYNTHESIS_TRACE"
 SYNTHESIS_TRACE_DIR_ENV = "TTS_SYNTHESIS_TRACE_DIR"
+
+# --- Прогрев коротких реплик (warm-up prefix) ----------------------------------
+# Перед короткой репликой в TTS уходит скрытый естественный текст, а в готовый
+# файл попадает только цель (см. backend/warmup_context.py). Выключено по
+# умолчанию до живого A/B на реальных голосах: включение функции, которая
+# добавляет LLM-вызов и alignment в каждый короткий кусок, — решение по измерению,
+# а не по предположению (§23, §25 пакета).
+WARMUP_ENV = "TTS_WARMUP_ENABLED"
+WARMUP_ENABLED = os.environ.get(WARMUP_ENV, "0").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+# Короткость цели: те же две оси, что у слоя коротких реплик (знаки и слова), но
+# свои пороги — прогрев дороже контекста, поэтому его область уже.
+WARMUP_MAX_CHARS = int(os.environ.get("TTS_WARMUP_MAX_CHARS", "80"))
+WARMUP_MAX_WORDS = int(os.environ.get("TTS_WARMUP_MAX_WORDS", "12"))
+# Предел префикса: длинный контекст не улучшает вход в речь, а удлиняет синтез и
+# повышает шанс, что модель «уедет» в собственный текст.
+WARMUP_MAX_PREFIX_CHARS = int(os.environ.get("TTS_WARMUP_MAX_PREFIX_CHARS", "180"))
+WARMUP_LLM_TIMEOUT_SEC = float(os.environ.get("TTS_WARMUP_LLM_TIMEOUT_SEC", "10"))
+# Сколько токенов разрешено модели: два предложения — это десятки токенов, а не
+# сотни. Ограничение спасает от «размышлений» на локальной модели.
+WARMUP_MAX_TOKENS = int(os.environ.get("TTS_WARMUP_MAX_TOKENS", "96"))
+WARMUP_TEMPERATURE = float(os.environ.get("TTS_WARMUP_TEMPERATURE", "0.3"))
+WARMUP_SEED = int(os.environ.get("TTS_WARMUP_SEED", "0"))
+WARMUP_NUM_CTX = int(os.environ.get("TTS_WARMUP_NUM_CTX", "2048"))
+WARMUP_KEEP_ALIVE = os.environ.get("TTS_WARMUP_KEEP_ALIVE", "5m")
+# Запас перед найденной границей цели: атаку первого фонема легко срезать «по
+# границе слова». Значение измеряется на живом прогоне, а не берётся из головы.
+WARMUP_PREROLL_MS = float(os.environ.get("TTS_WARMUP_PREROLL_MS", "30"))
+# Уверенность alignment: доля найденных слов цели. Ниже порога граница считается
+# ненадёжной, и пайплайн синтезирует цель заново без прогрева (fail-safe, §9).
+WARMUP_ALIGNMENT_MIN_CONFIDENCE = float(
+    os.environ.get("TTS_WARMUP_ALIGNMENT_MIN_CONFIDENCE", "0.8")
+)
+WARMUP_CACHE_SIZE = int(os.environ.get("TTS_WARMUP_CACHE_SIZE", "256"))
+# Движки, для которых прогрев разрешён. Список, а не флаг: разные движки
+# по-разному реагируют на контекст, и отключать их нужно по одному (§13).
+WARMUP_ENGINES = tuple(
+    item.strip()
+    for item in os.environ.get("TTS_WARMUP_ENGINES", "f5").split(",")
+    if item.strip()
+)
 
 # --- Дефолтные параметры XTTS v2 ----------------------------------------------
 # Значения совпадают с тем, что записано в config.json базовой модели и

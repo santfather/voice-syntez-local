@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from . import config
+from . import config, emotions
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +287,12 @@ class ShortUtteranceContext:
     llm_class: str | None = None
     llm_context_dependency: str | None = None
     llm_relevant: tuple[int, ...] = ()
+    # Действующая интонация цели (UPDATE 3 §52). Нужна политике совместимости:
+    # контекст берётся у того же спикера, но одинаковый голос не значит
+    # одинаковую интонацию — крик и спокойная фраза в одном контексте дали бы
+    # модели чужой регистр. Пустая строка — «неизвестно», и она ничего не
+    # запрещает: без анализа слой обязан работать как раньше.
+    prosody: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -302,6 +308,7 @@ class ShortUtteranceContext:
             "llm_class": self.llm_class,
             "llm_context_dependency": self.llm_context_dependency,
             "llm_relevant": list(self.llm_relevant),
+            "prosody": self.prosody,
         }
 
 
@@ -321,8 +328,25 @@ def _speaker_of(replica) -> str:
     return str(getattr(replica, "voice", "") or "")
 
 
+def _prosody_of(replica) -> str:
+    """Действующая интонация реплики; без слоя просодии — пустая строка.
+
+    Поле читается у реплики, а не считается здесь: правило «override →
+    рекомендация → эмоция» живёт в модели реплики (§24), и второй его копии в
+    этом слое быть не должно. Реплика без анализа отдаёт NEUTRAL — тот же
+    спокойный регистр, что и у соседа, поэтому политика совместимости ничего не
+    запрещает и слой работает как раньше (§2, §52).
+    """
+    return str(getattr(replica, "prosody_effective", "") or "").strip()
+
+
 def _nearest_same_speaker(
-    prepared: list[str], speakers: list[str], index: int, step: int, window: int
+    prepared: list[str],
+    speakers: list[str],
+    prosody: list[str],
+    index: int,
+    step: int,
+    window: int,
 ) -> str | None:
     """Ближайшая реплика того же спикера в пределах окна — до или после цели.
 
@@ -330,13 +354,21 @@ def _nearest_same_speaker(
     другому персонажу («— Ты уже пришёл? — Да.»), и контекст того же голоса
     оказывается на расстоянии двух-трёх реплик. Именно он и нужен: это речь того
     же человека, её и может прочитать текущий голос.
+
+    Совместимость интонации — второе условие, наравне с голосом (§52). Реплика
+    того же спикера, но другого регистра (крик рядом со спокойной фразой) —
+    плохой контекст: модель прочитала бы цель в чужом звучании. Несовместимого
+    соседа пропускаем и ищем дальше; если подходящего нет, контекста нет вовсе, и
+    стратегия честно откатывается на DIRECT, а не «примерно по смыслу».
     """
     position = index + step
     while 0 <= position < len(prepared) and (position - index) * step <= window:
         if not prepared[position]:
             position += step
             continue
-        if speakers[position] == speakers[index]:
+        if speakers[position] == speakers[index] and emotions.prosody_compatible(
+            prosody[index], prosody[position]
+        ):
             return prepared[position]
         position += step
     return None
@@ -368,6 +400,7 @@ def build_contexts(
     items = list(replicas)
     prepared = [_prepared_text(replica) for replica in items]
     speakers = [_speaker_of(replica) for replica in items]
+    prosody = [_prosody_of(replica) for replica in items]
     limit = config.SHORT_UTTERANCE_CONTEXT_WINDOW if window is None else window
     contexts: list[ShortUtteranceContext] = []
     for index, replica in enumerate(items):
@@ -380,13 +413,16 @@ def build_contexts(
                 previous_text=prepared[index - 1] if index > 0 else None,
                 next_text=prepared[index + 1] if index + 1 < len(prepared) else None,
                 same_speaker_previous=_nearest_same_speaker(
-                    prepared, speakers, index, -1, limit
+                    prepared, speakers, prosody, index, -1, limit
                 ),
-                same_speaker_next=_nearest_same_speaker(prepared, speakers, index, 1, limit),
+                same_speaker_next=_nearest_same_speaker(
+                    prepared, speakers, prosody, index, 1, limit
+                ),
                 utterance=classify_utterance(prepared[index], thresholds),
                 llm_class=_hint_str(llm_hints, index, "class"),
                 llm_context_dependency=_hint_str(llm_hints, index, "context_dependency"),
                 llm_relevant=_hint_relevant(llm_hints, index),
+                prosody=prosody[index],
             )
         )
     return contexts
@@ -630,6 +666,11 @@ def build_batches(
     реплики (их обрабатывать не нужно, но вызывающему так проще). Реплики разных
     спикеров не объединяются никогда: это был бы один голос на два персонажа
     (§10), поэтому `allow_cross_speaker` существует только для benchmark'а.
+
+    Второе условие склейки — совместимость интонации (§52). Даже один голос
+    звучит по-разному в спокойной фразе и в крике: общий синтез дал бы обеим
+    репликам один регистр, и одна из них прозвучала бы неверно. Поэтому смена
+    регистра разрывает группу так же, как смена спикера.
     """
     limit = max_replicas or config.SHORT_UTTERANCE_BATCH_MAX
     groups: list[ShortBatch] = []
@@ -645,7 +686,8 @@ def build_batches(
         if current:
             previous = contexts[current[-1]]
             same = previous.speaker == context.speaker or allow_cross_speaker
-            if not same or len(current) >= limit:
+            compatible = emotions.prosody_compatible(previous.prosody, context.prosody)
+            if not same or not compatible or len(current) >= limit:
                 groups.append(_make_batch(contexts, current))
                 current = []
         current.append(index)

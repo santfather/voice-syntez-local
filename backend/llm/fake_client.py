@@ -199,6 +199,18 @@ class FakeOllamaClient:
         preset = self._responses.get(model)
         if preset is not None:
             return _shape_response(preset, case)
+        scene = case.get("replicas")
+        if isinstance(scene, list):
+            # Запрос на окно (§7): ответ — конверт, по разбору на каждую реплику
+            # входа. Клиент повторяет то, что обязан сделать prompt, а не знает
+            # что-то своё: иначе тест проходил бы на поведении, которого в бою нет.
+            return json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "replicas": [self._entry(item) for item in scene],
+                },
+                ensure_ascii=False,
+            )
         replica_id = int(case.get("replica_id") or -1)
         gold = case.get("expected") or self._gold.get(replica_id, [])
         return json.dumps(
@@ -214,18 +226,45 @@ class FakeOllamaClient:
             ensure_ascii=False,
         )
 
+    def _entry(self, item: dict) -> dict:
+        """Разбор одной реплики окна: gold по `replica_id` или пустые аннотации."""
+        replica_id = int(item.get("replica_id") or -1)
+        gold = item.get("expected") or self._gold.get(replica_id, [])
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "replica_id": item.get("replica_id", 0),
+            "items": gold,
+            "utterance": {
+                "class": self._utterance.get(replica_id, "NORMAL"),
+                "context_dependency": "LOW",
+            },
+        }
+
 
 def _shape_response(preset: str | dict, case: dict) -> str:
     """Подставляет в заготовку ответа `replica_id` кейса.
 
     Заготовки в тестах пишутся как «ответ модели» и не должны знать, какой id
     придёт: id подставляет клиент — так же, как это делает настоящая модель по
-    инструкции prompt'а.
+    инструкции prompt'а. Оконная заготовка (с `replicas`) получает id реплик входа
+    по порядку: порядок реплик в окне и в ответе совпадает по построению.
     """
     if isinstance(preset, dict):
         payload = dict(preset)
-        payload.setdefault("replica_id", case.get("replica_id", 0))
         payload.setdefault("schema_version", SCHEMA_VERSION)
+        incoming = case.get("replicas")
+        if isinstance(incoming, list) and isinstance(payload.get("replicas"), list):
+            entries: list[dict] = []
+            for position, raw_entry in enumerate(payload["replicas"]):
+                entry = dict(raw_entry)
+                if position < len(incoming):
+                    entry.setdefault(
+                        "replica_id", int(incoming[position].get("replica_id") or 0)
+                    )
+                entries.append(entry)
+            payload["replicas"] = entries
+            return json.dumps(payload, ensure_ascii=False)
+        payload.setdefault("replica_id", case.get("replica_id", 0))
         return json.dumps(payload, ensure_ascii=False)
     return preset
 
@@ -235,7 +274,8 @@ def _case_from_messages(messages: list[dict], responses: dict[str, list[str]]) -
 
     Runner передаёт кейс в prompt как JSON — подставной клиент читает его обратно,
     чтобы ответить gold-аннотациями. Это ровно тот путь, которым пойдёт настоящая
-    модель: никакого «второго канала» с кейсом у клиента нет.
+    модель: никакого «второго канала» с кейсом у клиента нет. Кейс бывает
+    одиночным (`target_text`) и оконным (`replicas`) — оба распознаются по форме.
     """
     for message in reversed(messages):
         content = str(message.get("content") or "")
@@ -246,6 +286,8 @@ def _case_from_messages(messages: list[dict], responses: dict[str, list[str]]) -
                 payload = json.loads(content[start : end + 1])
             except ValueError:
                 continue
-            if isinstance(payload, dict) and "target_text" in payload:
+            if isinstance(payload, dict) and (
+                "target_text" in payload or "replicas" in payload
+            ):
                 return payload
     return {}

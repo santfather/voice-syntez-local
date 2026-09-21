@@ -15,7 +15,14 @@ from typing import Any
 
 import numpy as np
 
-from . import config, qa_screening, reference_resolver, synthesis_trace, take_quality
+from . import (
+    config,
+    qa_screening,
+    reference_resolver,
+    synthesis_trace,
+    take_quality,
+    warmup_context,
+)
 from . import short_utterance as su
 from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
@@ -264,6 +271,11 @@ class RenderSettings:
     # политика приложения (по умолчанию выключено, пока benchmark не покажет
     # улучшение).
     short_utterance: "ShortUtteranceSettings | None" = None
+    # Прогрев коротких реплик (warmup-context): перед короткой фразой в модель
+    # уходит скрытый текст, а в файл попадает только цель. `None` — политика
+    # приложения (`config.WARMUP_ENABLED`), `False` — выключено для этой задачи,
+    # `True` — включено. Свойство запуска, как и проверка качества.
+    warmup: bool | None = None
     # Имя готового файла, заданное пользователем. Свойство запуска, а не сборки:
     # в настройках проекта оно не запоминается — иначе следующая сборка молча
     # взяла бы имя, выбранное для прошлого файла, и получила бы «-2» вместо него.
@@ -290,6 +302,8 @@ class RenderResult:
     # План короткой реплики по индексу: класс, стратегия, источник контекста,
     # отпечаток синтез-текста (§24). Пусто — слой не применялся.
     short_runs: dict[int, "ShortRun"] = field(default_factory=dict)
+    # Прогрев коротких реплик по индексу: префикс, граница цели и откат (§15).
+    warmups: dict[int, dict] = field(default_factory=dict)
     # Фактически использованный референс по индексу реплики (UPDATE 2 §10):
     # профиль, эмоция и признак отката на NEUTRAL. Нужен, чтобы карточка реплики
     # и метаданные take'а показывали **факт**, а не намерение.
@@ -961,6 +975,7 @@ async def _synthesize_chunk(
     label: str,
     source_text: str | None = None,
     reference: "reference_resolver.ResolvedReference | None" = None,
+    seed: int | None = None,
 ) -> tuple[np.ndarray, int | None]:
     """Синтезирует один кусок, отделяя свой таймаут от чужой ошибки движка.
 
@@ -980,8 +995,16 @@ async def _synthesize_chunk(
     `reference` — выбранный референс (эмоциональный или нейтральный, см.
     `reference_resolver`). Без него берётся основной референс голоса: разовые
     задачи и старые вызовы продолжают работать как раньше.
+
+    `seed` — принудительный сид. Production его не задаёт (сид выбирается
+    случайно на каждую попытку), а benchmark'у просодии он нужен: сравнение
+    reference-профилей обязано отличаться **только** профилем (§32).
     """
-    seed = random.randrange(config.SEED_MAX) if engine.supports_seed else None
+    seed = (
+        seed
+        if seed is not None
+        else (random.randrange(config.SEED_MAX) if engine.supports_seed else None)
+    )
     params = _engine_params(tuning, settings, seed)
     ref_audio_path = str(reference.audio_path) if reference is not None else str(voice.audio_path)
     ref_text = reference.ref_text if reference is not None else voice.ref_text
@@ -1242,12 +1265,17 @@ async def _synthesize_attempt(
     attempt: int,
     trace: "synthesis_trace.ReplicaTrace | None" = None,
     reference: "reference_resolver.ResolvedReference | None" = None,
+    seed: int | None = None,
+    warmup: "warmup_context.WarmupContext | None" = None,
 ) -> tuple[np.ndarray, int | None]:
     """Одна попытка: синтез плана, обрезка до цели и откат, если границы нет.
 
     Порядок обязателен: обрезка идёт **до** подготовки куска, потому что
     подготовка выравнивает громкость, и с необрезанным контекстом уровень задавал
     бы он, а не целевая реплика.
+
+    `seed` — принудительный сид для benchmark'а просодии; в production не задан,
+    и каждая попытка берёт случайный (см. `_synthesize_chunk`).
     """
     # План применяется, пока не случился откат. Откат закрепляется: если границы
     # не нашлось, следующие попытки синтезируют цель сразу — повторять заведомо
@@ -1260,6 +1288,20 @@ async def _synthesize_attempt(
         plain_text = short.plan.engine_target_text or text
     use_plan = short is not None and short.active and not short.fallback
     synthesis_text = short.plan.synthesis_text if use_plan else plain_text
+    # Прогрев: в модель уходит «скрытый префикс + цель», из аудио остаётся только
+    # цель. Префикс готовится тем же путём, что и цель (`_text_for_engine`): у F5
+    # это с ударениями, у XTTS — без «+»-разметки, по паспорту движка (§8).
+    warmup_prefix = (warmup.prefix_text or "") if warmup is not None else ""
+    if warmup_prefix:
+        prepared_prefix = await asyncio.to_thread(
+            _text_for_engine, warmup_prefix, engine, settings.auto_accent
+        )
+        if prepared_prefix.strip():
+            warmup_prefix = prepared_prefix
+            synthesis_text = f"{warmup_prefix.rstrip()} {plain_text.lstrip()}"
+        else:
+            # Префикс целиком состоял из служебных знаков — прогрева не будет.
+            warmup_prefix = ""
     needs_crop = use_plan and short.plan.needs_crop
     chunk, seed = await _synthesize_chunk(
         engine,
@@ -1271,11 +1313,79 @@ async def _synthesize_attempt(
         label=label,
         source_text=replica.text,
         reference=reference,
+        seed=seed,
     )
     if trace is not None:
         trace.seed = seed
         trace.stage(synthesis_trace.STAGE_RAW, chunk)
         _short_trace_fields(trace, short)
+    if warmup_prefix and warmup is not None:
+        # Границу цели ищем **на каждой попытке** заново: новый сид даёт другую
+        # длительность префикса, и прошлый timestamp к ней не относится (§14).
+        boundary = await asyncio.to_thread(
+            warmup_context.locate_target_start,
+            chunk,
+            SAMPLE_RATE,
+            synthesis_text,
+            plain_text,
+        )
+        if boundary is None:
+            # Fail-safe обязателен: сомнительный результат не используем вовсе, а
+            # синтезируем цель заново без прогрева (§9). Повреждённый trim хуже,
+            # чем отсутствие улучшения.
+            warmup.fallback = warmup_context.REASON_ALIGNMENT
+            logger.info("warmup fallback replica=%s reason=%s", position, warmup.fallback)
+            chunk, seed = await _synthesize_chunk(
+                engine,
+                voice,
+                plain_text,
+                _nudge_tuning(voice, engine, tuning, attempt - 1),
+                settings,
+                position=position,
+                label=label,
+                source_text=replica.text,
+                reference=reference,
+                seed=seed,
+            )
+            if trace is not None:
+                trace.seed = seed
+                trace.warmup_used = True
+                trace.warmup_fallback = warmup.fallback
+                trace.warmup_prefix_chars = len(warmup.prefix_text or "")
+                trace.stage(
+                    synthesis_trace.STAGE_RAW,
+                    chunk,
+                    note="после отката прогрева: цель отдельно",
+                )
+                trace.stage(
+                    synthesis_trace.STAGE_CONTEXT,
+                    None,
+                    note="граница цели не найдена — прогрев отброшен",
+                )
+            return chunk, seed
+        preroll = int(SAMPLE_RATE * max(config.WARMUP_PREROLL_MS, 0) / 1000)
+        start = max(0, int(boundary.start_sec * SAMPLE_RATE) - preroll)
+        warmup.boundary_sec = boundary.start_sec
+        logger.info(
+            "warmup aligned replica=%s boundary=%.2fs confidence=%s words=%s/%s",
+            position, boundary.start_sec, boundary.confidence,
+            boundary.matched_words, boundary.total_words,
+        )
+        if trace is not None:
+            trace.warmup_used = True
+            trace.warmup_prefix_chars = len(warmup.prefix_text or "")
+            trace.warmup_boundary_sec = boundary.start_sec
+            trace.stage(
+                synthesis_trace.STAGE_CONTEXT,
+                chunk[start:],
+                note=(
+                    "прогрев отрезан по границе "
+                    f"{boundary.method} (уверенность {boundary.confidence:.2f}, "
+                    f"запас {config.WARMUP_PREROLL_MS:.0f} мс)"
+                ),
+            )
+        return chunk[start:], seed
+
     if not needs_crop:
         if trace is not None:
             # Обрезки контекста не было — это факт, а не отсутствие данных.
@@ -1314,6 +1424,7 @@ async def _synthesize_attempt(
             label=label,
             source_text=replica.text,
             reference=reference,
+            seed=seed,
         )
         if trace is not None:
             trace.seed = seed
@@ -1350,6 +1461,8 @@ async def _synthesize_checked(
     context: su.ShortUtteranceContext | None = None,
     trace: "synthesis_trace.ReplicaTrace | None" = None,
     reference: "reference_resolver.ResolvedReference | None" = None,
+    seed: int | None = None,
+    warmup: "warmup_context.WarmupContext | None" = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None, ShortRun | None]:
     """Синтез куска: обычный, с проверкой (`settings.qa`) и/или коротким слоем.
 
@@ -1386,7 +1499,13 @@ async def _synthesize_checked(
         text = await asyncio.to_thread(
             _text_for_engine, replica.text, engine, settings.auto_accent
         )
-    short = short_run_for(replica, engine, settings, context=context)
+    # Прогрев и контекст короткого слоя — два ответа на одну проблему: если
+    # прогрев применён, контекстный план не строится вовсе. Иначе в модель ушли бы
+    # и префикс, и соседняя реплика, а обрезать пришлось бы дважды.
+    if warmup is not None and warmup.prefix_text:
+        short = None
+    else:
+        short = short_run_for(replica, engine, settings, context=context)
     qa = settings.qa
     use_qa = qa is not None and qa.mode != config.QA_MODE_OFF
     if trace is not None:
@@ -1410,7 +1529,7 @@ async def _synthesize_checked(
     if short is None and not use_qa:
         chunk, seed = await _synthesize_attempt(
             engine, voice, replica, text, tuning, settings, position, label, None, 1, trace,
-            reference,
+            reference, seed, warmup,
         )
         return chunk, seed, None, None
 
@@ -1451,7 +1570,7 @@ async def _synthesize_checked(
 
         chunk, seed = await _synthesize_attempt(
             engine, voice, replica, text, tuning, settings, position, label, attempt_short,
-            attempt, trace, reference,
+            attempt, trace, reference, seed, warmup,
         )
         attempts = attempt
         if attempt_short is not None:
@@ -1783,6 +1902,18 @@ async def render_dialogue(
             llm_hints=llm_hints,
         )
 
+    # Прогрев коротких реплик: префикс спрашивается у локальной LLM и живёт только
+    # до синтеза. Строится лениво — по реплике перед её синтезом, а не пачкой:
+    # прогрев нужен только коротким, а вызов LLM стоит времени (§18).
+    warmup_enabled = (
+        config.WARMUP_ENABLED if settings.warmup is None else bool(settings.warmup)
+    )
+    if warmup_enabled:
+        logger.info(
+            "warmup enabled job=%s replicas=%s engines=%s",
+            job_id, len(replicas), ",".join(config.WARMUP_ENGINES),
+        )
+
     resolved: dict[str, Voice] = {}
     per_replica: dict[int, SpeakerSettings] = {}
     for index, replica in enumerate(replicas):
@@ -1799,6 +1930,7 @@ async def render_dialogue(
     engines = await _load_engines(list(resolved.values()), on_loaded=on_engine_loaded)
 
     references: dict[int, dict] = {}
+    warmups: dict[int, dict] = {}
     pieces: list[np.ndarray] = list(resume.pieces) if resume else []
     segments: list[tuple[int, int]] = list(resume.segments) if resume else []
     seeds: list[int | None] = list(resume.seeds) if resume else []
@@ -1844,13 +1976,36 @@ async def render_dialogue(
             settings_for_replica = per_replica[index - 1]
             voice = resolved[settings_for_replica.voice_id]
             engine = engines[voice.engine]
-            # Референс выбирается под эмоцию реплики одним резолвером (UPDATE 2 §10):
-            # эмоциональный профиль того же голоса, иначе его нейтральный. Гарантия
-            # «только свой голос» структурная — профили лежат внутри голоса.
-            reference = reference_resolver.resolve_reference(
-                voice, engine.id, replica.emotion_effective, profile_id=replica.reference_profile_id
+            # Референс выбирается под действующую просодию реплики одним резолвером
+            # (UPDATE 3 §24, §51): `override → рекомендация модели → эмоция`.
+            # Раньше здесь стояла эмоция, и рекомендованный профиль (`SURPRISE →
+            # EXCLAMATION`) до движка не доезжал — LLM называла интонацию, а
+            # синтез получал референс прежней эмоции. Гарантия «только свой голос»
+            # структурная — профили лежат внутри голоса.
+            reference = reference_resolver.resolve_prosody(
+                voice, engine.id, replica.prosody_effective, profile_id=replica.reference_profile_id
             )
             references[index - 1] = reference.to_dict()
+            warmup: warmup_context.WarmupContext | None = None
+            if warmup_enabled:
+                warmup = await asyncio.to_thread(
+                    warmup_context.get_service().build,
+                    target_text=replica.final_text or replica.text,
+                    engine_id=engine.id,
+                    previous_text=(replicas[index - 2].final_text or replicas[index - 2].text)
+                    if index >= 2
+                    else None,
+                    next_text=(replicas[index].final_text or replicas[index].text)
+                    if index < total
+                    else None,
+                    speaker=replica.label,
+                )
+                if warmup.prefix_text:
+                    logger.info(
+                        "warmup used replica=%s target_chars=%s prefix_chars=%s cache_hit=%s",
+                        index, len(replica.final_text or replica.text),
+                        len(warmup.prefix_text), warmup.cache_hit,
+                    )
             replica_trace = None
             if trace is not None:
                 replica_trace = trace.replica(
@@ -1869,9 +2024,23 @@ async def render_dialogue(
                 replica_trace.emotion_detected = replica.emotion_detected
                 replica_trace.emotion_override = replica.emotion_override
                 replica_trace.emotion_effective = replica.emotion_effective
+                # Интонация: рекомендация модели и то, что дошло до резолвера.
+                # Второе может отличаться от первого — при ручном выборе (§37).
+                replica_trace.prosody_profile = getattr(replica, "prosody_profile", "")
+                replica_trace.prosody_effective = replica.prosody_effective
+                replica_trace.prosody_confidence = getattr(replica, "prosody_confidence", None)
+                replica_trace.prosody_intensity = getattr(replica, "prosody_intensity", None)
+                replica_trace.prosody_pace = getattr(replica, "prosody_pace", "")
+                replica_trace.dialogue_act = getattr(replica, "dialogue_act", "")
+                replica_trace.context_dependency = getattr(replica, "context_dependency", "")
                 replica_trace.reference_profile_id = reference.profile_id
+                # Ключ профиля в терминах §55 — то же значение, что эмоция профиля.
+                replica_trace.reference_profile_key = reference.resolved_emotion
+                replica_trace.reference_requested_profile = reference.requested_emotion
+                replica_trace.reference_resolved_profile = reference.resolved_emotion
                 replica_trace.reference_emotion = reference.resolved_emotion
                 replica_trace.reference_fallback_used = reference.fallback_used
+                replica_trace.reference_fallback_reason = reference.fallback_reason
 
             started = time.monotonic()
             chunk, seed, qa_outcome, short_run = await _synthesize_checked(
@@ -1887,7 +2056,13 @@ async def render_dialogue(
                 context=short_contexts[index - 1] if short_contexts else None,
                 trace=replica_trace,
                 reference=reference,
+                warmup=warmup,
             )
+            if warmup is not None:
+                # Паспорт прогрева собирается **после** синтеза: граница и признак
+                # отката появляются в ходе попытки, и снимок до неё показывал бы
+                # «прогрев применён, отказов нет» даже когда границы не нашлось.
+                warmups[index - 1] = warmup.to_dict()
             if short_run is not None:
                 short_runs[index - 1] = short_run
             seeds.append(seed)
@@ -1969,6 +2144,7 @@ async def render_dialogue(
         qualities=qualities,
         short_runs=short_runs,
         references=references,
+        warmups=warmups,
     )
 
 
@@ -2002,8 +2178,8 @@ async def synthesize_replica(
     resolved = tuning_for(voice, speaker, replica.overrides)
     engine = _engine_for(voice)
     await asyncio.to_thread(engine.load)
-    reference = reference_resolver.resolve_reference(
-        voice, engine.id, replica.emotion_effective, profile_id=replica.reference_profile_id
+    reference = reference_resolver.resolve_prosody(
+        voice, engine.id, replica.prosody_effective, profile_id=replica.reference_profile_id
     )
 
     chunk, seed, qa_outcome, short_run = await _synthesize_checked(
@@ -2047,6 +2223,8 @@ async def synthesize_take(
     wait_for_memory: WaitForMemory | None = None,
     on_note: NoteCallback | None = None,
     should_abort: Callable[[], bool] | None = None,
+    reference: "reference_resolver.ResolvedReference | None" = None,
+    seed: int | None = None,
 ) -> tuple[np.ndarray, int | None, QaOutcome | None]:
     """Синтезирует одну фразу вне диалога — тем же путём, что и реплику.
 
@@ -2054,6 +2232,11 @@ async def synthesize_take(
     разные модели, и путь до них обязан совпадать с боевым (preprocessing текста →
     ограничение инференса по времени → QA-цикл). Иначе замеренное время описывало
     бы не то, что происходит при обычной генерации.
+
+    `reference` и `seed` — для benchmark'а reference-профилей (§30–§32): он
+    сравнивает один и тот же текст и голос, меняя **только** профиль, и обязан
+    зафиксировать сид. Без них берутся основной референс голоса и случайный сид,
+    как раньше.
     """
     replica = Replica(voice=tuning.voice_id or voice.id, text=text, line_number=1)
     chunk, seed, qa_outcome, _short_run = await _synthesize_checked(
@@ -2067,6 +2250,8 @@ async def synthesize_take(
         wait_for_memory=wait_for_memory,
         on_note=on_note,
         should_abort=should_abort,
+        reference=reference,
+        seed=seed,
     )
     return chunk, seed, qa_outcome
 

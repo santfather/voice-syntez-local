@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from conftest import F5_VOICE, XTTS_VOICE  # noqa: F401 — общие идентификаторы голосов
 
-from backend import audio_pipeline, config
+from backend import audio_pipeline, config, emotions
 from backend import short_utterance as su
 from backend.dialogue_parser import Replica
 
@@ -146,6 +146,89 @@ def test_next_same_speaker_is_used_when_no_previous():
     plan = su.build_plan(contexts[1], strategy=su.STRATEGY_SAME_SPEAKER_CONTEXT)
     assert plan.synthesis_text == "Очень устала. Да."
     assert plan.context_source == su.SOURCE_SAME_SPEAKER_NEXT
+
+
+# --- §52: совместимость интонации ---------------------------------------------
+def _with_prosody(replicas: list[Replica], values: list[str]) -> list[Replica]:
+    """Проставляет репликам рекомендованный профиль — как это делает анализ."""
+    for replica, value in zip(replicas, values):
+        replica.prosody_profile = value
+    return replicas
+
+
+def test_calm_and_question_share_one_register():
+    """Вопрос и спокойный ответ — одна интонационная линия, а не две (§52)."""
+    assert emotions.prosody_compatible(emotions.EMOTION_NEUTRAL, emotions.EMOTION_QUESTION)
+    assert emotions.prosody_compatible(
+        emotions.EMOTION_QUESTION, emotions.EMOTION_SAD_SYMPATHETIC
+    )
+    # «Спокойная реплика + крик» — ровно тот случай, который политика и запрещает.
+    assert not emotions.prosody_compatible(
+        emotions.EMOTION_NEUTRAL, emotions.EMOTION_EXCLAMATION
+    )
+    assert not emotions.prosody_compatible(emotions.EMOTION_CALM, emotions.EMOTION_FEAR)
+    # Неизвестная интонация ничего не блокирует: без анализа LLM слой работает как
+    # раньше, и запрет на контекст из-за отсутствия метаданных был бы регрессом.
+    assert emotions.prosody_compatible("", emotions.EMOTION_EXCLAMATION)
+    assert emotions.prosody_compatible(emotions.EMOTION_AUTO, emotions.EMOTION_NEUTRAL)
+
+
+def test_screaming_neighbor_is_not_used_as_context():
+    """Сосед того же голоса, но другого регистра — не контекст (§52)."""
+    replicas = _with_prosody(
+        _replicas(("Анна", "Уходи отсюда!"), ("Анна", "Да.")),
+        [emotions.EMOTION_EXCLAMATION, emotions.EMOTION_NEUTRAL],
+    )
+    contexts = su.build_contexts(replicas)
+    assert contexts[1].same_speaker_previous is None
+    # Контекста нет — план честно откатывается на DIRECT, а не берёт чужой регистр.
+    plan = su.build_plan(contexts[1], strategy=su.STRATEGY_SAME_SPEAKER_CONTEXT)
+    assert plan.strategy == su.STRATEGY_DIRECT
+    assert plan.synthesis_text == "Да."
+
+
+def test_incompatible_neighbor_is_skipped_not_a_dead_end():
+    """Несовместимый сосед пропускается, поиск продолжается дальше (§52)."""
+    replicas = _with_prosody(
+        _replicas(
+            ("Анна", "Я только что вернулась домой."),
+            ("Анна", "Уходи отсюда!"),
+            ("Анна", "Да."),
+        ),
+        [
+            emotions.EMOTION_NEUTRAL,
+            emotions.EMOTION_EXCLAMATION,
+            emotions.EMOTION_NEUTRAL,
+        ],
+    )
+    contexts = su.build_contexts(replicas)
+    # Ближний сосед — крик (другой регистр), поэтому взят следующий спокойный.
+    assert contexts[2].same_speaker_previous == "Я только что вернулась домой."
+
+
+def test_register_change_splits_batch():
+    """Смена регистра разрывает группу так же, как смена спикера (§10, §52)."""
+    replicas = _with_prosody(
+        _replicas(("Анна", "Да."), ("Анна", "Уходи!")),
+        [emotions.EMOTION_NEUTRAL, emotions.EMOTION_EXCLAMATION],
+    )
+    contexts = su.build_contexts(replicas)
+    batches = su.build_batches(contexts)
+    assert batches[0].indexes == (0,)
+    assert batches[1].indexes == (1,)
+
+
+def test_unknown_prosody_keeps_context_as_before():
+    """Без анализа просодии поведение слоя не меняется (§2: работа без Ollama).
+
+    Неразмеченная реплика получает NEUTRAL — тот же спокойный регистр, что и у
+    соседа, поэтому политика совместимости ничего не запрещает и контекст
+    остаётся прежним.
+    """
+    replicas = _replicas(("Анна", "Я только что вернулась домой."), ("Анна", "Да."))
+    contexts = su.build_contexts(replicas)
+    assert contexts[1].prosody == emotions.EMOTION_NEUTRAL
+    assert contexts[1].same_speaker_previous == "Я только что вернулась домой."
 
 
 def test_adjacent_short_same_speaker_replicas_can_be_grouped():

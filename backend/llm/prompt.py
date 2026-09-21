@@ -18,7 +18,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "russian_linguistics" / "prompts"
-ANALYZER_PROMPT = "analyzer.v3.txt"
+# Одиночный prompt: одна целевая реплика с соседями. Им работает сплошной текст
+# (`analyze_replica`) и benchmark — там кейс один и разбор один.
+ANALYZER_PROMPT = "analyzer.v4.txt"
+# Оконный prompt: сцена целиком, ответ конвертом `replicas[]` (§7). Отдельный файл,
+# а не редакция v4, потому что контракт другой (вход и выход), а benchmark мерит
+# именно одиночный кейс: подмена prompt'а подменила бы измеряемое.
+ANALYZER_WINDOW_PROMPT = "analyzer.v5.txt"
+# v3 остаётся на диске: по нему получены сохранённые benchmark-результаты
+# UPDATE 2, и удалять его значило бы сделать прошлые отчёты невоспроизводимыми.
+ANALYZER_PROMPT_V3 = "analyzer.v3.txt"
 # v2 остаётся на диске: по нему получены сохранённые benchmark-результаты, и
 # удалять его значило бы сделать прошлые отчёты невоспроизводимыми.
 ANALYZER_PROMPT_V2 = "analyzer.v2.txt"

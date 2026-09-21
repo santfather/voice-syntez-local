@@ -1,4 +1,4 @@
-"""Фразы для записи голоса в `frontend/app.js`: состав, «ё» и запрет тестовой фразы.
+"""Фразы для записи голоса в `frontend/app.js`: состав, «ё», mapping и запрет тестовой фразы.
 
 JS-раннера в проекте нет, поэтому тест читает `frontend/app.js` как текст — тем же
 приёмом, что `test_launcher.py` читает `VOICE_SYNTEZ.command`. Разбор — регулярные
@@ -8,8 +8,9 @@ JS-раннера в проекте нет, поэтому тест читает
 
 Проверяется не «текст совпадает с документом побайтово», а смысл: первые пять фраз
 не тронуты, новых ровно шесть и в порядке документа, в новых есть «ё» и новые
-интонационные регистры, каждая фраза короткая, а тестовая фраза с плотной «ё»
-остаётся тестовыми данными и не попадает ни в список записи, ни в UI записи.
+интонационные регистры, каждая фраза короткая, у каждой есть записываемый профиль
+(`RECORD_PHRASE_PROFILES`, §16), а тестовая фраза с плотной «ё» остаётся тестовыми
+данными и не попадает ни в список записи, ни в UI записи.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import re
 from pathlib import Path
 from typing import NoReturn
 
-from backend import qa_screening
+from backend import emotions, qa_screening
 from backend.text_normalization import normalize
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -304,6 +305,33 @@ def record_phrases() -> list[tuple[str, str]]:
     return entries
 
 
+_PROFILE_MAP_DECL = re.compile(r"\bconst\s+RECORD_PHRASE_PROFILES\s*=\s*\{")
+_PROFILE_ENTRY = re.compile(
+    r"(?P<label>" + _JS_STRING + r")\s*:\s*(?P<key>" + _JS_STRING + r")",
+    re.DOTALL,
+)
+
+
+def record_phrase_profiles() -> list[tuple[str, str]]:
+    """Пары (подпись фразы, ключ профиля) из `RECORD_PHRASE_PROFILES` (§16)."""
+    source = _read_app_js()
+    declaration = _PROFILE_MAP_DECL.search(source)
+    if not declaration:
+        _fail("не найдено объявление `const RECORD_PHRASE_PROFILES = {`")
+    end = _matching_bracket(source, declaration.end() - 1)
+    body = source[declaration.end() : end]
+    entries = [
+        (_decode_js_string(match.group("label")), _decode_js_string(match.group("key")))
+        for match in _PROFILE_ENTRY.finditer(body)
+    ]
+    if not entries:
+        _fail("в RECORD_PHRASE_PROFILES не разобрано ни одной пары подпись/profile_key")
+    leftovers = _PROFILE_ENTRY.sub("", body).replace(",", "").strip()
+    if leftovers:
+        _fail(f"в RECORD_PHRASE_PROFILES остался неразобранный фрагмент: {leftovers[:80]!r}")
+    return entries
+
+
 def yo_stress_test_phrase() -> str:
     """Текст `YO_STRESS_TEST_PHRASE`; ошибка, если объявление пропало."""
     source = _read_app_js()
@@ -351,7 +379,66 @@ def test_new_intonation_registers_present():
     assert not missing, f"нет подписей с новыми регистрами: {missing}"
 
 
-# --- 5. Длина фразы ------------------------------------------------------------
+# --- 5. Mapping «подпись фразы → ключ профиля» (§16) ---------------------------
+# Документ задаёт initial mapping буквально: одна фраза — одна интонация, и все
+# одиннадцать различны. Здесь он записан как ожидание, потому что это **данные
+# документа**, а не следствие кода: перепутанная пара не сломала бы ни один тест
+# выше, но записала бы «иронию» под профилем восторга.
+DOCUMENT_PHRASE_PROFILES: tuple[tuple[str, str], ...] = (
+    ("Вопрос и утверждение", "NEUTRAL_QUESTION"),
+    ("Восклицания, много шипящих", "EXCLAMATION"),
+    ("Спокойная просьба (короче)", "CALM"),
+    ("Только вопросы", "QUESTION"),
+    ("Сложные сочетания согласных", "NEUTRAL"),
+    ("Радость, восторг", "DELIGHT"),
+    ("Огорчение, сочувствие", "SAD_SYMPATHETIC"),
+    ("Лёгкая ирония", "IRONIC"),
+    ("Строгий тон, короткий приказ", "STRICT"),
+    ("Перечисление, ровный ритм", "ENUMERATION"),
+    ("Быстрая, взволнованная речь", "EXCITED"),
+)
+
+
+def test_mapping_matches_document_and_covers_every_phrase():
+    mapping = record_phrase_profiles()
+    assert mapping == list(DOCUMENT_PHRASE_PROFILES), (
+        "mapping §16 обязан совпадать с документом и идти в порядке фраз"
+    )
+    # Подписи — тот же список и в том же порядке, что и RECORD_PHRASES: иначе
+    # мастер записал бы фразу не под ту интонацию, а заметить это было бы нечем.
+    assert [label for label, _ in mapping] == [label for label, _ in record_phrases()]
+    assert len(set(label for label, _ in mapping)) == len(mapping), (
+        "одна подпись не может встречаться дважды: по ней ищется профиль фразы"
+    )
+
+
+def test_every_phrase_profile_is_recordable_and_unique():
+    """Ключи mapping — только записываемые профили §10, и каждый ровно один раз."""
+    keys = [key for _, key in record_phrase_profiles()]
+    assert set(keys) <= set(emotions.PROFILE_KEYS), (
+        "записать профиль под семантическую эмоцию (SURPRISE/FEAR) нельзя — "
+        "backend ответит 400"
+    )
+    # Одиннадцать разных интонаций: две фразы под один профиль означали бы, что
+    # вторая запись молча вытеснит первую как дубликат той же интонации.
+    assert len(set(keys)) == len(keys) == len(emotions.PROFILE_KEYS)
+
+
+def test_wizard_saves_recording_as_profile_of_selected_voice():
+    """Мастер пишет запись в профиль выбранного голоса, а не в новый голос (§16)."""
+    source = APP_JS.read_text(encoding="utf-8")
+    # Запись уходит в профили конкретного голоса — и вместе с фразой, по которой
+    # записана: без `source_record_phrase_id` повторная запись не заменила бы
+    # прежний профиль, а легла бы рядом вторым.
+    assert "/api/voices/${voice.id}/references" in source
+    assert "form.append('source_record_phrase_id', recordPhraseId(index))" in source
+    # Режим выбирается явно: пока голос не выбран, запись идёт прежним путём —
+    # через форму нового голоса.
+    assert "RECORD_NEW_VOICE" in source
+    assert "recordTargetVoice()" in source
+
+
+# --- 6. Длина фразы ------------------------------------------------------------
 def test_every_phrase_fits_short_reference_budget():
     """Каждая фраза укладывается в первые ~12 с референса, которые берёт F5.
 
@@ -392,7 +479,7 @@ def test_new_phrases_stay_near_original_reading_time():
     )
 
 
-# --- 6. Тестовая фраза: «ё» восстанавливается, исходник не мутирует ------------
+# --- 7. Тестовая фраза: «ё» восстанавливается, исходник не мутирует ------------
 def test_yo_stress_phrase_is_test_data_not_a_record_phrase():
     phrase = yo_stress_test_phrase()
     assert phrase.strip(), "тестовая фраза не должна быть пустой"
@@ -424,7 +511,7 @@ def test_yo_stress_phrase_restores_yo_without_mutating_source():
     assert phrase == original
 
 
-# --- 7. Тестовая фраза не предлагается при записи -----------------------------
+# --- 8. Тестовая фраза не предлагается при записи -----------------------------
 def test_yo_stress_phrase_is_not_offered_for_recording():
     source = APP_JS.read_text(encoding="utf-8")
     assert "YO_STRESS_TEST_PHRASE" in source, "константа должна использоваться, а не быть мёртвой"

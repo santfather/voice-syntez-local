@@ -40,7 +40,7 @@ from .ollama_client import (
     OllamaModel,
     get_client,
 )
-from .prompt import PromptTemplate, load_prompt
+from .prompt import ANALYZER_WINDOW_PROMPT, PromptTemplate, load_prompt
 from .settings_store import load_settings
 
 logger = logging.getLogger("tts.llm.analyzer")
@@ -78,6 +78,10 @@ DEFAULT_NUM_CTX = 8192
 DEFAULT_TIMEOUT_SEC = 90.0
 DEFAULT_CONTEXT_REPLICAS = 2
 DEFAULT_CONTEXT_CHARS = 4000
+# Сколько реплик сцены уходит в один запрос (§7). Шесть — компромисс: модель
+# видит реплику, соседей с обеих сторон и говорящих, а `num_ctx` остаётся в
+# пределах разумного. Реплика на запрос — это ровно то, что запрещено.
+DEFAULT_SCENE_REPLICAS = 6
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,8 @@ class AnalyzerSettings:
     max_repairs: int = 1
     context_replicas: int = DEFAULT_CONTEXT_REPLICAS
     context_chars: int = DEFAULT_CONTEXT_CHARS
+    # Размер окна сцены (§6, §7): сколько реплик диалога уходит в один запрос.
+    scene_replicas: int = DEFAULT_SCENE_REPLICAS
     response_format: str = "json"
     think: str = "auto"
     # Режим проекта по умолчанию: «LLM обязателен перед рендером» или опционален.
@@ -116,6 +122,7 @@ class AnalyzerSettings:
             "max_repairs": self.max_repairs,
             "context_replicas": self.context_replicas,
             "context_chars": self.context_chars,
+            "scene_replicas": self.scene_replicas,
             "response_format": self.response_format,
             "think": self.think,
             "required_for_render": self.required_for_render,
@@ -181,7 +188,7 @@ def apply_overrides(settings: AnalyzerSettings, overrides: Mapping[str, object])
     for key in ("enabled", "required_for_render"):
         if key in overrides:
             values[key] = bool(overrides[key])
-    for key in ("num_ctx", "context_replicas"):
+    for key in ("num_ctx", "context_replicas", "scene_replicas"):
         if key in overrides:
             try:
                 number = int(overrides[key])
@@ -202,6 +209,7 @@ def apply_overrides(settings: AnalyzerSettings, overrides: Mapping[str, object])
             "required_for_render",
             "num_ctx",
             "context_replicas",
+            "scene_replicas",
         )
     })
 
@@ -221,6 +229,7 @@ def _settings_from_env(source: Mapping[str, str]) -> AnalyzerSettings:
             source, "LLM_ANALYZER_CONTEXT_REPLICAS", DEFAULT_CONTEXT_REPLICAS
         ),
         context_chars=_env_int(source, "LLM_ANALYZER_CONTEXT_CHARS", DEFAULT_CONTEXT_CHARS),
+        scene_replicas=_env_int(source, "LLM_ANALYZER_SCENE_REPLICAS", DEFAULT_SCENE_REPLICAS),
         response_format=_env(source, "LLM_ANALYZER_RESPONSE_FORMAT") or "json",
         think=_env(source, "LLM_ANALYZER_THINK") or "auto",
         required_for_render=_env_flag(source, "LLM_ANALYZER_REQUIRED_FOR_RENDER", False),
@@ -277,6 +286,55 @@ def context_hash(context: Mapping[str, Any]) -> str:
             "context_before": list(context.get("context_before") or []),
             "context_after": list(context.get("context_after") or []),
         },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return text_hash(payload)
+
+
+def plan_windows(
+    count: int, *, size: int = DEFAULT_SCENE_REPLICAS, overlap: int = DEFAULT_CONTEXT_REPLICAS
+) -> tuple[tuple[int, int], ...]:
+    """Разбивает реплики на окна анализа: короткая сцена — одно окно (§6, §7).
+
+    Окна идут с перекрытием: реплика на границе окна должна видеть соседей с
+    другой стороны, иначе смысл «Это проблема?» снова решался бы по одной строке.
+    Ответ на перекрывающуюся реплику берётся из первого окна — так у каждой
+    реплики ровно один разбор, и результат не зависит от порядка обхода.
+
+    Возвращает полуинтервалы `(начало, конец)` по позициям реплик.
+    """
+    if count <= 0 or size <= 0:
+        return ()
+    step = max(size - max(overlap, 0), 1)
+    windows: list[tuple[int, int]] = []
+    start = 0
+    while start < count:
+        end = min(start + size, count)
+        windows.append((start, end))
+        if end >= count:
+            break
+        start += step
+    return tuple(windows)
+
+
+def scene_hash(scene: Sequence[Mapping[str, object]]) -> str:
+    """Хеш окна: id, говорящий и текст всех реплик, увиденных моделью (§11).
+
+    Ключ кеша должен описывать **то, что реально ушло в запрос**. Для окна это вся
+    сцена, а не только ±2 соседа: иначе разбор, полученный по шести репликам,
+    вернулся бы из кеша для той же реплики в другой сцене — и контекстная разница,
+    ради которой всё делалось, исчезла бы.
+    """
+    payload = json.dumps(
+        [
+            {
+                "replica_id": int(item.get("replica_id") or 0),
+                "speaker": str(item.get("speaker") or ""),
+                "target_text": str(item.get("target_text") or ""),
+            }
+            for item in scene
+        ],
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -432,11 +490,16 @@ class LinguisticAnalyzer:
         settings: AnalyzerSettings | None = None,
         client: OllamaClient | None = None,
         prompt: PromptTemplate | None = None,
+        window_prompt: PromptTemplate | None = None,
         clock=time.monotonic,
     ) -> None:
         self.settings = settings or settings_from_env()
         self.client = client or get_client()
         self.prompt = prompt or load_prompt()
+        # Оконный prompt отдельный: у окна другой контракт (конверт `replicas[]`),
+        # и версия именно этого файла уходит в `prompt_version` оконных разборов —
+        # иначе вчерашний разбор сцены нашёлся бы в кеше по одиночному prompt'у.
+        self.window_prompt = window_prompt or load_prompt(ANALYZER_WINDOW_PROMPT)
         self.clock = clock
         self.last_model = ""
 
@@ -547,16 +610,7 @@ class LinguisticAnalyzer:
         source_digest = text_hash(target_text)
         context_digest = context_hash(context)
         if not self.settings.enabled:
-            return ReplicaAnalysis(
-                replica_id=replica_id,
-                status=STATUS_DISABLED,
-                model_tag=self.settings.primary_model,
-                prompt_version=self.prompt.version,
-                source_hash=source_digest,
-                context_hash=context_digest,
-                dictionary_hash=dictionary_digest,
-                error="Analyzer выключен",
-            )
+            return self._disabled(replica_id, source_digest, context_digest, dictionary_digest)
 
         started = self.clock()
         model = self.selected_model()
@@ -605,6 +659,162 @@ class LinguisticAnalyzer:
                 dictionary_digest=dictionary_digest,
             )
 
+        return self._build_analysis(
+            analysis,
+            replica_id=replica_id,
+            target_text=target_text,
+            model=model,
+            source_digest=source_digest,
+            context_digest=context_digest,
+            dictionary_digest=dictionary_digest,
+            started=started,
+            repaired=repaired,
+        )
+
+    def analyze_window(
+        self,
+        *,
+        scene: Sequence[Mapping[str, object]],
+        dictionary_digest: str = "",
+        cancel=None,
+    ) -> dict[int, ReplicaAnalysis]:
+        """Анализирует окно реплик одним запросом (§6, §7). Никогда не бросает.
+
+        `scene` — реплики так, как их видит модель: `replica_id`, `speaker`,
+        `target_text`. Возвращаются разборы по `replica_id`; реплика, о которой
+        модель не ответила или чей разбор не прошёл проверку, получает `FAILED` с
+        причиной. Это не «шумный отказ»: пользователь обязан видеть, какие реплики
+        остались без анализа, — иначе пропуск выглядел бы как «ошибок нет».
+
+        Контекст здесь — всё окно, а не ±2 соседа: смысл реплики в диалоге
+        («Правда?» после хорошей и после плохой новости) определяется сценой, и
+        обрезать её до двух соседей значило бы вернуть ту же слепоту, только
+        дороже — один запрос на несколько реплик.
+        """
+        texts = {
+            int(item.get("replica_id") or 0): str(item.get("target_text") or "")
+            for item in scene
+        }
+        ids = list(texts)
+        scene_digest = scene_hash(scene)
+        if not self.settings.enabled:
+            return {
+                replica_id: self._disabled(
+                    replica_id,
+                    text_hash(texts[replica_id]),
+                    scene_digest,
+                    dictionary_digest,
+                    prompt_version=self.window_prompt.version,
+                )
+                for replica_id in ids
+            }
+
+        started = self.clock()
+        model = self.selected_model()
+        self.last_model = model
+        model_digest = self._model_digest(model)
+
+        def failed(replica_id: int, error: str) -> ReplicaAnalysis:
+            # digest читается один раз на окно, а не на каждую реплику: паспорт
+            # модели — это её свойство, а не свойство разбора.
+            return self._failure(
+                replica_id,
+                model,
+                text_hash(texts[replica_id]),
+                scene_digest,
+                started,
+                error,
+                dictionary_digest=dictionary_digest,
+                model_digest=model_digest,
+                prompt_version=self.window_prompt.version,
+            )
+
+        if not self._model_exists(model):
+            # Явная причина вместо HTTP-ошибки Ollama: пользователю важно понять,
+            # что модель не скачана, а не «что-то пошло не так».
+            return {
+                replica_id: failed(replica_id, f"Модель «{model}» не скачана локально")
+                for replica_id in ids
+            }
+
+        payload = {
+            "replicas": [
+                {
+                    "replica_id": int(item.get("replica_id") or 0),
+                    "speaker": str(item.get("speaker") or ""),
+                    "target_text": str(item.get("target_text") or ""),
+                }
+                for item in scene
+            ],
+            "language": "ru",
+        }
+        messages = self.window_prompt.messages(payload, schema_json=self._window_schema_text())
+        try:
+            window, errors, repaired = self._request_window(
+                model, messages, ids, texts, cancel
+            )
+        except OllamaError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            return {replica_id: failed(replica_id, error) for replica_id in ids}
+
+        if window is None:
+            error = "Ответ не прошёл проверку: " + ", ".join(errors)
+            return {replica_id: failed(replica_id, error) for replica_id in ids}
+
+        rejected = {
+            int(item.get("replica_id") or 0): ", ".join(item.get("errors") or [])
+            for item in window.rejected
+        }
+        parsed = window.by_replica()
+        results: dict[int, ReplicaAnalysis] = {}
+        for replica_id in ids:
+            analysis = parsed.get(replica_id)
+            if analysis is None:
+                results[replica_id] = failed(
+                    replica_id,
+                    "Реплика не разобрана в окне"
+                    + (f": {rejected[replica_id]}" if rejected.get(replica_id) else ""),
+                )
+                continue
+            results[replica_id] = self._build_analysis(
+                analysis,
+                replica_id=replica_id,
+                target_text=texts[replica_id],
+                model=model,
+                model_digest=model_digest,
+                source_digest=text_hash(texts[replica_id]),
+                context_digest=scene_digest,
+                dictionary_digest=dictionary_digest,
+                started=started,
+                repaired=repaired,
+                prompt_version=self.window_prompt.version,
+            )
+        return results
+
+    def _build_analysis(
+        self,
+        analysis: s.LinguisticAnalysis,
+        *,
+        replica_id: int,
+        target_text: str,
+        model: str,
+        source_digest: str,
+        context_digest: str,
+        dictionary_digest: str,
+        started: float,
+        model_digest: str | None = None,
+        repaired: bool = False,
+        prompt_version: str | None = None,
+    ) -> ReplicaAnalysis:
+        """Собирает разбор реплики из ответа модели: границы, статус, служебные поля.
+
+        Общий путь одиночного анализа и окна: разница только в том, откуда взялся
+        ответ, а решение «что принять» обязано быть одинаковым — иначе одна и та же
+        реплика получала бы разный разбор в зависимости от размера окна.
+
+        `prompt_version` — версия prompt'а, чьим ответом получен разбор: у окна она
+        своя, и от неё зависит попадание в кеш (§46).
+        """
         items, dropped = locate_annotations(analysis.items, target_text)
         markup_stripped = sum(
             1 for item in analysis.items if strip_stress_markup(item)[1]
@@ -615,7 +825,6 @@ class LinguisticAnalyzer:
         status = STATUS_READY
         if dropped or markup_stripped or any(item.needs_review for item in items):
             status = STATUS_NEEDS_REVIEW
-        digest = self._model_digest(model)
         return ReplicaAnalysis(
             replica_id=replica_id,
             status=status,
@@ -623,14 +832,34 @@ class LinguisticAnalyzer:
             dropped=dropped,
             utterance=analysis.utterance,
             model_tag=model,
-            model_digest=digest,
-            prompt_version=self.prompt.version,
+            model_digest=self._model_digest(model) if model_digest is None else model_digest,
+            prompt_version=prompt_version or self.prompt.version,
             source_hash=source_digest,
             context_hash=context_digest,
             dictionary_hash=dictionary_digest,
             seconds=self.clock() - started,
             repaired=repaired,
             markup_stripped=markup_stripped,
+        )
+
+    def _disabled(
+        self,
+        replica_id: int,
+        source_digest: str,
+        context_digest: str,
+        dictionary_digest: str,
+        prompt_version: str | None = None,
+    ) -> ReplicaAnalysis:
+        """Разбор выключенного Analyzer'а: не «пусто», а состояние с причиной."""
+        return ReplicaAnalysis(
+            replica_id=replica_id,
+            status=STATUS_DISABLED,
+            model_tag=self.settings.primary_model,
+            prompt_version=prompt_version or self.prompt.version,
+            source_hash=source_digest,
+            context_hash=context_digest,
+            dictionary_hash=dictionary_digest,
+            error="Analyzer выключен",
         )
 
     def _request_analysis(
@@ -642,11 +871,7 @@ class LinguisticAnalyzer:
             model,
             messages,
             schema=schema,
-            options={
-                "num_ctx": self.settings.num_ctx,
-                "temperature": self.settings.temperature,
-                "seed": self.settings.seed,
-            },
+            options=self._options(),
             keep_alive="5m",
             timeout=self.settings.timeout_sec,
             cancel=cancel,
@@ -683,11 +908,7 @@ class LinguisticAnalyzer:
                 model,
                 repair_messages,
                 schema=schema,
-                options={
-                    "num_ctx": self.settings.num_ctx,
-                    "temperature": self.settings.temperature,
-                    "seed": self.settings.seed,
-                },
+                options=self._options(),
                 keep_alive="5m",
                 timeout=self.settings.timeout_sec,
                 cancel=cancel,
@@ -702,6 +923,82 @@ class LinguisticAnalyzer:
                 check_reasons=False,
             )
         return analysis, errors, repairs > 0
+
+    def _request_window(
+        self,
+        model: str,
+        messages: list[dict],
+        replica_ids: Sequence[int],
+        texts: Mapping[int, str],
+        cancel,
+    ) -> tuple[s.WindowAnalysis | None, list[str], bool]:
+        """Один запрос на окно сцены и один ограниченный повтор при отказе (§7, §13).
+
+        Ответ проверяется целиком (`parse_window_analysis`), но цена ошибки другая:
+        не прошедшая проверку реплика теряет только свой разбор, а не весь запрос.
+        """
+        schema = s.window_json_schema() if self.settings.response_format == "schema" else None
+        chat = self.client.chat(
+            model,
+            messages,
+            schema=schema,
+            options=self._options(),
+            keep_alive="5m",
+            timeout=self.settings.timeout_sec,
+            cancel=cancel,
+            think=self._think_for(model),
+        )
+        window, errors = s.parse_window_analysis(
+            chat.text,
+            replica_ids=replica_ids,
+            target_texts=texts,
+            check_spans=False,
+            check_reasons=False,
+        )
+        repairs = 0
+        raw_text = chat.text
+        while window is None and repairs < max(int(self.settings.max_repairs), 0):
+            repairs += 1
+            chat = self.client.chat(
+                model,
+                [
+                    *messages,
+                    {"role": "assistant", "content": raw_text[:2000]},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Предыдущий ответ не прошёл проверку схемы. Верни ТОЛЬКО JSON "
+                            "по схеме — объект с полем replicas, по разбору на КАЖДЫЙ "
+                            "replica_id из входа. Ошибки: "
+                            + ", ".join(dict.fromkeys(errors))
+                            + "."
+                        ),
+                    },
+                ],
+                schema=schema,
+                options=self._options(),
+                keep_alive="5m",
+                timeout=self.settings.timeout_sec,
+                cancel=cancel,
+                think=self._think_for(model),
+            )
+            raw_text = chat.text
+            window, errors = s.parse_window_analysis(
+                raw_text,
+                replica_ids=replica_ids,
+                target_texts=texts,
+                check_spans=False,
+                check_reasons=False,
+            )
+        return window, errors, repairs > 0
+
+    def _options(self) -> dict:
+        """Параметры запроса: одни и те же для реплики, окна и повторов."""
+        return {
+            "num_ctx": self.settings.num_ctx,
+            "temperature": self.settings.temperature,
+            "seed": self.settings.seed,
+        }
 
     def _think_for(self, model: str) -> bool | None:
         """`auto`: выключить скрытое рассуждение у моделей, которые это умеют."""
@@ -718,6 +1015,9 @@ class LinguisticAnalyzer:
 
     def _schema_text(self) -> str:
         return json.dumps(s.analysis_json_schema(), ensure_ascii=False, indent=2)
+
+    def _window_schema_text(self) -> str:
+        return json.dumps(s.window_json_schema(), ensure_ascii=False, indent=2)
 
     def _model_digest(self, model: str) -> str:
         try:
@@ -736,14 +1036,16 @@ class LinguisticAnalyzer:
         started: float,
         error: str,
         dictionary_digest: str = "",
+        model_digest: str | None = None,
+        prompt_version: str | None = None,
     ) -> ReplicaAnalysis:
         logger.info("Анализ реплики %s не выполнен: %s", replica_id, error)
         return ReplicaAnalysis(
             replica_id=replica_id,
             status=STATUS_FAILED,
             model_tag=model,
-            model_digest=self._model_digest(model),
-            prompt_version=self.prompt.version,
+            model_digest=self._model_digest(model) if model_digest is None else model_digest,
+            prompt_version=prompt_version or self.prompt.version,
             source_hash=source_digest,
             context_hash=context_digest,
             dictionary_hash=dictionary_digest,

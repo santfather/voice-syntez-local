@@ -383,6 +383,11 @@ def main() -> int:
         help="сколько первых реплик разбирать (по умолчанию все)",
     )
     parser.add_argument("--pause-ms", type=int, default=400)
+    parser.add_argument(
+        "--warmup",
+        action="store_true",
+        help="включить прогрев коротких реплик (warmup prefix) для этого прогона",
+    )
     parser.add_argument("--out", help="куда записать отчёт JSON (по умолчанию — рядом с трейсом)")
     parser.add_argument(
         "--trace-dir",
@@ -447,6 +452,8 @@ def main() -> int:
         auto_accent=True,
         qa=QaSettings.for_mode(args.qa),
         require_prepared=True,
+        # Прогрев: A/B снимается двумя запусками — без флага и с ним (§23).
+        warmup=bool(args.warmup),
         short_utterance=(
             audio_pipeline.ShortUtteranceSettings(enabled=True, strategy=args.strategy)
             if args.short

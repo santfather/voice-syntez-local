@@ -272,6 +272,8 @@ class GenerateRequest(TrackOptions):
     chunk_strategy: ChunkStrategy = config.CHUNK_STRATEGY_DEFAULT
     # Короткие реплики (§23): выключено по умолчанию, включается настройкой.
     short_utterance: ShortUtteranceRequest | None = None
+    # Прогрев коротких реплик: None — политика приложения (`TTS_WARMUP_ENABLED`).
+    warmup_short_replicas: bool | None = None
     # Имя готового файла; пусто — имя из id задачи.
     output_name: str = ""
     # Фоновая задача (Фаза 11): рендер уходит в приоритет 3 и пропускает вперёд
@@ -385,6 +387,10 @@ class ProjectRenderRequest(BaseModel):
     chunk_strategy: ChunkStrategy | None = None
     # Короткие реплики: None — взять сохранённое в проекте (как у остальных ручек).
     short_utterance: ShortUtteranceRequest | None = None
+    # Прогрев коротких реплик (warmup prefix): None — как сохранено в проекте,
+    # иначе политика приложения. Скрытый контекст перед короткой фразой; в готовое
+    # аудио он не попадает.
+    warmup_short_replicas: bool | None = None
     # Имя готового файла. В настройках проекта не запоминается (см.
     # `_resolved_render_settings`): имя выбирают для конкретного файла.
     output_name: str | None = None
@@ -613,6 +619,17 @@ async def status() -> dict:
             "available_strategies": list(su.SELECTABLE_STRATEGIES),
             "thresholds": su.ShortThresholds().to_dict(),
             "boundary_method": config.SHORT_UTTERANCE_BOUNDARY_METHOD,
+        },
+        # Прогрев коротких реплик: включён ли, для каких движков и по каким
+        # порогам. Интерфейсу это нужно, чтобы галочка показывала то, что сделает
+        # сервер, а не собственную догадку.
+        "warmup": {
+            "enabled": config.WARMUP_ENABLED,
+            "engines": list(config.WARMUP_ENGINES),
+            "max_chars": config.WARMUP_MAX_CHARS,
+            "max_words": config.WARMUP_MAX_WORDS,
+            "max_prefix_chars": config.WARMUP_MAX_PREFIX_CHARS,
+            "preroll_ms": config.WARMUP_PREROLL_MS,
         },
         # Состояние памяти одной сводкой (NORMAL/WARNING/CRITICAL + причина):
         # очередь решает по нему, начинать ли задачу, watchdog — прерывать ли
@@ -1140,10 +1157,18 @@ async def delete_voice(voice_id: str) -> dict:
 
 
 class VoiceReferenceUpdate(BaseModel):
-    """Правка референс-профиля: эмоция и подпись (UPDATE 2 §8, §37)."""
+    """Правка референс-профиля: интонация, подпись и выключатели (UPDATE 2 §8, §37;
+    UPDATE 3 §18, §35)."""
 
     emotion: str | None = None
     label: str | None = None
+    # `enabled=False` — профиль остаётся в голосе, но автоматика его не выбирает:
+    # так неудачная запись не удаляется, а перестаёт влиять на синтез (§35).
+    enabled: bool | None = None
+    is_default: bool | None = None
+    # Право на автоматический выбор по интонации (§35). Ставится вручную — после
+    # benchmark'а (§33) и прослушивания (§34); ручной выбор реплики не ограничивает.
+    enabled_for_auto: bool | None = None
 
 
 @app.post("/api/voices/{voice_id}/references", status_code=201)
@@ -1154,13 +1179,23 @@ async def add_voice_reference(
     ref_text: Annotated[str, Form()] = "",
     label: Annotated[str, Form()] = "",
     verify_ref_text: Annotated[bool, Form()] = True,
+    source_record_phrase_id: Annotated[str, Form()] = "",
+    enabled: Annotated[bool, Form()] = True,
+    is_default: Annotated[bool, Form()] = False,
+    enabled_for_auto: Annotated[bool, Form()] = False,
 ) -> dict:
-    """Добавляет голосу эмоциональный референс — отдельным профилем.
+    """Добавляет голосу интонационный референс — отдельным профилем.
 
-    Голос остаётся **одним**: другой референс той же эмоции — это профиль, а не
+    Голос остаётся **одним**: другой референс той же интонации — это профиль, а не
     новый голос (§37). Проверка «референс ↔ расшифровка» идёт тем же путём, что и
-    у основного: без неё эмоциональный профиль мог бы перебить нейтральный, не
+    у основного: без неё интонационный профиль мог бы перебить нейтральный, не
     совпадая с собственной записью (§38).
+
+    `source_record_phrase_id` — какая фраза `RECORD_PHRASES` записана (§16): мастер
+    ведёт по списку и помечает каждый профиль его фразой.
+
+    `enabled_for_auto` по умолчанию `False`: свежая запись ещё не подтверждена
+    benchmark'ом, и в автоматическую маршрутизацию не попадает (§35).
     """
     data = await file.read()
     if not data:
@@ -1174,6 +1209,10 @@ async def add_voice_reference(
             ref_text=ref_text,
             label=label,
             verify_ref_text=verify_ref_text,
+            source_record_phrase_id=source_record_phrase_id,
+            enabled=enabled,
+            is_default=is_default,
+            enabled_for_auto=enabled_for_auto,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Голос не найден") from exc
@@ -1191,10 +1230,16 @@ async def add_voice_reference(
 async def update_voice_reference(
     voice_id: str, profile_id: str, payload: VoiceReferenceUpdate
 ) -> dict:
-    """Меняет эмоцию или подпись референса, не перезаписывая аудио."""
+    """Меняет интонацию, подпись или доступность профиля, не перезаписывая аудио."""
     try:
         profile = get_store().update_reference(
-            voice_id, profile_id, emotion=payload.emotion, label=payload.label
+            voice_id,
+            profile_id,
+            emotion=payload.emotion,
+            label=payload.label,
+            enabled=payload.enabled,
+            is_default=payload.is_default,
+            enabled_for_auto=payload.enabled_for_auto,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Референс не найден") from exc
@@ -1756,6 +1801,7 @@ async def generate(payload: GenerateRequest) -> dict:
             qa=QaSettings.for_mode(payload.qa),
             short_utterance=_short_settings(payload.short_utterance),
             output_name=payload.output_name,
+            warmup=payload.warmup_short_replicas,
         ),
     )
     try:
@@ -1847,6 +1893,10 @@ async def render_text(payload: RenderTextRequest) -> dict:
             qa=QaSettings.for_mode(payload.qa),
             short_utterance=_short_settings(payload.short_utterance),
             output_name=payload.output_name,
+            # Прогрев — для коротких реплик диалога. В сплошном тексте он не
+            # включается автоматически: куски там длинные, а выигрыш не измерен
+            # (UPDATE 3 §20), поэтому поле выключено явно, а не по дефолту.
+            warmup=False,
         ),
     )
     try:
@@ -2052,6 +2102,10 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
     short_settings = _short_settings(payload.short_utterance) or (
         audio_pipeline.ShortUtteranceSettings.from_dict(short_saved) if short_saved else None
     )
+    # Прогрев: пришедшее значение важнее сохранённого, сохранённое — дефолта.
+    warmup = payload.warmup_short_replicas
+    if warmup is None:
+        warmup = saved.get("warmup_short_replicas")
     settings = RenderSettings(
         pause_ms=pause_ms,
         cross_fade_duration=cross_fade,
@@ -2059,6 +2113,7 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
         output_format=output_format,
         qa=QaSettings.for_mode(qa),
         short_utterance=short_settings,
+        warmup=None if warmup is None else bool(warmup),
         # Только из запроса: сохранённое имя не подставляется — повторный рендер
         # без тела должен писать файл как раньше, а не переиспользовать имя
         # прошлого запуска (иначе второй файл молча стал бы «-2»).
@@ -2074,6 +2129,8 @@ def _resolved_render_settings(project: dict, payload: ProjectRenderRequest) -> t
         # Настройка коротких реплик — часть сборки проекта: повторный запуск без
         # тела запроса должен звучать так же.
         "short_utterance": None if short_settings is None else short_settings.to_dict(),
+        # Прогрев запоминается вместе с остальными настройками сборки.
+        "warmup_short_replicas": warmup,
     }
     return settings, remembered
 
@@ -2099,6 +2156,24 @@ def _replica_or_404(project: dict, index: int) -> dict:
         if int(replica["index"]) == index:
             return replica
     raise HTTPException(status_code=404, detail="Реплика не найдена")
+
+
+def _prosody_metadata(replica: dict) -> dict:
+    """Метаданные просодии реплики для пайплайна (UPDATE 3 §11–§13, §56).
+
+    Читаются из строки проекта как есть: это диагностика, а не решение, и
+    пересчитывать её в момент рендера значило бы показывать в trace не то, что
+    видел пользователь. Одно место на первую сборку и перегенерацию — иначе
+    варианты одной реплики различались бы не звучанием, а набором полей.
+    """
+    return {
+        "prosody_profile": replica["prosody_profile"],
+        "prosody_confidence": replica["prosody_confidence"],
+        "prosody_intensity": replica["prosody_intensity"],
+        "prosody_pace": replica["prosody_pace"],
+        "dialogue_act": replica["dialogue_act"],
+        "context_dependency": replica["context_dependency"],
+    }
 
 
 def _resolved_voice(voice_id: str, voices: dict) -> Voice | None:
@@ -2218,6 +2293,11 @@ def _emotion_catalog(voice: Voice | None) -> list[dict]:
                 "profile_id": str(status.get("reference_profile_id") or ""),
                 "resolved_emotion": str(status.get("resolved_emotion") or ""),
                 "error": str(status.get("error") or ""),
+                # Может ли это значение быть **записанным** профилем (§10).
+                # Интерфейсу нужно отделить 11 интонаций, под которые есть фразы
+                # записи, от семантических SURPRISE/FEAR: выбрать их руками можно
+                # (старый проект), но записать под них профиль нечем (§17).
+                "profile": emotions.is_profile_key(value),
             }
         )
     return catalog
@@ -2280,11 +2360,35 @@ def _replica_payload(project: dict, index: int, voices: dict | None = None) -> d
             "dialogue_act": replica["dialogue_act"],
             "context_dependency": replica["context_dependency"],
         },
+        # Просодия (UPDATE 3 §13, §36, §59): что предложила модель, что действует и
+        # что реально ушло в движок. `effective` считает строка реплики (единое
+        # правило `override → рекомендация → эмоция`), поэтому карточка не
+        # досчитывает маршрут сама, а показывает тот же ответ, что получит резолвер.
+        "prosody": {
+            "profile": replica["prosody_profile"],
+            "profile_title": emotions.emotion_title(replica["prosody_profile"]),
+            "intensity": replica["prosody_intensity"],
+            "pace": replica["prosody_pace"],
+            "confidence": replica["prosody_confidence"],
+            # `override` — не второе поле, а то же `emotion_override`: ручной выбор
+            # пользователя один и задаёт и эмоцию, и интонацию. Дублируется он здесь
+            # потому, что дропдаун читает блок просодии целиком, и брать выбранное
+            # значение из соседнего блока значило бы держать один факт в двух местах
+            # сборки ответа.
+            "override": replica["emotion_override"],
+            "effective": replica["prosody_effective"],
+            "effective_title": emotions.emotion_title(replica["prosody_effective"]),
+            "source": _emotion_source(project),
+            "dialogue_act": replica["dialogue_act"],
+            "context_dependency": replica["context_dependency"],
+        },
         # Что реально ушло в движок последним синтезом этой реплики.
         "reference": {
             "profile_id": replica["reference_profile_id"],
+            "profile_key": replica["reference_profile_key"],
             "emotion": replica["reference_emotion"],
             "fallback_used": replica["reference_fallback_used"],
+            "fallback_reason": replica["reference_fallback_reason"],
         },
     }
 
@@ -2814,10 +2918,20 @@ def _analyze_project(project: dict, indexes: list[int] | None, auto_accent: bool
         llm_outcome = _llm_analyzer_for(project["id"]).run(
             project_id=project["id"],
             replicas=[
-                {"index": int(row["index"]), "text": row["text"], "replica_id": int(row["id"])}
+                {
+                    "index": int(row["index"]),
+                    "text": row["text"],
+                    "replica_id": int(row["id"]),
+                    # Кто говорит — часть сцены: без этого модель не отличит
+                    # вопрос от ответа, а «Правда?» прочитает вне диалога (§7).
+                    "speaker": str(row.get("speaker") or ""),
+                }
                 for row in selected
             ],
             rules=rules,
+            # Реплики проекта — это диалог: модель читает сцену окном и отвечает
+            # разбором на каждую реплику окна одним запросом (§6, §7).
+            scene=True,
         )
         get_projects_store().set_llm_analysis_state(
             project["id"],
@@ -2964,6 +3078,9 @@ def _apply_emotions(project_id: str, selected: list[dict], llm_outcome) -> None:
                 confidence=float(found.get("confidence") or 0.0),
                 dialogue_act=str(found.get("dialogue_act") or ""),
                 context_dependency=str(found.get("context_dependency") or ""),
+                # Просодия едет вместе с эмоцией: рекомендованный записываемый
+                # профиль, темп и интенсивность — из того же ответа модели (§8).
+                prosody=found.get("prosody") or {},
             )
             continue
         guess = emotions.heuristic_emotion(row["text"])
@@ -3170,6 +3287,9 @@ async def render_project(project_id: str, payload: ProjectRenderRequest | None =
                 emotion_detected=replica["emotion_detected"],
                 emotion_override=replica["emotion_override"],
                 reference_profile_id=replica["reference_profile_id"],
+                # Рекомендация просодии из анализа (UPDATE 3 §24): вместе с эмоцией
+                # она решает, какой профиль уйдёт резолверу. Тоже метаданные.
+                **_prosody_metadata(replica),
             )
             for index, replica in enumerate(project["replicas"])
         ],
@@ -3286,6 +3406,9 @@ async def regenerate_project_replica(
                 emotion_detected=replica["emotion_detected"],
                 emotion_override=replica["emotion_override"],
                 reference_profile_id=replica["reference_profile_id"],
+                # Рекомендация просодии: перегенерация обязана попасть в тот же
+                # профиль, что и первая сборка (UPDATE 3 §24, §29).
+                **_prosody_metadata(replica),
             ),
             speakers=_project_speakers(project),
             settings=_replica_render_settings(project),

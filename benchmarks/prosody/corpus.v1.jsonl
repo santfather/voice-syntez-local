@@ -1,0 +1,36 @@
+{"id": "neutral-001", "category": "neutral", "text": "Я пришёл немного раньше.", "expected_intent": "NEUTRAL", "ambiguous": false, "note": ""}
+{"id": "neutral-002", "category": "neutral", "text": "Сегодня было довольно тепло.", "expected_intent": "NEUTRAL", "ambiguous": false, "note": ""}
+{"id": "neutral-003", "category": "neutral", "text": "Документы лежат на столе.", "expected_intent": "NEUTRAL", "ambiguous": false, "note": ""}
+{"id": "neutral-004", "category": "neutral", "text": "Мы встретимся завтра утром.", "expected_intent": "NEUTRAL", "ambiguous": false, "note": ""}
+{"id": "question-001", "category": "question", "text": "Ты уверен?", "expected_intent": "QUESTION", "ambiguous": false, "note": ""}
+{"id": "question-002", "category": "question", "text": "Это правда?", "expected_intent": "QUESTION", "ambiguous": false, "note": ""}
+{"id": "question-003", "category": "question", "text": "Что произошло?", "expected_intent": "QUESTION", "ambiguous": false, "note": ""}
+{"id": "question-004", "category": "question", "text": "Когда вы вернётесь?", "expected_intent": "QUESTION", "ambiguous": false, "note": ""}
+{"id": "delight-001", "category": "delight", "text": "У нас получилось!", "expected_intent": "DELIGHT", "ambiguous": false, "note": ""}
+{"id": "delight-002", "category": "delight", "text": "Это потрясающе!", "expected_intent": "DELIGHT", "ambiguous": false, "note": ""}
+{"id": "delight-003", "category": "delight", "text": "Как я рад тебя видеть!", "expected_intent": "DELIGHT", "ambiguous": false, "note": ""}
+{"id": "delight-004", "category": "delight", "text": "Наконец-то всё вышло!", "expected_intent": "DELIGHT", "ambiguous": false, "note": ""}
+{"id": "sad-001", "category": "sad_sympathetic", "text": "Мне очень жаль.", "expected_intent": "SAD_SYMPATHETIC", "ambiguous": false, "note": ""}
+{"id": "sad-002", "category": "sad_sympathetic", "text": "Я понимаю, как тебе тяжело.", "expected_intent": "SAD_SYMPATHETIC", "ambiguous": false, "note": ""}
+{"id": "sad-003", "category": "sad_sympathetic", "text": "Это очень печальная новость.", "expected_intent": "SAD_SYMPATHETIC", "ambiguous": false, "note": ""}
+{"id": "sad-004", "category": "sad_sympathetic", "text": "Соболезную твоей потере.", "expected_intent": "SAD_SYMPATHETIC", "ambiguous": false, "note": ""}
+{"id": "irony-001", "category": "irony", "text": "Ну конечно.", "expected_intent": "IRONIC", "ambiguous": false, "note": ""}
+{"id": "irony-002", "category": "irony", "text": "Очень вовремя.", "expected_intent": "IRONIC", "ambiguous": false, "note": ""}
+{"id": "irony-003", "category": "irony", "text": "Как удачно всё совпало.", "expected_intent": "IRONIC", "ambiguous": false, "note": ""}
+{"id": "irony-004", "category": "irony", "text": "Прекрасно, просто прекрасно.", "expected_intent": "IRONIC", "ambiguous": false, "note": ""}
+{"id": "strict-001", "category": "strict", "text": "Стойте здесь.", "expected_intent": "STRICT", "ambiguous": false, "note": ""}
+{"id": "strict-002", "category": "strict", "text": "Отдайте ключи.", "expected_intent": "STRICT", "ambiguous": false, "note": ""}
+{"id": "strict-003", "category": "strict", "text": "Закройте дверь.", "expected_intent": "STRICT", "ambiguous": false, "note": ""}
+{"id": "strict-004", "category": "strict", "text": "Не двигайтесь.", "expected_intent": "STRICT", "ambiguous": false, "note": ""}
+{"id": "enumeration-001", "category": "enumeration", "text": "Нужны ключи, документы, телефон и деньги.", "expected_intent": "ENUMERATION", "ambiguous": false, "note": ""}
+{"id": "enumeration-002", "category": "enumeration", "text": "Возьми хлеб, молоко, сыр и яблоки.", "expected_intent": "ENUMERATION", "ambiguous": false, "note": ""}
+{"id": "enumeration-003", "category": "enumeration", "text": "Нужно купить билеты, собрать вещи и вызвать такси.", "expected_intent": "ENUMERATION", "ambiguous": false, "note": ""}
+{"id": "enumeration-004", "category": "enumeration", "text": "Первое место, второе, третье и четвёртое.", "expected_intent": "ENUMERATION", "ambiguous": false, "note": ""}
+{"id": "excited-001", "category": "excited", "text": "Скорее, мы опаздываем!", "expected_intent": "EXCITED", "ambiguous": false, "note": ""}
+{"id": "excited-002", "category": "excited", "text": "Он уже здесь!", "expected_intent": "EXCITED", "ambiguous": false, "note": ""}
+{"id": "excited-003", "category": "excited", "text": "Смотри, что я нашёл!", "expected_intent": "EXCITED", "ambiguous": false, "note": ""}
+{"id": "excited-004", "category": "excited", "text": "Быстрее, поезд уходит!", "expected_intent": "EXCITED", "ambiguous": false, "note": ""}
+{"id": "ambiguous-001", "category": "ambiguous", "text": "Правда?", "expected_intent": "QUESTION", "ambiguous": true, "note": "переспрос или удивление — решает контекст"}
+{"id": "ambiguous-002", "category": "ambiguous", "text": "Вот как.", "expected_intent": "NEUTRAL", "ambiguous": true, "note": "нейтральное принятие к сведению или ирония"}
+{"id": "ambiguous-003", "category": "ambiguous", "text": "Ну конечно.", "expected_intent": "IRONIC", "ambiguous": true, "note": "согласие или сарказм — решает контекст"}
+{"id": "ambiguous-004", "category": "ambiguous", "text": "Хорошо.", "expected_intent": "NEUTRAL", "ambiguous": true, "note": "согласие, сомнение или угроза в зависимости от контекста"}

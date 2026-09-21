@@ -103,10 +103,113 @@
           "items": {
             "type": "integer"
           }
+        },
+        "emotion": {
+          "type": "string",
+          "enum": [
+            "NEUTRAL",
+            "CALM",
+            "QUESTION",
+            "NEUTRAL_QUESTION",
+            "EXCLAMATION",
+            "DELIGHT",
+            "SAD_SYMPATHETIC",
+            "IRONIC",
+            "STRICT",
+            "ENUMERATION",
+            "EXCITED",
+            "SURPRISE",
+            "FEAR"
+          ]
+        },
+        "emotion_confidence": {
+          "type": "number"
+        },
+        "dialogue_act": {
+          "type": "string",
+          "enum": [
+            "STATEMENT",
+            "QUESTION",
+            "ANSWER",
+            "REQUEST",
+            "COMMAND",
+            "REACTION",
+            "COMPLIMENT",
+            "REFUSAL",
+            "AGREEMENT",
+            "DISAGREEMENT",
+            "GREETING",
+            "FAREWELL",
+            "WARNING",
+            "EXCLAMATION",
+            "ENUMERATION",
+            "OTHER"
+          ]
+        },
+        "prosody": {
+          "type": "object",
+          "properties": {
+            "profile": {
+              "type": "string",
+              "enum": [
+                "NEUTRAL",
+                "CALM",
+                "QUESTION",
+                "NEUTRAL_QUESTION",
+                "EXCLAMATION",
+                "DELIGHT",
+                "SAD_SYMPATHETIC",
+                "IRONIC",
+                "STRICT",
+                "ENUMERATION",
+                "EXCITED",
+                "SURPRISE",
+                "FEAR"
+              ]
+            },
+            "recommended_profile": {
+              "type": "string",
+              "enum": [
+                "NEUTRAL",
+                "CALM",
+                "QUESTION",
+                "NEUTRAL_QUESTION",
+                "EXCLAMATION",
+                "DELIGHT",
+                "SAD_SYMPATHETIC",
+                "IRONIC",
+                "STRICT",
+                "ENUMERATION",
+                "EXCITED"
+              ]
+            },
+            "intensity": {
+              "type": "number"
+            },
+            "pace": {
+              "type": "string",
+              "enum": [
+                "SLOW",
+                "NORMAL",
+                "FAST"
+              ]
+            },
+            "confidence": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "profile",
+            "recommended_profile",
+            "intensity",
+            "pace",
+            "confidence"
+          ]
         }
       },
       "required": [
-        "class"
+        "class",
+        "emotion"
       ]
     }
   },

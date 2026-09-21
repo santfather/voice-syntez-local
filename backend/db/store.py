@@ -321,6 +321,10 @@ class ProjectsStore:
                         ),
                         "dialogue_act": replica["dialogue_act"],
                         "context_dependency": replica["context_dependency"],
+                        "prosody_profile": replica["prosody_profile"],
+                        "prosody_intensity": replica["prosody_intensity"],
+                        "prosody_pace": replica["prosody_pace"],
+                        "prosody_confidence": replica["prosody_confidence"],
                         "reference_profile_id": (
                             replica["reference_profile_id"]
                             if reference_profile_id is UNSET
@@ -328,6 +332,8 @@ class ProjectsStore:
                         ),
                         "reference_emotion": replica["reference_emotion"],
                         "reference_fallback_used": replica["reference_fallback_used"],
+                        "reference_profile_key": replica["reference_profile_key"],
+                        "reference_fallback_reason": replica["reference_fallback_reason"],
                     },
                 )
             if reason is not None:
@@ -348,19 +354,26 @@ class ProjectsStore:
         confidence: float = 0.0,
         dialogue_act: str = "",
         context_dependency: str = "",
+        prosody: dict | None = None,
     ) -> dict:
-        """Пишет **распознанную** эмоцию реплики (результат анализа сцены).
+        """Пишет **распознанную** эмоцию и просодию реплики (результат анализа сцены).
 
         Ручной выбор (`emotion_override`) не трогается: анализ не имеет права
         переписывать решение пользователя (§5, §11). Вместе с эмоцией пишутся
-        `dialogue_act` и `context_dependency` — они приходят из того же ответа
-        модели и без них «почему именно вопрос» не объяснить.
+        `dialogue_act`, `context_dependency` и блок просодии — они приходят из
+        того же ответа модели и без них «почему именно вопрос» не объяснить.
+
+        `prosody` — словарь полей §8 (`profile`, `intensity`, `pace`,
+        `confidence`). `None` означает «в этом ответе просодии не было»: тогда
+        сохранённая рекомендация не затирается пустотой, потому что разбор без
+        блока просодии — не то же самое, что разбор с явным «профиля нет».
         """
         with transaction() as connection:
             replicas = ReplicasRepository(connection)
             replica = replicas.by_index(project_id, index)
             if replica is None:
                 raise KeyError(index)
+            prosody = prosody or {}
             replicas.save_emotion(
                 int(replica["id"]),
                 {
@@ -373,11 +386,25 @@ class ProjectsStore:
                     "emotion_override": replica["emotion_override"],
                     "dialogue_act": replica["dialogue_act"] if detected is None else dialogue_act,
                     "context_dependency": (
-                        replica["context_dependency"] if detected is None else context_dependency
+                        replica["context_dependency"]
+                        if detected is None
+                        else context_dependency
+                    ),
+                    "prosody_profile": prosody.get(
+                        "profile", replica["prosody_profile"]
+                    ),
+                    "prosody_intensity": prosody.get(
+                        "intensity", replica["prosody_intensity"]
+                    ),
+                    "prosody_pace": prosody.get("pace", replica["prosody_pace"]),
+                    "prosody_confidence": prosody.get(
+                        "confidence", replica["prosody_confidence"]
                     ),
                     "reference_profile_id": replica["reference_profile_id"],
                     "reference_emotion": replica["reference_emotion"],
                     "reference_fallback_used": replica["reference_fallback_used"],
+                    "reference_profile_key": replica["reference_profile_key"],
+                    "reference_fallback_reason": replica["reference_fallback_reason"],
                 },
             )
         return self.get_project(project_id)  # type: ignore[return-value]
@@ -390,12 +417,16 @@ class ProjectsStore:
         profile_id: str,
         emotion: str,
         fallback_used: bool,
+        profile_key: str = "",
+        fallback_reason: str = "",
     ) -> dict:
         """Записывает, какой референс **фактически** ушёл в движок последним синтезом.
 
         Это факт, а не намерение: после рендера видно, взялся эмоциональный
         профиль или случился откат на NEUTRAL, — и в карточке реплики не нужно
-        ничего досчитывать.
+        ничего досчитывать. `profile_key` и `fallback_reason` дополняют факт до
+        того, что нужно карточке и take-метаданным (§55): каким ключом профиля
+        это было и почему пришлось откатываться.
         """
         with transaction() as connection:
             replicas = ReplicasRepository(connection)
@@ -410,9 +441,15 @@ class ProjectsStore:
                     "emotion_override": replica["emotion_override"],
                     "dialogue_act": replica["dialogue_act"],
                     "context_dependency": replica["context_dependency"],
+                    "prosody_profile": replica["prosody_profile"],
+                    "prosody_intensity": replica["prosody_intensity"],
+                    "prosody_pace": replica["prosody_pace"],
+                    "prosody_confidence": replica["prosody_confidence"],
                     "reference_profile_id": profile_id,
                     "reference_emotion": emotion,
                     "reference_fallback_used": fallback_used,
+                    "reference_profile_key": profile_key,
+                    "reference_fallback_reason": fallback_reason,
                 },
             )
         return self.get_project(project_id)  # type: ignore[return-value]

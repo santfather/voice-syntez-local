@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prosody benchmark corpus case",
+  "description": "Одна реплика корпуса reference prosody transfer benchmark (UPDATE 3 §31).",
+  "type": "object",
+  "required": ["id", "category", "text", "expected_intent"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Уникальный идентификатор кейса; он же префикс имени файла ячейки."
+    },
+    "category": {
+      "description": "Категория корпуса; список обязан совпадать с prosody_benchmark.CATEGORIES.",
+      "enum": [
+        "neutral",
+        "question",
+        "delight",
+        "sad_sympathetic",
+        "irony",
+        "strict",
+        "enumeration",
+        "excited",
+        "ambiguous"
+      ]
+    },
+    "text": {"type": "string", "minLength": 1, "description": "Текст реплики как он уйдёт в синтез."},
+    "expected_intent": {
+      "description": "Ожидаемое намерение; словарь обязан совпадать с emotions.EMOTIONS.",
+      "enum": [
+        "NEUTRAL",
+        "CALM",
+        "QUESTION",
+        "NEUTRAL_QUESTION",
+        "EXCLAMATION",
+        "DELIGHT",
+        "SAD_SYMPATHETIC",
+        "IRONIC",
+        "STRICT",
+        "ENUMERATION",
+        "EXCITED",
+        "SURPRISE",
+        "FEAR"
+      ]
+    },
+    "ambiguous": {
+      "type": "boolean",
+      "default": false,
+      "description": "Интонация реплики решается контекстом, а не текстом."
+    },
+    "note": {
+      "type": "string",
+      "description": "Контекст для спорных реплик; попадает в подсказку listening review."
+    }
+  }
+}

@@ -1,13 +1,13 @@
 """Сборка трека: подготовка куска, громкость файла, лимитер, варианты и паузы."""
 
 import asyncio
-from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
+from conftest import dominant_hz, sine
 
-from backend import audio_pipeline, config
+from backend import audio_pipeline, config, warmup_context
 from backend.audio_pipeline import (
     RenderSettings,
     SpeakerSettings,
@@ -30,7 +30,6 @@ from backend.audio_pipeline import (
 from backend.dialogue_parser import Replica
 from backend.engines.base import SAMPLE_RATE, STATE_READY, EngineInfo, SynthesisEngine
 from backend.transcribe import word_error_rate
-from conftest import dominant_hz, sine
 
 
 def _speaker(voice_id: str = "voice1", **overrides) -> SpeakerSettings:
@@ -429,3 +428,240 @@ def test_word_error_rate_counts_words_not_letters():
     # Перестановка — это замены, а не «половина текста не совпала»: так считает
     # расстояние Левенштейна, и по нему же принимается решение о повторе.
     assert word_error_rate("а б в г", "г в б а") == 1.0
+
+
+# --- прогрев коротких реплик --------------------------------------------------
+# Прогрев — скрытый текст перед целью. Тесты следят за тремя вещами: он уходит в
+# движок, из готового файла он вырезан, а метаданные и проверка видят только цель.
+WARMUP_PREFIX = "Тише, сейчас начнём."
+WARMUP_TARGET = "Да."
+
+
+class _FakeWarmupService:
+    """Сборщик префикса без LLM: ответ задан заранее, вызовы считаются."""
+
+    def __init__(self, prefix: str | None = WARMUP_PREFIX) -> None:
+        self.prefix = prefix
+        self.calls: list[dict] = []
+
+    def build(
+        self,
+        *,
+        target_text,
+        engine_id,
+        previous_text=None,
+        next_text=None,
+        speaker="",
+        enabled=None,
+    ) -> warmup_context.WarmupContext:
+        self.calls.append({"target_text": target_text, "engine_id": engine_id})
+        return warmup_context.WarmupContext(
+            target_text=target_text,
+            prefix_text=self.prefix,
+            enabled=bool(self.prefix),
+            reason=(
+                warmup_context.REASON_OK if self.prefix else warmup_context.REASON_EMPTY_RESPONSE
+            ),
+        )
+
+
+def _warmup_boundary(start_sec: float = 0.5) -> warmup_context.TargetBoundary:
+    """Граница цели так, как её вернул бы alignment по таймстемпам слов."""
+    return warmup_context.TargetBoundary(
+        start_sec=start_sec, confidence=1.0, method="asr", matched_words=1, total_words=1
+    )
+
+
+def _warmup_render(service, monkeypatch, **overrides):
+    """Рендер одной короткой реплики с подставленным сервисом прогрева."""
+    monkeypatch.setattr(audio_pipeline.warmup_context, "get_service", lambda: service)
+    return _render(
+        [_replica(WARMUP_TARGET)],
+        {"#1": _speaker()},
+        RenderSettings(pause_ms=0, output_format="wav", warmup=True, **overrides),
+    )
+
+
+def test_warmup_sends_prefix_and_target_to_engine(stub, fake_store, monkeypatch):
+    """Без полного «префикс + цель» модель не получит нужный вход в речь."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: _warmup_boundary()
+    )
+
+    _warmup_render(service, monkeypatch)
+
+    assert service.calls[0]["target_text"] == WARMUP_TARGET
+    assert len(stub.calls) == 1
+    sent = stub.calls[0]["text"]
+    assert sent.startswith(WARMUP_PREFIX)
+    # Цель — суффикс синтез-текста: именно по этому суффиксу ищется граница.
+    assert sent.endswith(WARMUP_TARGET)
+    assert sent == f"{WARMUP_PREFIX} {WARMUP_TARGET}"
+
+
+def test_warmup_crop_removes_prefix_audio(stub, fake_store, monkeypatch):
+    """В файле должна остаться цель: иначе пользователь услышит чужой текст."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context,
+        "locate_target_start",
+        lambda *a, **k: _warmup_boundary(0.5),
+    )
+
+    result = _warmup_render(service, monkeypatch)
+
+    assert len(stub.calls) == 1
+    full_sec = 0.4 + 0.02 * len(stub.calls[0]["text"])
+    # Срезано ровно до границы с запасом `WARMUP_PREROLL_MS`, а не «примерно».
+    assert result.duration_sec == pytest.approx(
+        full_sec - 0.5 + config.WARMUP_PREROLL_MS / 1000, abs=0.05
+    )
+    assert result.duration_sec < full_sec
+
+
+def test_warmup_metadata_reports_boundary(stub, fake_store, monkeypatch):
+    """Диагностике нужна фактическая граница: без неё непонятно, как резалось аудио."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context,
+        "locate_target_start",
+        lambda *a, **k: _warmup_boundary(0.5),
+    )
+
+    result = _warmup_render(service, monkeypatch)
+
+    assert result.warmups[0]["warmup_boundary_sec"] == pytest.approx(0.5)
+
+
+def test_warmup_alignment_failure_resynthesizes_target_only(stub, fake_store, monkeypatch):
+    """Ненайденная граница — не «оставить как есть», а честный повтор только цели."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: None
+    )
+
+    _warmup_render(service, monkeypatch)
+
+    assert len(stub.calls) == 2
+    assert WARMUP_PREFIX in stub.calls[0]["text"]
+    assert stub.calls[1]["text"] == WARMUP_TARGET
+
+
+def test_warmup_metadata_reports_alignment_fallback(stub, fake_store, monkeypatch):
+    """Откат обязан быть виден в метаданных: иначе деградация прогрева незаметна."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: None
+    )
+
+    result = _warmup_render(service, monkeypatch)
+
+    assert result.warmups[0]["warmup_fallback"] is True
+
+
+def test_qa_measures_target_without_warmup_prefix(stub, fake_store, monkeypatch):
+    """Проверка сравнивает цель с целью: префикс в ожидаемом тексте уронил бы WER."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: _warmup_boundary()
+    )
+    measured: list[str] = []
+
+    async def fake_measure(chunk: np.ndarray, expected: str) -> tuple[str, float]:
+        measured.append(expected)
+        return WARMUP_TARGET, 0.0
+
+    monkeypatch.setattr(audio_pipeline, "_transcribe_and_measure", fake_measure)
+
+    result = _warmup_render(
+        service, monkeypatch, qa=audio_pipeline.QaSettings.for_mode("strict")
+    )
+
+    assert measured == [WARMUP_TARGET]
+    assert all(WARMUP_PREFIX not in expected for expected in measured)
+    assert result.qa[0].status == audio_pipeline.QA_PASSED
+
+
+def test_warmup_off_keeps_plain_synthesis(stub, fake_store, monkeypatch):
+    """Выключенный прогрев не должен ни звать сервис, ни менять текст для движка."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(audio_pipeline.warmup_context, "get_service", lambda: service)
+    monkeypatch.setattr(config, "WARMUP_ENABLED", True)
+
+    # Явный `warmup=False` сильнее включённой политики приложения.
+    result = _render(
+        [_replica(WARMUP_TARGET)],
+        {"#1": _speaker()},
+        RenderSettings(pause_ms=0, output_format="wav", warmup=False),
+    )
+    assert len(stub.calls) == 1
+    assert stub.calls[0]["text"] == WARMUP_TARGET
+    assert result.warmups == {}
+    assert service.calls == []
+
+    # Политика приложения выключена, `warmup=None` — поведение прежнее.
+    stub.calls.clear()
+    monkeypatch.setattr(config, "WARMUP_ENABLED", False)
+    result = _render(
+        [_replica(WARMUP_TARGET)],
+        {"#1": _speaker()},
+        RenderSettings(pause_ms=0, output_format="wav"),
+    )
+    assert len(stub.calls) == 1
+    assert stub.calls[0]["text"] == WARMUP_TARGET
+    assert result.warmups == {}
+    assert service.calls == []
+
+
+def test_warmup_prefix_passes_accentizer_on_f5(accent_stub, fake_store, monkeypatch):
+    """F5 понимает «+»: префикс обязан пройти accentizer так же, как цель."""
+    service = _FakeWarmupService(prefix="Тише начнём")
+    monkeypatch.setattr(audio_pipeline.warmup_context, "get_service", lambda: service)
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: _warmup_boundary()
+    )
+    monkeypatch.setattr(audio_pipeline, "accentuate", lambda text: f"[{text}]")
+
+    _warmup_render(service, monkeypatch)
+
+    sent = accent_stub.calls[0]["text"]
+    assert "[Тише начнём]" in sent
+    assert sent.endswith(f"[{WARMUP_TARGET}]")
+
+
+def test_warmup_prefix_skips_accentizer_on_plain_engine(stub, fake_store, monkeypatch):
+    """Движок без ударений не должен получить «+»-разметку: он прочитал бы её вслух."""
+    service = _FakeWarmupService(prefix="Тише начнём")
+    monkeypatch.setattr(audio_pipeline.warmup_context, "get_service", lambda: service)
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: _warmup_boundary()
+    )
+    monkeypatch.setattr(audio_pipeline, "accentuate", lambda text: f"[{text}]")
+
+    _warmup_render(service, monkeypatch)
+
+    sent = stub.calls[0]["text"]
+    assert "[" not in sent
+    assert sent.startswith("Тише начнём")
+    assert sent.endswith(WARMUP_TARGET)
+
+
+def test_warmup_takes_priority_over_short_layer(stub, fake_store, monkeypatch):
+    """Два слоя не складываются: в движок идёт прогрев, а не контекст короткой реплики."""
+    service = _FakeWarmupService()
+    monkeypatch.setattr(audio_pipeline.warmup_context, "get_service", lambda: service)
+    monkeypatch.setattr(
+        audio_pipeline.warmup_context, "locate_target_start", lambda *a, **k: _warmup_boundary()
+    )
+    settings = RenderSettings(
+        pause_ms=0,
+        output_format="wav",
+        warmup=True,
+        short_utterance=audio_pipeline.ShortUtteranceSettings(enabled=True),
+    )
+
+    _render([_replica(WARMUP_TARGET)], {"#1": _speaker()}, settings)
+
+    # Даже если короткий слой построил свой план, первый вход модели — префикс прогрева.
+    assert stub.calls[0]["text"] == f"{WARMUP_PREFIX} {WARMUP_TARGET}"

@@ -1,4 +1,5 @@
-"""Эмоция реплики: словарь значений и правила выбора действующего (UPDATE 2 §3–§6).
+"""Эмоция реплики: словарь значений и правила выбора действующего (UPDATE 2 §3–§6,
+UPDATE 3 §10–§13).
 
 Эмоция — это **метаданные**, а не слово в тексте. Ни один служебный маркер не
 попадает ни в `source_text`, ни в `final_text`: синтезу уходит ровно тот текст,
@@ -8,6 +9,19 @@
 
 Слой эмоции отвечает только за **выбор референса** (просодический conditioning) и
 ничего не исправляет в аудио: если слово обрезано, это лечит не эмоция (§54).
+
+Словарей два, и они намеренно разные:
+
+* `PROFILE_KEYS` — то, что может быть **записано** как референс-профиль голоса
+  (UPDATE 3 §10): 11 значений, ровно под 11 фраз `RECORD_PHRASES`.
+* `EMOTIONS` — то, что модель может **определить** (семантика реплики). Оно шире:
+  `SURPRISE` и `FEAR` из UPDATE 2 остаются различимыми, хотя отдельной записи под
+  них нет — резолвер уводит их в ближайший разрешённый профиль с явным откатом
+  (UPDATE 3 §17). Свести этот словарь к списку профилей значило бы потерять
+  разницу между «модель поняла, что это испуг» и «модель не поняла ничего».
+
+Обратная совместимость: все значения UPDATE 2 входят в `EMOTIONS`, поэтому старые
+проекты и голоса читаются без миграции данных.
 """
 
 from __future__ import annotations
@@ -15,43 +29,103 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# Минимальный production-набор (§3.1). Порядок — он же порядок в интерфейсе.
+# `AUTO` — не эмоция, а способ её выбрать («пусть решает LLM»).
 EMOTION_AUTO = "AUTO"
+
 EMOTION_NEUTRAL = "NEUTRAL"
+EMOTION_CALM = "CALM"
 EMOTION_QUESTION = "QUESTION"
+EMOTION_NEUTRAL_QUESTION = "NEUTRAL_QUESTION"
+EMOTION_EXCLAMATION = "EXCLAMATION"
 EMOTION_DELIGHT = "DELIGHT"
+EMOTION_SAD_SYMPATHETIC = "SAD_SYMPATHETIC"
+EMOTION_IRONIC = "IRONIC"
+EMOTION_STRICT = "STRICT"
+EMOTION_ENUMERATION = "ENUMERATION"
+EMOTION_EXCITED = "EXCITED"
+# Значения UPDATE 2, оставленные различимыми: под них нет отдельной записи, и
+# резолвер подбирает ближайший профиль с явным `fallback_used` (§17).
 EMOTION_SURPRISE = "SURPRISE"
 EMOTION_FEAR = "FEAR"
 
-# Значения, которые пользователь может выбрать руками (AUTO — «пусть решает LLM»).
-SELECTABLE_EMOTIONS: tuple[str, ...] = (
-    EMOTION_AUTO,
+# Production-набор профилей (UPDATE 3 §10): порядок — он же порядок в интерфейсе.
+# Только эти значения могут быть ключом записанного референса.
+PROFILE_KEYS: tuple[str, ...] = (
     EMOTION_NEUTRAL,
+    EMOTION_CALM,
     EMOTION_QUESTION,
+    EMOTION_NEUTRAL_QUESTION,
+    EMOTION_EXCLAMATION,
     EMOTION_DELIGHT,
-    EMOTION_SURPRISE,
-    EMOTION_FEAR,
+    EMOTION_SAD_SYMPATHETIC,
+    EMOTION_IRONIC,
+    EMOTION_STRICT,
+    EMOTION_ENUMERATION,
+    EMOTION_EXCITED,
 )
-# Значения, которые имеют смысл как конкретный референс: `AUTO` сюда не входит —
-# это не эмоция, а способ её выбрать.
-EMOTIONS: tuple[str, ...] = SELECTABLE_EMOTIONS[1:]
+
+# Семантические эмоции: `AUTO` сюда не входит — это не значение анализа.
+EMOTIONS: tuple[str, ...] = (*PROFILE_KEYS, EMOTION_SURPRISE, EMOTION_FEAR)
+
+# Значения, которые пользователь может выбрать руками. Шире словаря профилей:
+# ручной выбор «Удивление» остаётся возможным для старых проектов и честно
+# показывается как откат, если записи под него нет (§17).
+SELECTABLE_EMOTIONS: tuple[str, ...] = (EMOTION_AUTO, *EMOTIONS)
+
 # Эмоции, для которых отдельного референса может не быть: отсутствие не блокирует
-# синтез, а даёт NEUTRAL с пометкой об откате (§9).
-OPTIONAL_EMOTIONS: tuple[str, ...] = (
-    EMOTION_QUESTION,
-    EMOTION_DELIGHT,
-    EMOTION_SURPRISE,
-    EMOTION_FEAR,
+# синтез, а даёт безопасный откат с пометкой (§9, §26).
+OPTIONAL_EMOTIONS: tuple[str, ...] = tuple(
+    value for value in EMOTIONS if value != EMOTION_NEUTRAL
 )
 
 EMOTION_TITLES = {
     EMOTION_AUTO: "Авто",
     EMOTION_NEUTRAL: "Нейтрально",
+    EMOTION_CALM: "Спокойно",
     EMOTION_QUESTION: "Вопрос",
-    EMOTION_DELIGHT: "Восторг",
+    EMOTION_NEUTRAL_QUESTION: "Вопрос + нейтрально",
+    EMOTION_EXCLAMATION: "Восклицание",
+    EMOTION_DELIGHT: "Радость / восторг",
+    EMOTION_SAD_SYMPATHETIC: "Огорчение / сочувствие",
+    EMOTION_IRONIC: "Ирония",
+    EMOTION_STRICT: "Строго",
+    EMOTION_ENUMERATION: "Перечисление",
+    EMOTION_EXCITED: "Взволнованно",
     EMOTION_SURPRISE: "Удивление",
     EMOTION_FEAR: "Испуг",
 }
+
+# Короткие подписи для компактных мест интерфейса (dropdown реплики, карточка take).
+EMOTION_SHORT_TITLES = {
+    **EMOTION_TITLES,
+    EMOTION_SAD_SYMPATHETIC: "Сочувствие",
+    EMOTION_NEUTRAL_QUESTION: "Вопрос",
+}
+
+
+def is_profile_key(value: object) -> bool:
+    """Может ли это значение быть ключом записанного референс-профиля (§10)."""
+    return str(value or "").strip().upper() in PROFILE_KEYS
+
+
+def normalize_profile_key(value: object, *, default: str = EMOTION_NEUTRAL) -> str:
+    """Приводит ключ профиля к production-набору; вне набора — `default`.
+
+    Отдельно от `normalize_emotion`: там словарь шире, и FEAR, попавший в профиль,
+    создал бы запись, которой не существует в наборе §10.
+    """
+    text = str(value or "").strip().upper()
+    if text in PROFILE_KEYS:
+        return text
+    return default
+
+
+def emotion_title(value: object) -> str:
+    """Подпись эмоции для интерфейса; неизвестное значение отдаётся как есть."""
+    text = str(value or "").strip().upper()
+    if not text or text == EMOTION_AUTO:
+        return EMOTION_TITLES[EMOTION_AUTO]
+    return EMOTION_TITLES.get(text, text)
 
 
 def normalize_emotion(value: object, *, default: str = EMOTION_NEUTRAL) -> str:
@@ -84,6 +158,87 @@ def emotion_effective(detected: object, override: object) -> str:
     if detected_value and detected_value != EMOTION_AUTO:
         return detected_value
     return EMOTION_NEUTRAL
+
+
+def prosody_effective(
+    detected: object, override: object, recommended: object = ""
+) -> str:
+    """Действующий профиль просодии: override → рекомендация модели → эмоция (§24).
+
+    Отличается от `emotion_effective` одним шагом: модель называет не только
+    эмоцию, но и **записываемый** профиль (`recommended_profile`, §10). Если он
+    есть, именно он и есть цель маршрутизации — модель уже приняла решение о
+    замене (`SURPRISE → EXCLAMATION`), и резолверу не нужно выводить её самому.
+
+    Ручной выбор пользователя сильнее: `override` проверяется первым и берётся
+    даже тогда, когда модель рекомендовала другое (§5, §37). Пустая рекомендация
+    не ошибка: тогда работает прежнее правило `override → detected → NEUTRAL`, а
+    семантические значения уводит в ближайший профиль таблица отката (§17).
+    """
+    chosen = normalize_emotion(override, default="") if override else ""
+    if chosen and chosen != EMOTION_AUTO:
+        return chosen
+    suggested = normalize_profile_key(recommended, default="") if recommended else ""
+    if suggested:
+        return suggested
+    return emotion_effective(detected, "")
+
+
+# --- совместимость просодии ---------------------------------------------------
+# Регистр просодии: грубая группа интонаций, внутри которой реплики звучат
+# сопоставимо. Нужна слою коротких реплик (UPDATE 3 §52): контекст для короткой
+# фразы берётся из реплики того же спикера, но одинаковый голос ещё не значит
+# одинаковую интонацию — спокойная фраза и крик склеились бы в одно звучание, и
+# модель прочитала бы цель в чужом регистре.
+#
+# Групп намеренно мало: это политика совместимости, а не классификация эмоций.
+# Внутри группы замена контекста безопасна, между группами — нет.
+#
+# Вопрос стоит вместе со спокойным регистром, а не отдельно. Разделять их было бы
+# ошибкой: вопрос и спокойный ответ — одна интонационная линия («Как дела?» —
+# «Всё хорошо.»), и запрет контекста между ними ломал бы самый обычный диалог.
+# Политика защищает от смены **силы** звучания, а не от смены речевой функции.
+PROSODY_REGISTER_CALM = "calm"
+PROSODY_REGISTER_HIGH = "high"
+PROSODY_REGISTER_MARKED = "marked"
+
+PROSODY_REGISTERS: dict[str, str] = {
+    EMOTION_NEUTRAL: PROSODY_REGISTER_CALM,
+    EMOTION_CALM: PROSODY_REGISTER_CALM,
+    EMOTION_QUESTION: PROSODY_REGISTER_CALM,
+    EMOTION_NEUTRAL_QUESTION: PROSODY_REGISTER_CALM,
+    EMOTION_ENUMERATION: PROSODY_REGISTER_CALM,
+    EMOTION_SAD_SYMPATHETIC: PROSODY_REGISTER_CALM,
+    EMOTION_EXCLAMATION: PROSODY_REGISTER_HIGH,
+    EMOTION_DELIGHT: PROSODY_REGISTER_HIGH,
+    EMOTION_EXCITED: PROSODY_REGISTER_HIGH,
+    EMOTION_SURPRISE: PROSODY_REGISTER_HIGH,
+    EMOTION_IRONIC: PROSODY_REGISTER_MARKED,
+    EMOTION_STRICT: PROSODY_REGISTER_MARKED,
+    EMOTION_FEAR: PROSODY_REGISTER_MARKED,
+}
+
+
+def prosody_register(value: object) -> str:
+    """Регистр интонации; пустое значение — пустая строка («неизвестно»)."""
+    text = str(value or "").strip().upper()
+    if not text or text == EMOTION_AUTO:
+        return ""
+    return PROSODY_REGISTERS.get(text, "")
+
+
+def prosody_compatible(first: object, second: object) -> bool:
+    """Совместимы ли две интонации как цель и контекст (§52).
+
+    Неизвестная интонация не блокирует: без анализа (LLM выключена) слой коротких
+    реплик обязан работать как раньше, и запрет на контекст из-за отсутствия
+    метаданных был бы отказом функциональности ради политики.
+    """
+    left = prosody_register(first)
+    right = prosody_register(second)
+    if not left or not right:
+        return True
+    return left == right
 
 
 # --- детерминированная подсказка ---------------------------------------------
@@ -174,17 +329,32 @@ def heuristic_emotion(text: str) -> HeuristicEmotion:
 __all__ = [
     "EMOTIONS",
     "EMOTION_AUTO",
+    "EMOTION_CALM",
     "EMOTION_DELIGHT",
+    "EMOTION_ENUMERATION",
+    "EMOTION_EXCLAMATION",
+    "EMOTION_EXCITED",
     "EMOTION_FEAR",
+    "EMOTION_IRONIC",
     "EMOTION_NEUTRAL",
+    "EMOTION_NEUTRAL_QUESTION",
     "EMOTION_QUESTION",
+    "EMOTION_SAD_SYMPATHETIC",
+    "EMOTION_SHORT_TITLES",
+    "EMOTION_STRICT",
     "EMOTION_SURPRISE",
     "EMOTION_TITLES",
     "OPTIONAL_EMOTIONS",
+    "PROFILE_KEYS",
+    "PROSODY_REGISTERS",
     "SELECTABLE_EMOTIONS",
     "HeuristicEmotion",
     "emotion_effective",
+    "emotion_title",
     "heuristic_emotion",
     "is_emotion",
+    "is_profile_key",
     "normalize_emotion",
+    "normalize_profile_key",
+    "prosody_effective",
 ]

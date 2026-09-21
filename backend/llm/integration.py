@@ -39,6 +39,8 @@ from .analyzer import (
     ReplicaAnalysis,
     build_context,
     context_hash,
+    plan_windows,
+    scene_hash,
 )
 
 logger = logging.getLogger("tts.llm.integration")
@@ -333,11 +335,16 @@ def utterance_hints(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
 
 
 def replica_emotions(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
-    """Эмоция по репликам из сохранённых разборов: индекс → эмоция и уверенность.
+    """Эмоция и просодия по репликам из сохранённых разборов: индекс → значения.
 
     Отдельно от `utterance_hints`, потому что читатели разные: подсказки короткого
-    слоя — про класс и соседей, а эмоция уходит в данные проекта и в интерфейс.
-    Смешивать их значило бы тянуть в короткий слой лишнее.
+    слоя — про класс и соседей, а эмоция и просодия уходят в данные проекта и в
+    интерфейс. Смешивать их значило бы тянуть в короткий слой лишнее.
+
+    Реплика попадает в результат, если модель сказала **хоть что-то**: эмоцию или
+    блок просодии. Считать признаком только эмоцию нельзя — ответ, где назван
+    `recommended_profile`, но не заполнено `emotion`, иначе потерялся бы целиком,
+    и маршрутизация осталась бы без рекомендованного профиля (§8).
     """
     result: dict[int, dict] = {}
     for row in rows:
@@ -348,13 +355,25 @@ def replica_emotions(rows: Iterable[Mapping[str, object]]) -> dict[int, dict]:
         except ValueError:
             continue
         utterance = payload.get("utterance") or {}
-        if not isinstance(utterance, dict) or not utterance.get("emotion"):
+        if not isinstance(utterance, dict):
+            continue
+        prosody = utterance.get("prosody") or {}
+        prosody = prosody if isinstance(prosody, dict) else {}
+        if not utterance.get("emotion") and not any(prosody.values()):
             continue
         result[int(row.get("replica_index") or 0)] = {
             "emotion": str(utterance.get("emotion") or ""),
             "confidence": float(utterance.get("emotion_confidence") or 0.0),
             "dialogue_act": str(utterance.get("dialogue_act") or ""),
             "context_dependency": str(utterance.get("context_dependency") or ""),
+            # Маршрутизация (§8): рекомендованный записываемый профиль, темп и
+            # интенсивность — метаданные выбора референса, а не параметры движка.
+            "prosody": {
+                "profile": str(prosody.get("recommended_profile") or ""),
+                "intensity": prosody.get("intensity"),
+                "pace": str(prosody.get("pace") or ""),
+                "confidence": prosody.get("confidence"),
+            },
         }
     return result
 
@@ -391,6 +410,11 @@ class ProjectAnalysisOutcome:
             "replicas": len(self.analyses),
             "from_cache": self.from_cache,
             "calls": self.calls,
+            # Реплик на запрос (§77): по этому числу видно, что анализатор читает
+            # сцену, а не гоняет модель по одной реплике. 1.0 — тревожный признак.
+            "replicas_per_call": (
+                round(len(self.analyses) / self.calls, 2) if self.calls else 0.0
+            ),
             "seconds": round(self.seconds, 3),
             "error": self.error,
             "blocked_reason": self.blocked_reason,
@@ -436,6 +460,7 @@ class ProjectLlmAnalyzer:
         project_id: str,
         replicas: Sequence[Mapping[str, object]],
         rules: Sequence[Mapping[str, object]] = (),
+        scene: bool = False,
         on_progress: Callable[[str], None] | None = None,
     ) -> ProjectAnalysisOutcome:
         """Анализирует реплики проекта: кеш → слот → модель → сохранение.
@@ -443,6 +468,11 @@ class ProjectLlmAnalyzer:
         Если Analyzer выключен, ничего не делается: `DISABLED` — честный статус, а
         не «тихо пропустили». Если память или слот не дают начать, разбор не
         подменяется детерминированным результатом: статус `FAILED` с причиной.
+
+        `scene=True` — это диалог: реплики читаются окнами сцены, один запрос на
+        окно (§6, §7). Сплошной текст идёт прежним путём — по одной «реплике»-
+        фрагменту: его фрагменты не сцена с говорящими, и разбивать их на окна
+        значило бы менять смысл запроса, ничего не выигрывая.
         """
         settings = self.analyzer.settings
         if not settings.enabled:
@@ -450,15 +480,38 @@ class ProjectLlmAnalyzer:
         report = on_progress or (lambda message: logger.info("%s", message))
         started = self.clock()
         rules_digest = dictionary_hash(rules)
+        prompt_version = self._prompt_version(scene=scene)
         texts = [str(row.get("text") or "") for row in replicas]
+        # id реплик: тем же правилом, что и раньше — сохранённый id проекта, а без
+        # него позиция. Модель обязана вернуть ровно эти id (§47).
+        replica_ids = [
+            int(row.get("replica_id") or 0) or position + 1
+            for position, row in enumerate(replicas)
+        ]
+        scene_rows = [
+            {
+                "replica_id": replica_ids[position],
+                "speaker": str(row.get("speaker") or ""),
+                "target_text": texts[position],
+            }
+            for position, row in enumerate(replicas)
+        ]
+        # Окна: диалог читается сценой, одиночный режим — по одной реплике, чтобы
+        # проверка памяти осталась на каждой реплике (проход длинный, §14).
+        windows = (
+            plan_windows(len(replicas), size=settings.scene_replicas,
+                         overlap=settings.context_replicas)
+            if scene
+            else tuple((position, position + 1) for position in range(len(replicas)))
+        )
         analyses: dict[int, ReplicaAnalysis] = {}
         from_cache = 0
         calls = 0
         model_tag = ""
         digest = ""
 
-        # Слот берётся на весь проход: держать модель загруженной между репликами
-        # дешевле, чем грузить её заново на каждую, а параллельно с синтезом она
+        # Слот берётся на весь проход: держать модель загруженной между окнами
+        # дешевле, чем грузить её заново на каждое, а параллельно с синтезом она
         # всё равно работать не должна (§14.2).
         try:
             with self.scheduler.hold(
@@ -466,16 +519,16 @@ class ProjectLlmAnalyzer:
                 model_size_gb=self.model_size_gb,
                 owner=f"analysis:{project_id}",
             ):
-                for position, row in enumerate(replicas):
+                for start, end in windows:
                     # Проход длинный (десятки реплик), и память может уйти в HARD
                     # STOP уже во время него: модель загружена, KV-кэш растёт.
-                    # Проверяем перед каждой репликой и останавливаемся с причиной —
+                    # Проверяем перед каждым окном и останавливаемся с причиной —
                     # частичный разбор лучше, чем swap на всей машине (§14).
                     abort = self.scheduler.check(
                         memory.HEAVY_LLM, model_size_gb=self.model_size_gb
                     )
                     if abort.memory_level == memory.LEVEL_HARD_STOP:
-                        # Модель могла быть загружена предыдущими репликами: при
+                        # Модель могла быть загружена предыдущими окнами: при
                         # остановке её обязательно возвращаем системе.
                         self._unload_model_safely(model_tag or self.analyzer.selected_model())
                         return ProjectAnalysisOutcome(
@@ -489,36 +542,80 @@ class ProjectLlmAnalyzer:
                             from_cache=from_cache,
                             calls=calls,
                         )
-                    index = int(row.get("index") or position)
-                    target = texts[position]
-                    context = build_context(
-                        target,
-                        texts[max(0, position - settings.context_replicas) : position],
-                        texts[position + 1 : position + 1 + settings.context_replicas],
-                        limit=settings.context_replicas,
-                        budget_chars=settings.context_chars,
-                    )
-                    key = AnalysisKey(
-                        source_text_hash=text_hash(target),
-                        context_hash=context_hash(context),
-                        dictionary_hash=rules_digest,
-                        # Digest модели ещё не известен до первого ответа: кеш по
-                        # нему проверяется на втором проходе, а здесь он берётся из
-                        # уже сохранённого разбора при поиске.
-                        model_digest=digest,
-                        prompt_version=self.analyzer.prompt.version,
-                        schema_version=s.SCHEMA_VERSION,
-                    )
-                    cached = self._lookup_analysis(index, key) if self._lookup else None
-                    if cached is not None:
-                        analyses[index] = cached
-                        from_cache += 1
-                        model_tag = model_tag or cached.model_tag
-                        digest = digest or cached.model_digest
+                    window_digest = scene_hash(scene_rows[start:end]) if scene else ""
+                    pending: list[int] = []
+                    contexts: dict[int, dict] = {}
+                    for position in range(start, end):
+                        row = replicas[position]
+                        index = int(row.get("index") or position)
+                        if index in analyses:
+                            # Реплика из перекрытия окон: её разбор уже получен в
+                            # первом окне, а в этом она только контекст сцены.
+                            continue
+                        if scene:
+                            context_digest = window_digest
+                        else:
+                            contexts[position] = build_context(
+                                texts[position],
+                                texts[max(0, position - settings.context_replicas) : position],
+                                texts[position + 1 : position + 1 + settings.context_replicas],
+                                limit=settings.context_replicas,
+                                budget_chars=settings.context_chars,
+                            )
+                            context_digest = context_hash(contexts[position])
+                        key = AnalysisKey(
+                            source_text_hash=text_hash(texts[position]),
+                            context_hash=context_digest,
+                            dictionary_hash=rules_digest,
+                            # Digest модели ещё не известен до первого ответа: кеш
+                            # по нему проверяется на втором проходе, а здесь он
+                            # берётся из уже сохранённого разбора при поиске.
+                            model_digest=digest,
+                            prompt_version=prompt_version,
+                            schema_version=s.SCHEMA_VERSION,
+                        )
+                        cached = self._lookup_analysis(index, key) if self._lookup else None
+                        if cached is not None:
+                            analyses[index] = cached
+                            from_cache += 1
+                            model_tag = model_tag or cached.model_tag
+                            digest = digest or cached.model_digest
+                            continue
+                        pending.append(position)
+                    if not pending:
                         continue
+                    if scene:
+                        # Один запрос на окно (§7). В запрос уходит всё окно,
+                        # включая реплики из кеша: они — контекст сцены, и без них
+                        # соседи читались бы как обрывок диалога.
+                        expected = {
+                            replica_ids[position]: self._missing_in_window(
+                                replica_ids[position],
+                                texts[position],
+                                window_digest,
+                                rules_digest,
+                            )
+                            for position in pending
+                        }
+                        results = self.analyzer.analyze_window(
+                            scene=scene_rows[start:end], dictionary_digest=rules_digest
+                        )
+                        calls += 1
+                        for position in pending:
+                            replica_id = replica_ids[position]
+                            analysis = results.get(replica_id) or expected[replica_id]
+                            index = int(replicas[position].get("index") or position)
+                            analyses[index] = analysis
+                            model_tag = analysis.model_tag or model_tag
+                            digest = analysis.model_digest or digest
+                            self._save_analysis(index, analysis)
+                        continue
+                    position = pending[0]
+                    index = int(replicas[position].get("index") or position)
+                    context = contexts[position]
                     analysis = self.analyzer.analyze_replica(
-                        replica_id=int(row.get("replica_id") or 0) or index + 1,
-                        target_text=target,
+                        replica_id=replica_ids[position],
+                        target_text=texts[position],
                         before=context["context_before"],
                         after=context["context_after"],
                         dictionary_digest=rules_digest,
@@ -527,11 +624,8 @@ class ProjectLlmAnalyzer:
                     analyses[index] = analysis
                     model_tag = analysis.model_tag or model_tag
                     digest = analysis.model_digest or digest
-                    if self._save is not None:
-                        # Сохраняем и FAILED: причина отказа реплики должна быть
-                        # видна пользователю, а не растворяться в общем «ошибка».
-                        # Кеш такие записи не отдаёт (см. AnalysisCache.lookup).
-                        self._save(index, analysis)
+                    self._save_analysis(index, analysis)
+
         except scheduler_module.HeavyBlockedError as exc:
             # Не «продолжим без LLM»: пользователь обязан увидеть, что анализа не
             # было, и повторить его позже.
@@ -628,3 +722,45 @@ class ProjectLlmAnalyzer:
             logger.debug("Не удалось прочитать digest модели: %s", exc)
             return ""
         return info.digest if info is not None else ""
+
+    def _prompt_version(self, *, scene: bool) -> str:
+        """Версия prompt'а для ключа кеша: у окна она своя (§46).
+
+        Сцена и одиночная реплика читаются разными prompt'ами, поэтому и разборы
+        у них разные: сложи их в один ключ — и оконный разбор вернулся бы как
+        результат одиночного анализа.
+        """
+        prompt = self.analyzer.window_prompt if scene else self.analyzer.prompt
+        return prompt.version
+
+    def _missing_in_window(
+        self, replica_id: int, target_text: str, context_digest: str, rules_digest: str
+    ) -> ReplicaAnalysis:
+        """Страховка на случай, когда окно не вернуло разбор реплики (§47).
+
+        `analyze_window` обязан ответить по каждому `replica_id`, но если разбор
+        всё же пропал, реплика получает `FAILED` с причиной, а не исчезает из
+        прохода: пропуск выглядел бы как «ошибок нет».
+        """
+        return ReplicaAnalysis(
+            replica_id=replica_id,
+            status=STATUS_FAILED,
+            model_tag=self.analyzer.last_model or self.analyzer.selected_model(),
+            prompt_version=self._prompt_version(scene=True),
+            source_hash=text_hash(target_text),
+            context_hash=context_digest,
+            dictionary_hash=rules_digest,
+            error="Окно не вернуло разбор этой реплики",
+        )
+
+    def _save_analysis(self, index: int, analysis: ReplicaAnalysis) -> None:
+        """Сохраняет разбор реплики, включая `FAILED`.
+
+        Отказ сохраняется намеренно: причина должна быть видна пользователю, а не
+        растворяться в общем «ошибка». Кеш такие записи не отдаёт (см.
+        `AnalysisCache.lookup`), поэтому на следующий проход реплика снова пойдёт
+        в модель.
+        """
+        if self._save is None:
+            return
+        self._save(index, analysis)

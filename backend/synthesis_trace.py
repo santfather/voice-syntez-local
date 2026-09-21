@@ -122,11 +122,33 @@ class ReplicaTrace:
     emotion_detected: str = ""
     emotion_override: str = ""
     emotion_effective: str = ""
+    # --- интонация (UPDATE 3 §13, §24) ------------------------------------------
+    # `prosody_profile` — что рекомендовала модель, `prosody_effective` — что
+    # реально ушло резолверу. Разница между ними и есть работа просодической
+    # маршрутизации: по ней в диагностике видно, заменила ли модель интонацию
+    # (SURPRISE → EXCLAMATION) и не перебил ли её ручной выбор (§37).
+    prosody_profile: str = ""
+    prosody_effective: str = ""
+    # Что модель сказала о реплике помимо профиля (§13, §56): уверенность,
+    # интенсивность, темп и тип реплики. Это диагностика, а не параметры движка,
+    # поэтому рядом с ними и лежат — в trace, а не в `engine_params`.
+    prosody_confidence: float | None = None
+    prosody_intensity: float | None = None
+    prosody_pace: str = ""
+    dialogue_act: str = ""
+    context_dependency: str = ""
     reference_profile_id: str = ""
+    # Ключ профиля (§55) — то же значение, что `emotion`, но под именем, которым
+    # его называют take-метаданные. Хранить одно и не отдавать второго значило бы
+    # заставлять читателя диагностики догадываться о тождестве.
+    reference_profile_key: str = ""
+    reference_requested_profile: str = ""
+    reference_resolved_profile: str = ""
     reference_audio: str = ""
     reference_text: str = ""
     reference_emotion: str = ""
     reference_fallback_used: bool = False
+    reference_fallback_reason: str = ""
     # --- план синтеза ----------------------------------------------------------
     utterance_class: str = ""
     short_strategy: str = ""

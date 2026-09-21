@@ -32,6 +32,9 @@ EDITABLE_FIELDS: tuple[str, ...] = (
     "required_for_render",
     "num_ctx",
     "context_replicas",
+    # Размер окна сцены (§7): им управляет пользователь, потому что «сколько
+    # реплик видит модель» — компромисс между качеством разбора и памятью.
+    "scene_replicas",
 )
 
 
@@ -78,7 +81,7 @@ def save_settings(patch: dict, path: Path | None = None) -> dict:
             continue
         if key in ("enabled", "required_for_render"):
             current[key] = bool(value)
-        elif key in ("num_ctx", "context_replicas"):
+        elif key in ("num_ctx", "context_replicas", "scene_replicas"):
             try:
                 number = int(value)
             except (TypeError, ValueError):

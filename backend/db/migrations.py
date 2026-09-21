@@ -272,6 +272,30 @@ ALTER TABLE replicas ADD COLUMN reference_emotion TEXT NOT NULL DEFAULT '';
 ALTER TABLE replicas ADD COLUMN reference_fallback_used INTEGER NOT NULL DEFAULT 0;
 """
 
+# Просодия реплики (UPDATE 3 §8, §24, §36). Колонки аддитивные: старые проекты
+# читаются как «модель ничего не рекомендовала», и резолвер сам уводит реплику в
+# NEUTRAL — миграции данных не нужно.
+#
+# `prosody_override` здесь **нет** намеренно: ручной выбор пользователя уже
+# хранится в `emotion_override`, и второй колонки-дубликата не заводим — иначе
+# два источника правды разошлись бы при правке одного из них. `prosody_effective`
+# тоже не хранится: это `override → recommended → эмоция` (см.
+# `emotions.prosody_effective`), и второй источник правды здесь так же опасен.
+#
+# `prosody_intensity`/`prosody_confidence` допускают NULL — это «модель не
+# сказала», и оно честно отличается от 0.0 (`0.0` — измеренная тишина).
+# `reference_profile_key` — ключ **взятого** профиля (расширенный словарь §10),
+# `reference_fallback_reason` — словами, почему случился откат: оба описывают
+# факт последнего синтеза и нужны карточке и метаданным варианта (§55).
+_MIGRATION_10 = """
+ALTER TABLE replicas ADD COLUMN prosody_profile TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN prosody_intensity REAL;
+ALTER TABLE replicas ADD COLUMN prosody_pace TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN prosody_confidence REAL;
+ALTER TABLE replicas ADD COLUMN reference_profile_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE replicas ADD COLUMN reference_fallback_reason TEXT NOT NULL DEFAULT '';
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -282,6 +306,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (7, _MIGRATION_7),
     (8, _MIGRATION_8),
     (9, _MIGRATION_9),
+    (10, _MIGRATION_10),
 )
 
 

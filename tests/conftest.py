@@ -121,6 +121,20 @@ def workspace(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_llm_settings(tmp_path, monkeypatch):
+    """Настройки анализатора из `data/llm_settings.json` не влияют на тесты.
+
+    Файл настроек переживает перезапуск — это его смысл, — но и тесты он тогда
+    переживает тоже: включённый в интерфейсе анализатор делал
+    `test_analyzer_disabled_by_default` красным на машине пользователя, хотя код
+    исправен. Поэтому каждый тест получает свой пустой файл настроек.
+    """
+    from backend.llm import settings_store
+
+    monkeypatch.setenv(settings_store.SETTINGS_ENV, str(tmp_path / "llm_settings.json"))
+
+
+@pytest.fixture(autouse=True)
 def no_memory_pressure(monkeypatch):
     """Очередь не должна засыпать в ожидании свободной памяти.
 

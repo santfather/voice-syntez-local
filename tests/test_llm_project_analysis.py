@@ -45,7 +45,20 @@ def _run(scenario) -> None:
 
 
 def _answer(case: dict, *, meaning: str = "строение, крепость") -> str:
-    """Ответ «модели»: омограф в целевой реплике с правильным словом и границами."""
+    """Ответ «модели»: омограф в целевой реплике с правильным словом и границами.
+
+    Диалог приходит окном (§7), поэтому один и тот же ответ умеет обе формы: на
+    одиночный кейс — объект разбора, на окно — конверт `replicas[]`.
+    """
+    replicas = case.get("replicas")
+    if isinstance(replicas, list):
+        return json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replicas": [json.loads(_answer(item, meaning=meaning)) for item in replicas],
+            },
+            ensure_ascii=False,
+        )
     text = case["target_text"]
     word = "замка" if "замка" in text else ("замок" if "замок" in text else "")
     items = []
@@ -74,6 +87,28 @@ def _answer(case: dict, *, meaning: str = "строение, крепость") 
     )
 
 
+def _window_aware(responder):
+    """Оборачивает ответ на одну реплику в ответ на окно (§7).
+
+    Тесты описывают разбор одной реплики, а сцена уходит окном: обёртка избавляет
+    каждый responder от второго формата ответа.
+    """
+
+    def answer(case: dict) -> str:
+        replicas = case.get("replicas")
+        if not isinstance(replicas, list):
+            return responder(case)
+        return json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replicas": [json.loads(responder(item)) for item in replicas],
+            },
+            ensure_ascii=False,
+        )
+
+    return answer
+
+
 @pytest.fixture
 def llm_env(monkeypatch):
     """Включает Analyzer с подставным клиентом и подставным датчиком памяти."""
@@ -85,12 +120,26 @@ def llm_env(monkeypatch):
         required_for_render: bool = False,
         sensor: dict | None = None,
         context_replicas: int = 2,
+        scene_replicas: int = 6,
+        handles_window: bool = False,
     ) -> FakeOllamaClient:
-        client = FakeOllamaClient(models=[MODEL], responder=responder or _answer, capabilities={})
+        """Ставит подставной Analyzer.
+
+        `handles_window=True` — responder сам читает окно (`case["replicas"]`):
+        нужен там, где ответ зависит от соседей по сцене (§52), а не только от
+        собственного текста реплики.
+        """
+        answer = responder or _answer
+        client = FakeOllamaClient(
+            models=[MODEL],
+            responder=answer if handles_window else _window_aware(answer),
+            capabilities={},
+        )
         settings = llm.AnalyzerSettings(
             enabled=enabled,
             required_for_render=required_for_render,
             context_replicas=context_replicas,
+            scene_replicas=scene_replicas,
         )
         analyzer = llm.LinguisticAnalyzer(settings=settings, client=client)
         monkeypatch.setattr(llm, "_analyzer", analyzer)
@@ -201,7 +250,12 @@ def test_llm_analysis_adds_candidates_without_changing_text(
 
 
 def test_llm_analysis_is_cached_between_runs(llm_env, voices, stub, monkeypatch):
-    """Повторный анализ того же текста не гоняет модель заново."""
+    """Повторный анализ того же текста не гоняет модель заново (§78).
+
+    Сцена неизменна — значит, и разбор годен: второй проход обязан взять его из
+    кеша целиком. Это ещё и проверка того, что ключ кеша описан **сценой** (текст,
+    контекст, говорящие), а не временем создания.
+    """
     client = llm_env()
 
     async def scenario() -> dict:
@@ -209,12 +263,26 @@ def test_llm_analysis_is_cached_between_runs(llm_env, voices, stub, monkeypatch)
             project = await _project_with_voices(api)
             await api.post(f"/api/projects/{project['id']}/analyze", json={})
             first_calls = len(client.calls)
+            first = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()["run"]
             await api.post(f"/api/projects/{project['id']}/analyze", json={})
-            return {"first": first_calls, "second": len(client.calls)}
+            second = (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()["run"]
+            return {
+                "first": first,
+                "second": second,
+                "calls": len(client.calls),
+                "first_calls": first_calls,
+            }
 
     calls = asyncio.run(scenario())
-    assert calls["first"] > 0
-    assert calls["second"] == calls["first"], "кеш обязан вернуть разбор без модели"
+    assert calls["first"]["calls"] == 1, "сцена читается одним запросом"
+    assert calls["first"]["from_cache"] == 0
+    assert calls["calls"] == calls["first_calls"], "кеш обязан вернуть разбор без модели"
+    assert calls["second"]["calls"] == 0
+    assert calls["second"]["from_cache"] == calls["first"]["replicas"]
 
 
 def test_source_change_invalidates_and_reanalyzes(llm_env, voices, stub, monkeypatch):
@@ -863,3 +931,331 @@ def test_render_allowed_after_llm_review(llm_env, voices, stub, monkeypatch):
     assert result["llm"]["status"] == "READY"
     assert result["render_status"] == 202, result["render"]
     assert all(result["final_texts"]), "рендер идёт по подготовленному тексту"
+
+
+# --- Фаза 6: сцена — один запрос на окно (§6, §7, §77) -------------------------
+# Gate фазы: «нет one-request-per-replica». Проверяется не только счётчиком
+# вызовов, но и тем, что в запрос уходит сцена с говорящими, а ответ раскладывается
+# по `replica_id`, а не по порядку.
+FOUR_LINES = (
+    "ИВАН: Мы гуляли вокруг старого замка на холме.\n"
+    "МАРГО: Он поменял замок на входной двери.\n"
+    "ИВАН: Замок был старый и скрипел.\n"
+    "МАРГО: Надо поменять замок весной."
+)
+
+
+def _scene_response(case: dict) -> str:
+    """Ответ модели на окно: по объекту на каждую реплику, без аннотаций."""
+    return json.dumps(
+        {
+            "schema_version": s.SCHEMA_VERSION,
+            "replicas": [
+                {"replica_id": item["replica_id"], "items": []} for item in case["replicas"]
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_dialogue_analysis_uses_neighbor_context(llm_env, voices, stub, monkeypatch):
+    """Диалог уходит моделью **сценой**: один запрос, все реплики с говорящими (§6, §7).
+
+    Смысл реплики в диалоге читается по сцене, а не по одной строке. Поэтому §77
+    требует не только «мало запросов», но и того, что в запрос попали соседи и кто
+    их произносит.
+    """
+    captured: list[dict] = []
+
+    def responder(case: dict) -> str:
+        captured.append(case)
+        return _scene_response(case)
+
+    client = llm_env(responder=responder, handles_window=True)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+
+    state = asyncio.run(scenario())
+
+    assert len(client.calls) == 1, "сцена — один запрос, а не запрос на реплику (§77)"
+    scene = captured[0]["replicas"]
+    assert [item["speaker"] for item in scene] == ["ИВАН", "МАРГО"]
+    assert scene[0]["target_text"].startswith("Мы гуляли")
+    assert scene[1]["target_text"].startswith("Он поменял")
+
+    run = state["run"]
+    assert run["calls"] == 1
+    assert run["replicas"] == 2, "разбор получила каждая реплика окна"
+    assert run["replicas_per_call"] == 2.0, "две реплики — один вызов модели"
+
+
+def test_dialogue_analysis_returns_results_by_replica_id(llm_env, voices, stub, monkeypatch):
+    """Разборы раскладываются по `replica_id`, а не по порядку в ответе (§62).
+
+    Модель вправе вернуть окно в любом порядке. При позиционной привязке реплики
+    получили бы чужие аннотации — и заметить это было бы негде: обе аннотации «про
+    этот текст».
+    """
+
+    def responder(case: dict) -> str:
+        entries = []
+        for item in reversed(case["replicas"]):
+            text = item["target_text"]
+            word = "замка" if "замка" in text else ("замок" if "замок" in text else "")
+            items = []
+            if word:
+                start = text.index(word)
+                items.append(
+                    {
+                        "span_start": start,
+                        "span_end": start + len(word),
+                        "source": word,
+                        "type": "homograph",
+                        "meaning": "строение, крепость",
+                        "suggested_form": "замок",
+                        "confidence": 0.9,
+                        "needs_review": False,
+                    }
+                )
+            entries.append({"replica_id": item["replica_id"], "items": items})
+        return json.dumps(
+            {"schema_version": s.SCHEMA_VERSION, "replicas": entries}, ensure_ascii=False
+        )
+
+    llm_env(responder=responder, handles_window=True)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+
+    state = asyncio.run(scenario())
+    words: dict[int, list[str]] = {}
+    for candidate in state["candidates"]:
+        words.setdefault(candidate["replica_index"], []).append(candidate["word"])
+    assert words == {0: ["замка"], 1: ["замок"]}
+
+
+def test_long_dialogue_is_read_in_overlapping_windows(llm_env, voices, stub, monkeypatch):
+    """Длинный диалог режется на окна с перехлёстом: соседи остаются видимыми (§6).
+
+    Окна перекрываются, иначе реплика на границе читалась бы без второй стороны, а
+    разбор перекрывающейся реплики берётся из первого окна — ровно один на реплику.
+    """
+    captured: list[dict] = []
+
+    def responder(case: dict) -> str:
+        captured.append(case)
+        return _scene_response(case)
+
+    client = llm_env(responder=responder, handles_window=True, scene_replicas=3)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api, text=FOUR_LINES)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+
+    state = asyncio.run(scenario())
+
+    assert len(client.calls) == 2, "четыре реплики по три в окне — два запроса"
+    assert [len(call["replicas"]) for call in captured] == [3, 3]
+    first_ids = [item["replica_id"] for item in captured[0]["replicas"]]
+    second_ids = [item["replica_id"] for item in captured[1]["replicas"]]
+    assert second_ids[0] == first_ids[1], "окна перекрываются: граница видит соседей"
+
+    run = state["run"]
+    assert run["replicas"] == 4
+    assert run["from_cache"] == 0
+    assert run["calls"] == 2
+    assert run["replicas_per_call"] == 2.0
+    assert state["replicas_failed"] == 0
+
+
+def test_same_text_can_receive_different_prosody_in_different_context(
+    llm_env, voices, stub, monkeypatch
+):
+    """Одно и то же «Правда?» получает разную интонацию по сцене (§52, §62).
+
+    В этом и смысл оконного анализа: без соседей реплика была бы неразличима, и
+    модель вынуждена была бы угадывать по знаку вопроса.
+    """
+    from backend.db.store import get_projects_store
+
+    GOOD = "ИВАН: Мы выиграли миллион.\nМАРГО: Правда?"
+    BAD = "ИВАН: Я опять забыл документы.\nМАРГО: Правда?"
+
+    def responder(case: dict) -> str:
+        scene = case["replicas"]
+        delight = "миллион" in scene[0]["target_text"]
+        entries = []
+        for item in scene:
+            utterance = {"class": "NORMAL", "context_dependency": "LOW"}
+            if item["target_text"].strip().startswith("Правда"):
+                utterance = {
+                    "class": "QUESTION",
+                    "context_dependency": "HIGH",
+                    "emotion": "DELIGHT" if delight else "SAD_SYMPATHETIC",
+                    "emotion_confidence": 0.8,
+                    "dialogue_act": "QUESTION",
+                }
+            entries.append(
+                {"replica_id": item["replica_id"], "items": [], "utterance": utterance}
+            )
+        return json.dumps(
+            {"schema_version": s.SCHEMA_VERSION, "replicas": entries}, ensure_ascii=False
+        )
+
+    llm_env(responder=responder, handles_window=True)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            found = {}
+            for name, text in (("good", GOOD), ("bad", BAD)):
+                project = await _project_with_voices(api, text=text)
+                await api.post(f"/api/projects/{project['id']}/analyze", json={})
+                found[name] = project["id"]
+            return found
+
+    projects = asyncio.run(scenario())
+    store = get_projects_store()
+    good = llm_integration.replica_emotions(store.llm_analyses(projects["good"]))
+    bad = llm_integration.replica_emotions(store.llm_analyses(projects["bad"]))
+    assert good[1]["emotion"] == "DELIGHT"
+    assert bad[1]["emotion"] == "SAD_SYMPATHETIC"
+
+
+def test_unknown_replica_id_is_rejected(llm_env, voices, stub, monkeypatch):
+    """Чужой `replica_id` не привязывается «по порядку», а пропуск виден (§47, §62).
+
+    Модель, вернувшая выдуманный id, не получает за это чужие тексты: разбор
+    отбрасывается, а реплика, о которой ответа не было, честно уходит в FAILED.
+    """
+
+    def responder(case: dict) -> str:
+        real = [item["replica_id"] for item in case["replicas"]]
+        entries = [{"replica_id": real[0], "items": []}, {"replica_id": 999, "items": []}]
+        return json.dumps(
+            {"schema_version": s.SCHEMA_VERSION, "replicas": entries}, ensure_ascii=False
+        )
+
+    llm_env(responder=responder, handles_window=True)
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return (
+                await api.get(f"/api/projects/{project['id']}/linguistic-analysis")
+            ).json()
+
+    state = asyncio.run(scenario())
+    assert state["candidates_total"] == 0, "чужой id не превращается в разбор"
+    assert state["replicas_failed"] == 1
+    assert "не разобрана" in state["failed"][0]["error"]
+    assert state["status"] == llm.STATUS_FAILED
+
+
+def test_window_prompt_version_invalidates_scene_cache(llm_env, voices, stub, monkeypatch):
+    """Смена версии оконного prompt'а инвалидирует разбор сцены (§46, §78).
+
+    Разбор получен по другим условиям задачи — отдавать его как актуальный нельзя,
+    хотя текст, модель и словарь не менялись.
+    """
+    from dataclasses import replace
+
+    client = llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            first = len(client.calls)
+            analyzer = llm.get_analyzer()
+            llm._analyzer = llm.LinguisticAnalyzer(
+                settings=analyzer.settings,
+                client=analyzer.client,
+                window_prompt=replace(
+                    analyzer.window_prompt,
+                    version=str(int(analyzer.window_prompt.version) + 1),
+                ),
+            )
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return {"first": first, "second": len(client.calls)}
+
+    result = asyncio.run(scenario())
+    assert result["second"] > result["first"], "новый prompt — новый разбор, кеш не подходит"
+
+
+def test_speaker_change_invalidates_scene_cache():
+    """Смена говорящего меняет сцену — разбор этой сцены кешем не отдаётся (§78).
+
+    `speaker` входит в окно, поэтому переименование говорящего — это другой вход,
+    а не тот же самый: «Правда?» от разных людей читается по-разному.
+    """
+    from backend.llm import analysis_cache as cache
+
+    client = FakeOllamaClient(
+        models=[MODEL], responder=_window_aware(_answer), capabilities={}
+    )
+    analyzer = llm.LinguisticAnalyzer(
+        settings=llm.AnalyzerSettings(enabled=True, scene_replicas=6), client=client
+    )
+    saved: dict = {}
+
+    def lookup(index, key):
+        analysis = saved.get(index)
+        return analysis if analysis is not None and cache.key_for(analysis) == key else None
+
+    def save(index, analysis):
+        saved[index] = analysis
+
+    runner = llm_integration.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=scheduler_module.HeavyScheduler(
+            gate=memory.HeavyGate(), sensor=lambda: dict(GREEN)
+        ),
+        lookup=lookup,
+        save=save,
+        unload_after=False,
+    )
+    pair = [
+        {
+            "index": 0,
+            "text": "Мы гуляли вокруг старого замка на холме.",
+            "replica_id": 7,
+            "speaker": "Аня",
+        },
+        {
+            "index": 1,
+            "text": "Он поменял замок на входной двери.",
+            "replica_id": 8,
+            "speaker": "Борис",
+        },
+    ]
+
+    first = runner.run(project_id="scene", replicas=pair, scene=True)
+    assert first.calls == 1 and first.from_cache == 0
+    assert len(client.calls) == 1
+
+    same = runner.run(project_id="scene", replicas=pair, scene=True)
+    assert same.calls == 0, "та же сцена берётся из кеша"
+    assert same.from_cache == 2
+    assert len(client.calls) == 1
+
+    renamed = [{**pair[0], "speaker": "Вера"}, pair[1]]
+    changed = runner.run(project_id="scene", replicas=renamed, scene=True)
+    assert changed.calls == 1, "говорящий — часть сцены, старый разбор не годится"
+    assert len(client.calls) == 2
+

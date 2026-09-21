@@ -136,6 +136,32 @@ const RECORD_PHRASES = [
   },
 ];
 
+// Mapping «подпись фразы → ключ профиля» (UPDATE 3 §16). Одиннадцать фраз дают
+// одиннадцать **разных** интонаций и записываются в **один** голос: каждая фраза
+// становится отдельным `ReferenceProfile` этого голоса, а не новым голосом.
+// Ключом карты стоит подпись, потому что её же пользователь видит в списке фраз:
+// две параллельные таблицы «по индексу» разошлись бы на первой вставке.
+// Порядок значений — порядок документа, он же порядок записи в мастере.
+const RECORD_PHRASE_PROFILES = {
+  'Вопрос и утверждение': 'NEUTRAL_QUESTION',
+  'Восклицания, много шипящих': 'EXCLAMATION',
+  'Спокойная просьба (короче)': 'CALM',
+  'Только вопросы': 'QUESTION',
+  'Сложные сочетания согласных': 'NEUTRAL',
+  'Радость, восторг': 'DELIGHT',
+  'Огорчение, сочувствие': 'SAD_SYMPATHETIC',
+  'Лёгкая ирония': 'IRONIC',
+  'Строгий тон, короткий приказ': 'STRICT',
+  'Перечисление, ровный ритм': 'ENUMERATION',
+  'Быстрая, взволнованная речь': 'EXCITED',
+};
+
+// Позиция фразы в `RECORD_PHRASES` — это её устойчивый идентификатор
+// (`source_record_phrase_id`, §16). Он стабилен, пока стабилен порядок списка, а
+// порядок закреплён тестом: по нему бэкенд понимает, какой профиль заменяет
+// повторная запись, — «одна фраза = один профиль».
+const recordPhraseId = (index) => String(index);
+
 // Тестовые данные, а не фраза для записи. Слова подобраны так, чтобы «ё» стояла
 // и в начале, и после согласной, — на них видно работу шага восстановления «ё» в
 // панели «Что услышит модель». В RECORD_PHRASES её намеренно нет: искусственная
@@ -154,6 +180,9 @@ const RECORD_FORMATS = [
 // За фразы из списка длиннее 12 секунд брать не нужно: F5-TTS всё равно обрежет
 // референс. Потолок нужен, чтобы забытая запись не тянулась минутами.
 const RECORD_MAX_MS = 20000;
+// Режим записи «новый голос» в выборе цели. Пустая строка — потому что это не
+// идентификатор голоса, и путать режим с голосом нельзя даже по имени переменной.
+const RECORD_NEW_VOICE = '';
 // Порог перегрузки — тот же, что в audio_analysis.CLIPPING_LEVEL: индикатор должен
 // показывать красное ровно там, где бэкенд потом скажет «запись перегружена».
 const CLIPPING_LEVEL = 0.99;
@@ -1680,6 +1709,9 @@ async function loadVoices() {
   renderReplicaCards();
   renderTextVoiceOptions();
   renderPreviewPanels();
+  // Выбор цели записи — из того же списка голосов: без него мастер интонационных
+  // профилей не знал бы, куда записывать, а план записи не показывал бы прогресс.
+  renderRecordTargets();
   updateGenerateButton();
 }
 
@@ -1819,11 +1851,20 @@ function renderVoiceCards() {
   });
 }
 
-// Референс-профили голоса (UPDATE 2 §37). Один голос — один `voice_id`, но
-// несколько референсов: нейтральный (загруженный при создании) и эмоциональные.
-// Показываем эмоцию, подпись и качество; добавление и удаление — здесь же, потому
-// что «где записать восторг» и «где выбрать голос» — одно место.
-const REFERENCE_EMOTIONS = ['NEUTRAL', 'QUESTION', 'DELIGHT', 'SURPRISE', 'FEAR'];
+// Референс-профили голоса (UPDATE 3 §16–§19). Один голос — один `voice_id`, но
+// несколько референсов: нейтральный (загруженный при создании) и интонационные.
+// Показываем интонацию, подпись и качество; добавление и удаление — здесь же,
+// потому что «где записать восторг» и «где выбрать голос» — одно место.
+//
+// Список — ровно записываемые профили `PROFILE_KEYS` (§10). Семантических SURPRISE
+// и FEAR здесь нет: под них нет фразы записи, и бэкенд отвергает такой профиль —
+// подставить их в этот список значило бы предлагать выбор, который кончается
+// ошибкой 400. Ручной выбор SURPRISE у реплики остаётся возможным и честно
+// показывается откатом на нейтральный референс (§17).
+const REFERENCE_EMOTIONS = [
+  'NEUTRAL', 'CALM', 'QUESTION', 'NEUTRAL_QUESTION', 'EXCLAMATION', 'DELIGHT',
+  'SAD_SYMPATHETIC', 'IRONIC', 'STRICT', 'ENUMERATION', 'EXCITED',
+];
 
 function voiceReferencesHtml(voice) {
   const profiles = voice.reference_profiles || [];
@@ -1832,13 +1873,23 @@ function voiceReferencesHtml(voice) {
       ? `<span class="tag warn" title="${esc(profile.quality_note || 'расшифровка не совпала с записью')}">проверить</span>`
       : '';
     const emotion = EMOTION_LABELS[profile.emotion] || profile.emotion;
-    const removable = profile.id !== `${voice.id}-neutral`
-      ? `<button class="tiny ghost danger" data-role="reference-delete" data-profile="${esc(profile.id)}">удалить</button>`
-      : '<span class="muted">основной</span>';
+    const isBase = profile.id === `${voice.id}-neutral`;
+    const removable = isBase
+      ? '<span class="muted">основной</span>'
+      : `<button class="tiny ghost danger" data-role="reference-delete" data-profile="${esc(profile.id)}">удалить</button>`;
+    // §35: подтверждение открывает профилю автоматический выбор по интонации.
+    // У нейтрального референса флага нет: он и есть сам голос, автоматика берёт
+    // его всегда — подтверждать там нечего. Пока флаг снят, профиль остаётся
+    // рабочим при ручном выборе: сначала benchmark, потом доверие.
+    const auto = profile.emotion === 'NEUTRAL'
+      ? ''
+      : `<label class="muted" title="Разрешить автоматический подбор этого профиля по интонации реплики. Ставьте после прослушивания; без флага профиль доступен только вручную.">
+           <input type="checkbox" data-role="reference-auto" data-profile="${esc(profile.id)}" ${profile.enabled_for_auto ? 'checked' : ''} /> авто
+         </label>`;
     return `
       <div class="row between" style="margin-top:6px">
         <span class="muted">${esc(emotion)} · ${esc(profile.label || '')} ${quality}</span>
-        ${removable}
+        <span class="row">${auto}${removable}</span>
       </div>`;
   }).join('');
   const options = REFERENCE_EMOTIONS
@@ -1857,7 +1908,9 @@ function voiceReferencesHtml(voice) {
         Своя запись для эмоции даёт модели нужную интонацию: вопрос, восторг,
         удивление, испуг. Без неё эмоция озвучивается нейтральным референсом того же
         голоса — синтез не блокируется, но интонация будет нейтральной. Референс
-        другого голоса не используется никогда.
+        другого голоса не используется никогда. Галочка «авто» разрешает брать
+        профиль автоматически по интонации реплики — ставьте её после того, как
+        послушали запись: без неё профиль выбирается только вручную.
       </span>
     </details>`;
 }
@@ -1874,6 +1927,14 @@ async function addVoiceReference(voiceId, emotion, file) {
 
 async function deleteVoiceReference(voiceId, profileId) {
   return api(`/api/voices/${voiceId}/references/${profileId}`, { method: 'DELETE' });
+}
+
+async function updateVoiceReference(voiceId, profileId, changes) {
+  return api(`/api/voices/${voiceId}/references/${profileId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(changes),
+  });
 }
 
 function setPreviewStatus(card, message, isError = false) {
@@ -2403,9 +2464,97 @@ function showRecordPhrase() {
 }
 
 function renderRecordPhrases() {
+  // В подписи видно и фразу, и интонацию, которую она записывает: пользователь
+  // начитывает одну и ту же фразу в конкретном регистре, и знать его до записи
+  // важнее, чем после (§16).
   $('record-phrase').innerHTML = RECORD_PHRASES
-    .map((phrase, index) => `<option value="${index}">${esc(phrase.label)}</option>`)
+    .map((phrase, index) => {
+      const profile = RECORD_PHRASE_PROFILES[phrase.label];
+      const suffix = profile ? ` → ${emotionLabel(profile)}` : '';
+      return `<option value="${index}">${esc(phrase.label + suffix)}</option>`;
+    })
     .join('');
+  showRecordPhrase();
+}
+
+// --- мастер интонационных профилей --------------------------------------------
+// «Куда записывать» — это режим, а не голос: пустая строка означает обычный путь
+// через форму нового голоса. Значение живёт в самом `select`, а не в `state`:
+// перерисовка списка голосов не должна терять выбор пользователя, и хранить его
+// в двух местах значило бы однажды их разойтись.
+function recordTargetId() {
+  const select = $('record-target');
+  return select ? select.value || RECORD_NEW_VOICE : RECORD_NEW_VOICE;
+}
+
+function recordTargetVoice() {
+  const voiceId = recordTargetId();
+  return voiceId ? voiceById(voiceId) : null;
+}
+
+// Какие фразы у голоса уже записаны. Считаем по `source_record_phrase_id`, а не по
+// интонации: именно по этому полю бэкенд заменяет профиль при повторной записи, и
+// список должен показывать ровно то, что считает он.
+function recordedPhraseIds(voice) {
+  const ids = new Set();
+  ((voice && voice.reference_profiles) || []).forEach((profile) => {
+    if (profile.source_record_phrase_id) ids.add(String(profile.source_record_phrase_id));
+  });
+  return ids;
+}
+
+function renderRecordTargets() {
+  const select = $('record-target');
+  if (!select) return;
+  const current = select.value;
+  select.innerHTML = [
+    `<option value="${RECORD_NEW_VOICE}">Новый голос (форма ниже)</option>`,
+    ...state.voices.map(
+      (voice) => `<option value="${esc(voice.id)}">${esc(voice.name)} — интонационные профили</option>`,
+    ),
+  ].join('');
+  // Цель сохраняем между перерисовками: список голосов перечитывается после каждой
+  // записи, а сбрасывать выбор посреди мастера нельзя.
+  select.value = state.voices.some((voice) => voice.id === current) ? current : RECORD_NEW_VOICE;
+  renderRecordPlan();
+}
+
+function renderRecordPlan() {
+  const box = $('record-plan');
+  if (!box) return;
+  const voice = recordTargetVoice();
+  if (!voice) {
+    box.innerHTML = '';
+    $('record-target-note').textContent = '';
+    return;
+  }
+  const done = recordedPhraseIds(voice);
+  const recorded = RECORD_PHRASES.filter((_, index) => done.has(recordPhraseId(index))).length;
+  const missing = RECORD_PHRASES.length - recorded;
+  $('record-target-note').textContent = missing
+    ? `Запись станет профилем голоса «${voice.name}». Осталось фраз: ${missing} из ${RECORD_PHRASES.length}.`
+    : `У голоса «${voice.name}» записаны все ${RECORD_PHRASES.length} фраз — можно перезаписать любую.`;
+  box.innerHTML = RECORD_PHRASES.map((phrase, index) => {
+    const profile = RECORD_PHRASE_PROFILES[phrase.label];
+    const mark = done.has(recordPhraseId(index))
+      ? '<span class="tag ok">записано</span>'
+      : '<span class="muted">нет записи</span>';
+    return `
+      <div class="row between" style="margin-top:4px">
+        <span class="muted">${esc(phrase.label)} → ${esc(emotionLabel(profile))}</span>
+        ${mark}
+      </div>`;
+  }).join('');
+}
+
+// Мастер ведёт по списку сам: после записи выбирается первая фраза без профиля,
+// иначе одиннадцать записей требовали бы одиннадцати переключений вручную.
+function advanceRecordPhrase() {
+  const voice = recordTargetVoice();
+  if (!voice) return;
+  const done = recordedPhraseIds(voice);
+  const next = RECORD_PHRASES.findIndex((_, index) => !done.has(recordPhraseId(index)));
+  if (next >= 0) $('record-phrase').value = String(next);
   showRecordPhrase();
 }
 
@@ -2575,6 +2724,14 @@ function finishRecording() {
   player.src = record.url;
   player.hidden = false;
 
+  // Мастер (§16): запись идёт прямо в профиль выбранного голоса. Форму нового
+  // голоса не трогаем — иначе та же запись осела бы в двух местах сразу, и
+  // «Сохранить голос» создал бы из неё лишний голос.
+  if (recordTargetVoice()) {
+    saveRecordedReference(file);
+    return;
+  }
+
   // Записанный файл кладём в тот же input, что и загруженный: дальше сохранение,
   // кнопка «распознать» и все проверки работают без отдельной ветки кода.
   const transfer = new DataTransfer();
@@ -2630,6 +2787,54 @@ function resetRecording() {
   setRecordStatus('до 20 секунд');
   showAlert($('record-error'), '');
   showAlert($('record-notes'), '');
+}
+
+// Мастер интонационных профилей (§16): одна фраза — один профиль одного голоса.
+// Расшифровка берётся из самой фразы (её читают с экрана), поэтому сверку через
+// Whisper выключаем: текст известен точно, а десятки секунд ожидания здесь лишние.
+// Проверка «референс ↔ расшифровка» на бэкенде всё равно выполняется и вернёт
+// профиль с `quality_status = warning`, если запись разошлась с фразой.
+async function saveRecordedReference(file) {
+  const voice = recordTargetVoice();
+  if (!voice) return;
+  const index = parseInt($('record-phrase').value || '0', 10);
+  const phrase = RECORD_PHRASES[index] || RECORD_PHRASES[0];
+  const profile = RECORD_PHRASE_PROFILES[phrase.label];
+  if (!profile) {
+    setRecordStatus('запись готова, но профиль не сохранён');
+    showAlert($('record-error'), `Для фразы «${phrase.label}» не задан профиль — запись отменена.`);
+    return;
+  }
+  setRecordStatus('сохраняю профиль…');
+  const form = new FormData();
+  form.append('file', file);
+  form.append('emotion', profile);
+  form.append('ref_text', phrase.text);
+  form.append('label', phrase.label);
+  form.append('verify_ref_text', 'false');
+  // Идентификатор фразы: по нему бэкенд заменяет прежний профиль этой же фразы,
+  // а не заводит второй (§16).
+  form.append('source_record_phrase_id', recordPhraseId(index));
+  try {
+    const result = await api(`/api/voices/${voice.id}/references`, { method: 'POST', body: form });
+    setRecordStatus('профиль сохранён');
+    const saved = result.profile || {};
+    const warning = saved.quality_status === 'warning'
+      ? `\n\nВнимание: ${saved.quality_note || 'расшифровка не совпала с записью'} — профиль помечен «проверить» и в синтезе уступает нейтральному.`
+      : '';
+    showAlert(
+      $('record-notes'),
+      `«${phrase.label}» → ${emotionLabel(profile)}: профиль голоса «${voice.name}» сохранён.${warning}`,
+      'info',
+    );
+    // Список голосов перечитываем до перехода к следующей фразе: план записи и
+    // счётчик берут данные из него, а не из ответа на одну запись.
+    await loadVoices();
+    advanceRecordPhrase();
+  } catch (error) {
+    setRecordStatus('запись готова, но профиль не сохранён');
+    showAlert($('record-error'), error.message);
+  }
 }
 
 // --- проект диалога -----------------------------------------------------------
@@ -3979,7 +4184,7 @@ function replicaCardHtml(replica) {
         <span class="muted">Свой голос этой реплики; остальные читает голос спикера.</span>
       </div>
 
-      ${replicaEmotionHtml(replica)}
+      ${replicaProsodyHtml(replica)}
 
       ${replicaSliderHtml(replica, 'speed', 'Speed', PARAM_RANGES.speed)}
       ${replicaSliderHtml(replica, 'pause_override_ms', 'Pause before', { min: 0, max: 5000, step: 50 }, pause === null ? 400 : pause)}
@@ -4003,64 +4208,158 @@ function replicaCardHtml(replica) {
     </div>`;
 }
 
-// Эмоция реплики: селектор, фактический результат «Авто» и состояние референса.
-// Эмоция — метаданные, а не текст: она выбирает референс голоса (UPDATE 2 §11) и
-// никогда не попадает в произносимую строку. Поэтому здесь только селектор и
-// подпись — правка текста живёт в другом месте карточки.
+// Интонация реплики: селектор профиля, фактический результат «Авто» и состояние
+// референса. Интонация — метаданные, а не текст: она выбирает референс голоса
+// (UPDATE 2 §11, UPDATE 3 §23–§28) и никогда не попадает в произносимую строку.
+// Поэтому здесь только селектор и подписи — правка текста живёт в другом месте карточки.
 const EMOTION_SOURCE_LABELS = {
   llm: 'модель',
   heuristic: 'по тексту',
   none: 'нет',
 };
 
+// Подписи значений (UPDATE 3 §38). Полный набор из 14, а не пятёрка UPDATE 2:
+// без новых значений профиль голоса и детали реплики показывались бы кодом
+// «SAD_SYMPATHETIC», а не словами.
 const EMOTION_LABELS = {
-  NEUTRAL: 'нейтральный',
-  QUESTION: 'вопрос',
-  DELIGHT: 'восторг',
-  SURPRISE: 'удивление',
-  FEAR: 'испуг',
+  AUTO: 'Авто',
+  NEUTRAL: 'Нейтрально',
+  CALM: 'Спокойно',
+  QUESTION: 'Вопрос',
+  NEUTRAL_QUESTION: 'Вопрос + нейтрально',
+  EXCLAMATION: 'Восклицание',
+  DELIGHT: 'Радость / восторг',
+  SAD_SYMPATHETIC: 'Огорчение / сочувствие',
+  IRONIC: 'Ирония',
+  STRICT: 'Строго',
+  ENUMERATION: 'Перечисление',
+  EXCITED: 'Взволнованно',
+  SURPRISE: 'Удивление',
+  FEAR: 'Испуг',
 };
 
-function replicaEmotionHtml(replica) {
-  const emotion = replica.emotion || {};
-  // Каталог доступных эмоций считается на голос, а не на реплику: у одного голоса
-  // набор один и тот же, и дублировать его в каждой карточке незачем.
+// Типы высказывания (controlled vocabulary LLM, 16 значений). В интерфейсе нужен
+// русский: «QUESTION» рядом с «Интонация: Вопрос» читалось бы как второй код той
+// же вещи, хотя это разные оси — что человек делает и как это звучит (§57).
+const DIALOGUE_ACT_LABELS = {
+  STATEMENT: 'утверждение',
+  QUESTION: 'вопрос',
+  ANSWER: 'ответ',
+  REQUEST: 'просьба',
+  COMMAND: 'приказ',
+  REACTION: 'реакция',
+  COMPLIMENT: 'комплимент',
+  REFUSAL: 'отказ',
+  AGREEMENT: 'согласие',
+  DISAGREEMENT: 'несогласие',
+  GREETING: 'приветствие',
+  FAREWELL: 'прощание',
+  WARNING: 'предупреждение',
+  EXCLAMATION: 'восклицание',
+  ENUMERATION: 'перечисление',
+  OTHER: 'другое',
+};
+
+const PROSODY_PACE_LABELS = {
+  SLOW: 'медленный',
+  NORMAL: 'обычный',
+  FAST: 'быстрый',
+};
+
+const CONTEXT_DEPENDENCY_LABELS = {
+  LOW: 'низкая',
+  MEDIUM: 'средняя',
+  HIGH: 'высокая',
+};
+
+// Ниже этого порога авто-интонация показывается словами «низкая уверенность».
+// Число само по себе не помогает: 0.41 и 0.58 на глаз неразличимы, а решение
+// «верить автоматике или выбрать руками» пользователь принимает именно по этому
+// порогу (§39). Сам процент остаётся в деталях — там, где его читают осознанно.
+const LOW_CONFIDENCE = 0.6;
+
+function emotionLabel(value) {
+  return EMOTION_LABELS[value] || value || '—';
+}
+
+function confidenceText(value) {
+  if (typeof value !== 'number' || !isFinite(value) || value <= 0) return '';
+  if (value < LOW_CONFIDENCE) return 'низкая уверенность';
+  return `${Math.round(value * 100)}%`;
+}
+
+function replicaProsodyHtml(replica) {
+  const prosody = replica.prosody || {};
+  const reference = replica.reference || {};
+  // Каталог интонаций считается на голос, а не на реплику: у одного голоса набор
+  // один и тот же. Из него берутся только записываемые профили (§10) плюс «Авто»;
+  // семантические SURPRISE/FEAR остаются в списке лишь тогда, когда именно они
+  // выбраны руками раньше — иначе селект показывал бы «Авто» вместо правды (§17).
   const speaker = speakerByKey(replica.speaker);
   const catalog = (speaker && speaker.emotions && speaker.emotions.length)
     ? speaker.emotions
-    : (emotion.catalog && emotion.catalog.length
-      ? emotion.catalog
-      : [{ value: 'AUTO', title: 'Авто' }]);
-  const selected = emotion.override || 'AUTO';
-  const options = catalog
-    .map((item) => `<option value="${esc(item.value)}"${item.value === selected ? ' selected' : ''}${item.available === false ? ' disabled' : ''}>${esc(item.title)}${item.available === false ? ' (нет референса)' : ''}</option>`)
+    : [{ value: 'AUTO', title: 'Авто' }];
+  const selected = prosody.override || 'AUTO';
+  const offered = catalog.filter((item) => (
+    item.value === 'AUTO' || item.profile || item.value === selected
+  ));
+  const options = offered
+    .map((item) => `<option value="${esc(item.value)}"${item.value === selected ? ' selected' : ''}>${esc(item.title || emotionLabel(item.value))}</option>`)
     .join('');
-  const effective = emotion.effective_title || emotion.effective || '—';
-  const source = emotion.source || 'none';
-  // «Авто → Вопрос» — результат автоматики и то, откуда он взялся. Ручной выбор
-  // показывается без стрелки: это решение пользователя, а не догадка.
+
+  const effective = prosody.effective_title || emotionLabel(prosody.effective);
+  const source = prosody.source || 'none';
+  const confidence = confidenceText(prosody.confidence);
+  const act = prosody.dialogue_act
+    ? DIALOGUE_ACT_LABELS[prosody.dialogue_act] || prosody.dialogue_act
+    : '';
+  // «Авто → Ирония · низкая уверенность (по тексту)» — результат автоматики и то,
+  // откуда он взялся. Ручной выбор показывается без стрелки: это решение
+  // пользователя, а не догадка.
   const result = selected === 'AUTO'
-    ? `Авто → ${esc(effective)} <span class="muted">(${esc(EMOTION_SOURCE_LABELS[source] || source)})</span>`
+    ? `Авто → ${esc(effective)}`
+      + (confidence ? ` · <b>${esc(confidence)}</b>` : '')
+      + ` <span class="muted">(${esc(EMOTION_SOURCE_LABELS[source] || source)})</span>`
     : `выбрано: ${esc(effective)}`;
-  const reference = replica.reference || {};
-  const referenceNote = reference.fallback_used
-    ? 'референс: откат на нейтральный'
-    : reference.emotion
-      ? `референс: ${esc(EMOTION_LABELS[reference.emotion] || reference.emotion)}`
-      : 'референс: ещё не синтезировалось';
-  const act = emotion.dialogue_act ? ` · ${esc(emotion.dialogue_act)}` : '';
+
+  const referenceTitle = reference.emotion
+    ? emotionLabel(reference.emotion)
+    : (reference.profile_id ? reference.profile_id : 'ещё не синтезировалось');
+  const fallback = reference.fallback_used
+    ? `есть — ${reference.fallback_reason || 'профиль интонации недоступен'}`
+    : 'нет';
+
+  const details = [
+    ['Распознано моделью', prosody.profile ? emotionLabel(prosody.profile) : '—'],
+    ['Уверенность', typeof prosody.confidence === 'number' ? `${Math.round(prosody.confidence * 100)}%` : '—'],
+    ['Тип высказывания', act || '—'],
+    ['Связь с контекстом', CONTEXT_DEPENDENCY_LABELS[prosody.context_dependency] || prosody.context_dependency || '—'],
+    ['Насыщенность', typeof prosody.intensity === 'number' ? prosody.intensity.toFixed(2) : '—'],
+    ['Темп', PROSODY_PACE_LABELS[prosody.pace] || prosody.pace || '—'],
+    ['Reference', referenceTitle],
+    ['Fallback', fallback],
+    ['Профиль референса', reference.profile_key ? emotionLabel(reference.profile_key) : '—'],
+  ];
+  const detailRows = details
+    .map(([name, value]) => `<div class="row between"><span class="muted">${esc(name)}</span><span>${esc(value)}</span></div>`)
+    .join('');
+
   return `
       <div class="field" style="margin-top: 4px">
-        <span>Эмоция реплики</span>
+        <span>Интонация</span>
         <div class="grid-2">
-          <select data-role="emotion">${options}</select>
-          <span class="muted">${result}${act}<br />${referenceNote}</span>
+          <select data-role="prosody">${options}</select>
+          <span class="muted">${result}${act ? ` · ${esc(act)}` : ''}</span>
         </div>
-        <span class="muted">
-          Эмоция выбирает референс этого же голоса: вопрос, восторг, удивление и испуг
-          звучат своим референсом, а если его нет — нейтральным (об этом скажет подпись).
-          Ручной выбор важнее автоматического.
-        </span>
+        <details class="advanced prosody-details"${state.openDetails[`prosody-${replica.index}`] ? ' open' : ''}>
+          <summary>Детали интонации и референса</summary>
+          ${detailRows}
+          <span class="muted">
+            Интонация выбирает референс этого же голоса: своя запись для интонации
+            звучит ею, а если записи нет — нейтральной записью того же голоса, и об
+            этом скажет строка «Fallback». Ручной выбор важнее автоматического.
+          </span>
+        </details>
       </div>`;
 }
 
@@ -4353,6 +4652,18 @@ function applyShortPolicy(status) {
   state.shortPolicy = policy;
 }
 
+// Прогрев коротких реплик: галочка показывает политику приложения из /api/status,
+// а не собственную догадку интерфейса — как и «Авто» у короткого слоя.
+function applyWarmupPolicy(status) {
+  const box = $('warmup-enabled');
+  if (!box) return;
+  const policy = (status && status.warmup) || {};
+  box.checked = Boolean(policy.enabled);
+  box.title = policy.enabled
+    ? `Прогрев включён для движков: ${(policy.engines || []).join(', ') || '—'}`
+    : 'Прогрев выключен в настройках приложения (TTS_WARMUP_ENABLED)';
+}
+
 async function generate() {
   if (!state.project) return;
   showAlert($('job-error'), '');
@@ -4366,6 +4677,9 @@ async function generate() {
     output_format: $('output-format').value,
     chunk_strategy: $('chunk-strategy').value,
     short_utterance: shortUtterancePayload(),
+    // Прогрев коротких реплик: скрытый контекст перед короткой фразой. Технический
+    // текст — в готовое аудио не попадает и текст реплики не меняет.
+    warmup_short_replicas: $('warmup-enabled').checked,
     // Имя готового файла: свойство запуска, а не проекта. Пустое поле означает
     // прежнее поведение — имя из номера задачи.
     output_name: $('output-name').value.trim(),
@@ -5109,6 +5423,7 @@ async function refreshStatus() {
     const status = await api('/api/status');
     state.modelReady = status.model_loaded;
     applyShortPolicy(status);
+    applyWarmupPolicy(status);
     const engines = status.engines || [];
     const failedEngine = engines.find((e) => e.state === 'failed');
     const loadingEngines = engines.filter((e) => e.state === 'loading');
@@ -5211,9 +5526,11 @@ function bindReplicaCards() {
     const card = event.target.closest('.replica-card');
     if (!card) return;
     const index = indexOf(event.target);
-    // Эмоция — метаданные реплики, а не текст: смена только выбирает референс и
-    // не требует повторного анализа (§11). `AUTO` снимает ручной выбор (null).
-    if (event.target.dataset.role === 'emotion') {
+    // Интонация — метаданные реплики, а не текст: смена только выбирает референс и
+    // не требует повторного анализа (§11). Ручной выбор один и задаёт и эмоцию, и
+    // интонацию — это одно поле `emotion_override`, а не два (§40). `AUTO` снимает
+    // ручной выбор (null) и возвращает реплику автоматике.
+    if (event.target.dataset.role === 'prosody') {
       const value = event.target.value || 'AUTO';
       patchReplica(index, { emotion_override: value === 'AUTO' ? null : value });
       return;
@@ -5268,10 +5585,12 @@ function bindReplicaCards() {
     const details = event.target.closest('.replica-card details.advanced');
     if (!details) return;
     const index = details.closest('.replica-card').dataset.index;
-    // У блока подготовки своё состояние раскрытия: общий флаг открывал бы вместе
-    // с ним и «ещё настройки» — два разных вопроса с одним ответом.
+    // У каждого раскрывающегося блока своё состояние: общий флаг открывал бы вместе
+    // с ним и остальные — три разных вопроса с одним ответом.
     if (details.classList.contains('prepared')) state.preparedDetails[index] = details.open;
-    else state.openDetails[index] = details.open;
+    else if (details.classList.contains('prosody-details')) {
+      state.openDetails[`prosody-${index}`] = details.open;
+    } else state.openDetails[index] = details.open;
   }, true);
 
   const takePlayer = $('take-player');
@@ -5459,6 +5778,12 @@ function bindEvents() {
 
   // --- запись голоса с микрофона ---
   $('record-phrase').addEventListener('change', showRecordPhrase);
+  // Смена цели меняет и план записи, и текущую фразу: у нового голоса свой набор
+  // уже записанного, и вести мастера надо с его первой незакрытой фразы.
+  $('record-target').addEventListener('change', () => {
+    renderRecordPlan();
+    advanceRecordPhrase();
+  });
   $('btn-record').addEventListener('click', () => {
     // Одна кнопка на весь цикл: записать → стоп → записать заново.
     if (state.record.recorder) stopRecording();
@@ -5525,6 +5850,24 @@ function bindEvents() {
         await loadVoices();
         renderVoiceCards();
       } catch (error) {
+        setPreviewStatus(card, error.message, true);
+      }
+      return;
+    }
+    if (role === 'reference-auto') {
+      // Подтверждение профиля (§35) — это доверие, а не настройка: сохраняем сразу.
+      // Карточки не пересобираем: `loadVoices` перерисовывает их и закрыл бы
+      // раскрытый список референсов прямо под рукой. Вместо перерисовки берём
+      // новый список профилей из ответа сервера — он и есть источник галочки.
+      try {
+        const answer = await updateVoiceReference(voiceId, event.target.dataset.profile, {
+          enabled_for_auto: event.target.checked,
+        });
+        const voice = voiceById(voiceId);
+        if (voice) voice.reference_profiles = answer.reference_profiles;
+      } catch (error) {
+        // Флаг не сохранён — галочка обязана вернуться к настоящему состоянию.
+        event.target.checked = !event.target.checked;
         setPreviewStatus(card, error.message, true);
       }
       return;

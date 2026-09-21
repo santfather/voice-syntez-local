@@ -92,9 +92,50 @@ def _inspect_reference(audio_bytes: bytes, suffix: str, name: str, gender: str) 
     }
 
 
+def _duration_sec(audio_bytes: bytes, suffix: str) -> float | None:
+    """Длительность записи для карточки профиля (§18).
+
+    Неудачное декодирование не отменяет сохранение: профиль уже записан, и
+    отсутствие длительности — не повод терять пользовательскую запись.
+    """
+    try:
+        samples, rate = audio_analysis.load_mono(audio_bytes, suffix)
+    except Exception as exc:  # noqa: BLE001 — метрика, а не проверка качества
+        logger.warning("Не удалось измерить длительность референса: %s", exc)
+        return None
+    return round(len(samples) / rate, 3) if rate else None
+
+
+# Статусы проверки профиля (§22). `unknown` — запись, которую не сверяли с
+# расшифровкой (старая или загруженная руками): предпочитать её проверенной
+# нельзя, но и терять не за что.
+QUALITY_OK = "ok"
+QUALITY_WARNING = "warning"
+QUALITY_UNKNOWN = "unknown"
+
+# Статус расшифровки референса (§18): что именно известно про `ref_text`.
+# Отдельно от `quality_status` — там качество записи целиком, здесь только текст.
+TRANSCRIPTION_OK = "ok"  # распознавание прошло, текст совпал
+TRANSCRIPTION_WARNING = "warning"  # распознавание прошло, текст расходится
+TRANSCRIPTION_FROM_FORM = "from_form"  # текст взят из формы, без распознавания
+TRANSCRIPTION_UNKNOWN = "unknown"  # не проверяли (старые профили)
+
+
+def _as_bool(value: object, *, default: bool) -> bool:
+    """Флаг из JSON: `voices.json` правят руками, и `"false"` строкой — не редкость."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "да"}
+    return bool(value)
+
+
 @dataclass
 class ReferenceProfile:
-    """Один референс голоса: нейтральный или эмоциональный (UPDATE 2 §8).
+    """Один референс голоса: нейтральный или интонационный профиль (UPDATE 2 §8,
+    UPDATE 3 §18).
 
     Профиль принадлежит **голосу**: он лежит внутри записи голоса, и это делает
     «взять эмоциональный референс чужого голоса» структурно невозможным, а не
@@ -103,9 +144,31 @@ class ReferenceProfile:
     `quality_status` — итог уже существующей проверки «референс ↔ расшифровка»:
     `ok` (совпало), `warning` (расшифровка расходится), `unknown` (не проверяли).
     Резолвер не предпочитает профиль с `warning`, если есть нейтральный (§38).
+
+    Как читать поля, которые легко перепутать:
+
+    * `emotion` — ключ профиля: какой интонации принадлежит запись. Хранится под
+      этим именем, потому что так он уже лежит в `voices.json` и в API; наружу
+      отдаётся ещё и как `profile_key` (§18) — второе имя того же значения.
+    * `source_record_phrase_id` — какая фраза `RECORD_PHRASES` записана (§16).
+    * `is_default` — профиль по умолчанию для своей интонации: при нескольких
+      записях одной эмоции резолвер берёт сначала его (§27).
+    * `enabled` — выключенный профиль виден в интерфейсе, но автоматика его не
+      выбирает (§35): неудачную запись не обязательно удалять, чтобы она перестала
+      влиять на синтез.
+    * `enabled_for_auto` — разрешён ли профиль **автоматическому** выбору референса
+      (§35). По умолчанию `False`: пока профиль не подтверждён benchmark'ом и
+      прослушиванием (§34), автоматика его не берёт — даже если интонация совпала.
+      Ручной выбор реплики (`reference_profile_id`) этот флаг не ограничивает:
+      экспериментальный профиль остаётся доступным человеку, но не становится
+      производственной маршрутизацией сам по себе.
     """
 
     id: str
+    # Голос-владелец (§18, §19). Поле производное: единственный источник истины —
+    # вложенность профиля в запись голоса, и `VoicesStore._read` восстанавливает
+    # значение оттуда. Хранится ради самодостаточности профиля в API и метаданных.
+    voice_id: str = ""
     emotion: str = emotions.EMOTION_NEUTRAL
     label: str = ""
     audio_file: str = ""  # имя файла внутри voices/
@@ -113,13 +176,32 @@ class ReferenceProfile:
     # Кем записан профиль: `legacy` — основной референс голоса, `record` — запись
     # из интерфейса. Нужен, чтобы миграция не выдавала старое за новое.
     source: str = "legacy"
-    quality_status: str = "unknown"
+    quality_status: str = QUALITY_UNKNOWN
     quality_note: str = ""
+    transcription_status: str = TRANSCRIPTION_UNKNOWN
+    duration_sec: float | None = None  # длительность записи; None — измерить не удалось
     # Движки, для которых профиль проверен. Пустой список — «любой движок голоса».
     engine_compatibility: list = field(default_factory=list)
+    source_record_phrase_id: str = ""
+    is_default: bool = False
+    enabled: bool = True
+    # Подтверждён ли профиль benchmark'ом (§35). Значение по умолчанию —
+    # консервативное: новая запись не становится автоматической сама по себе.
+    enabled_for_auto: bool = False
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
+    # Меняется при правке профиля; пустая строка — «не правили с момента записи».
+    updated_at: str = ""
+
+    @property
+    def profile_key(self) -> str:
+        """Ключ профиля (§18) — имя поля в терминах UPDATE 3.
+
+        Хранится как `emotion`: переименование в `voices.json` заставило бы
+        мигрировать данные ради смены ярлыка, а старое имя уже ушло в API.
+        """
+        return self.emotion
 
     @property
     def audio_path(self) -> Path:
@@ -129,6 +211,8 @@ class ReferenceProfile:
         data = asdict(self)
         data["has_audio"] = bool(self.audio_file) and self.audio_path.exists()
         data["emotion_title"] = emotions.EMOTION_TITLES.get(self.emotion, self.emotion)
+        # Имя поля из §18: те же данные, второй сущности для них не заводим.
+        data["profile_key"] = self.emotion
         return data
 
     @classmethod
@@ -144,11 +228,33 @@ class ReferenceProfile:
         known = {key: value for key, value in raw.items() if key in _PROFILE_FIELDS}
         if not known.get("id") or not known.get("audio_file"):
             return None
+        # `profile_key` — имя поля из §18, `emotion` — то, под которым профиль
+        # лежит в `voices.json` и в API. Принимаем оба: запись нового формата не
+        # должна терять интонацию при чтении.
+        if raw.get("emotion") is None and raw.get("profile_key") is not None:
+            known["emotion"] = raw["profile_key"]
         known["emotion"] = emotions.normalize_emotion(known.get("emotion"))
         compatibility = known.get("engine_compatibility") or []
         known["engine_compatibility"] = (
             [str(item) for item in compatibility] if isinstance(compatibility, list) else []
         )
+        known["voice_id"] = str(known.get("voice_id") or "")
+        known["updated_at"] = str(known.get("updated_at") or "")
+        known["source_record_phrase_id"] = str(known.get("source_record_phrase_id") or "")
+        known["transcription_status"] = str(
+            known.get("transcription_status") or TRANSCRIPTION_UNKNOWN
+        )
+        known["enabled"] = _as_bool(known.get("enabled"), default=True)
+        known["is_default"] = _as_bool(known.get("is_default"), default=False)
+        # Флаг подтверждения (§35) по умолчанию снят: старый профиль, у которого
+        # поля нет вовсе, не должен задним числом получить право на автоматику.
+        known["enabled_for_auto"] = _as_bool(known.get("enabled_for_auto"), default=False)
+        try:
+            known["duration_sec"] = (
+                float(known["duration_sec"]) if known.get("duration_sec") is not None else None
+            )
+        except (TypeError, ValueError):
+            known["duration_sec"] = None
         try:
             return cls(**known)
         except TypeError:
@@ -217,15 +323,22 @@ class Voice:
         """
         return ReferenceProfile(
             id=f"{self.id}-neutral",
+            voice_id=self.id,
             emotion=emotions.EMOTION_NEUTRAL,
             label="Основной",
             audio_file=self.audio_file,
             ref_text=self.ref_text,
             source="legacy",
-            quality_status="warning" if self.ref_text_warning else "ok",
+            quality_status=QUALITY_WARNING if self.ref_text_warning else QUALITY_OK,
             quality_note=self.ref_text_warning or "",
+            # Старый голос расшифровку не сверял: у него нет и признака, что текст
+            # взят из формы, поэтому «неизвестно» — честнее, чем «совпало».
+            transcription_status=(
+                TRANSCRIPTION_WARNING if self.ref_text_warning else TRANSCRIPTION_UNKNOWN
+            ),
             engine_compatibility=[self.engine] if self.engine else [],
             created_at=self.created_at,
+            updated_at=self.created_at,
         )
 
     def profile(self, profile_id: str) -> "ReferenceProfile | None":
@@ -284,6 +397,11 @@ class VoicesStore:
                     )
                     if profile is not None
                 ]
+                # Владелец профиля — сама запись голоса: поле восстанавливается из
+                # неё, чтобы `voice_id` не мог разойтись с реальностью при правке
+                # `voices.json` руками.
+                for profile in voice.profiles:
+                    profile.voice_id = voice.id
                 voices.append(voice)
             except TypeError as exc:  # запись без обязательного поля — пропускаем
                 logger.warning("Пропускаю некорректную запись в voices.json: %s", exc)
@@ -464,17 +582,45 @@ class VoicesStore:
         ref_text: str = "",
         label: str = "",
         verify_ref_text: bool = True,
+        source_record_phrase_id: str = "",
+        is_default: bool = False,
+        enabled: bool = True,
+        enabled_for_auto: bool = False,
     ) -> ReferenceProfile:
-        """Добавляет эмоциональный референс существующему голосу.
+        """Добавляет интонационный референс существующему голосу.
 
         Тот же путь, что и у основного референса: файл пишется в `voices/`, а
         расшифровка либо сверяется с записью, либо берётся из формы. Качество
         проставляется здесь же — резолвер не должен выбирать профиль, про который
         известно, что он не совпадает с записью (§38).
+
+        `verify_ref_text=False` — запись сделана по показанной фразе (мастер из
+        §16): текст известен точно, и это отдельный статус расшифровки, а не
+        «совпало» — он честно говорит, что распознавания не было.
+
+        `source_record_phrase_id` делает запись повторяемой: одна фраза
+        `RECORD_PHRASES` — один профиль (§16), поэтому повторная запись той же фразы
+        **заменяет** прежний профиль, а не добавляет второй. Иначе в голосе копились
+        бы дубликаты одной интонации, а резолвер выбирал бы из них самый ранний — и
+        «записал заново» не давало бы никакого эффекта.
+
+        `enabled_for_auto` по умолчанию `False` (§35): свежая запись ещё не
+        подтверждена ни benchmark'ом, ни прослушиванием, поэтому в автоматическую
+        маршрутизацию не попадает. Включить флаг можно вручную — тогда профиль
+        станет кандидатом автоматического выбора референса.
         """
-        emotion = emotions.normalize_emotion(emotion)
-        if emotion == emotions.EMOTION_AUTO:
+        if str(emotion or "").strip().upper() == emotions.EMOTION_AUTO:
             raise ValueError("AUTO — не эмоция референса: выберите конкретную")
+        # Ключом профиля может быть только значение набора §10: записать «испуг»
+        # отдельным профилем нельзя — под него нет фразы RECORD_PHRASES. Отказ, а не
+        # подстановка NEUTRAL: молчаливое переименование «испуга» в нейтральный
+        # профиль поставило бы под видом основного референса чужую интонацию (§17).
+        if not emotions.is_profile_key(emotion):
+            raise ValueError(
+                f"Интонация «{str(emotion or '').strip()}» не записывается профилем: "
+                f"доступны {', '.join(emotions.PROFILE_KEYS)}"
+            )
+        emotion = emotions.normalize_profile_key(emotion)
         suffix = Path(audio_filename or "").suffix.lower()
         if suffix not in ALLOWED_AUDIO_SUFFIXES:
             raise ValueError(f"Формат {suffix or 'без расширения'} не поддерживается")
@@ -482,6 +628,9 @@ class VoicesStore:
             raise ValueError("Пустой файл записи")
         if len(audio_bytes) > MAX_AUDIO_BYTES:
             raise ValueError("Файл слишком большой")
+        # Замер длительности — до захвата блокировки: это декодирование, и держать
+        # на нём список голосов незачем.
+        duration = _duration_sec(audio_bytes, suffix)
         with self._lock:
             voices = self._read()
             voice = next((v for v in voices if v.id == voice_id), None)
@@ -496,21 +645,61 @@ class VoicesStore:
             except ValueError:
                 path.unlink(missing_ok=True)
                 raise
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
             profile = ReferenceProfile(
                 id=profile_id,
+                voice_id=voice_id,
                 emotion=emotion,
                 label=label.strip() or emotions.EMOTION_TITLES.get(emotion, emotion),
                 audio_file=filename,
                 ref_text=resolved_text,
                 source="record",
-                quality_status="warning" if warning else "ok",
+                quality_status=QUALITY_WARNING if warning else QUALITY_OK,
                 quality_note=warning or "",
+                transcription_status=(
+                    TRANSCRIPTION_FROM_FORM
+                    if not verify_ref_text
+                    else TRANSCRIPTION_WARNING if warning else TRANSCRIPTION_OK
+                ),
+                duration_sec=duration,
                 engine_compatibility=[voice.engine],
+                source_record_phrase_id=str(source_record_phrase_id or ""),
+                is_default=bool(is_default),
+                enabled=bool(enabled),
+                enabled_for_auto=bool(enabled_for_auto),
+                created_at=now,
+                updated_at=now,
             )
             # Профили хранятся отдельным списком; старый одиночный референс
             # остаётся нетронутым и читается как NEUTRAL.
+            replaced: ReferenceProfile | None = None
+            phrase_id = str(source_record_phrase_id or "")
+            if phrase_id:
+                replaced = next(
+                    (
+                        item
+                        for item in voice.profiles
+                        if str(item.source_record_phrase_id or "") == phrase_id
+                    ),
+                    None,
+                )
+                if replaced is not None:
+                    voice.profiles = [
+                        item for item in voice.profiles if item.id != replaced.id
+                    ]
             voice.profiles = [*voice.profiles, profile]
             self._write(voices)
+        if replaced is not None:
+            # Файл прежней записи удаляем после записи списка: если удаление не
+            # удастся, в `voices.json` уже не будет профиля, который на него ссылается.
+            try:
+                replaced.audio_path.unlink(missing_ok=True)
+            except OSError as exc:  # файл мог быть удалён руками
+                logger.warning("Прежний файл записи %s не удалён: %s", replaced.audio_file, exc)
+            logger.info(
+                "Голос %s: референс %s заменён записью фразы %s",
+                voice_id, replaced.id, phrase_id,
+            )
         logger.info("Голос %s: добавлен референс %s (%s)", voice_id, profile.id, emotion)
         return profile
 
@@ -521,8 +710,19 @@ class VoicesStore:
         *,
         emotion: str | None = None,
         label: str | None = None,
+        is_default: bool | None = None,
+        enabled: bool | None = None,
+        enabled_for_auto: bool | None = None,
     ) -> ReferenceProfile:
-        """Правит эмоцию или подпись профиля, не перезаписывая запись."""
+        """Правит профиль, не перезаписывая запись.
+
+        `enabled` — это выключатель, а не удаление (§35): запись остаётся в голосе
+        и в интерфейсе, но автоматика её больше не выбирает.
+
+        `enabled_for_auto` — право на **автоматический** выбор по интонации (§35).
+        Ставится вручную, когда профиль подтверждён benchmark'ом (§33) и
+        прослушиванием (§34). На ручной выбор реплики флаг не влияет.
+        """
         with self._lock:
             voices = self._read()
             voice = next((v for v in voices if v.id == voice_id), None)
@@ -531,13 +731,28 @@ class VoicesStore:
             profile = next((item for item in voice.profiles if item.id == profile_id), None)
             if profile is None:
                 raise KeyError(profile_id)
+            changed = False
             if emotion is not None:
-                chosen = emotions.normalize_emotion(emotion)
-                if chosen == emotions.EMOTION_AUTO:
+                if str(emotion).strip().upper() == emotions.EMOTION_AUTO:
                     raise ValueError("AUTO — не эмоция референса: выберите конкретную")
+                chosen = emotions.normalize_profile_key(emotion)
+                changed = chosen != profile.emotion
                 profile.emotion = chosen
             if label is not None:
-                profile.label = label.strip() or profile.label
+                new_label = label.strip() or profile.label
+                changed = changed or new_label != profile.label
+                profile.label = new_label
+            if enabled is not None and bool(enabled) != profile.enabled:
+                profile.enabled = bool(enabled)
+                changed = True
+            if is_default is not None and bool(is_default) != profile.is_default:
+                profile.is_default = bool(is_default)
+                changed = True
+            if enabled_for_auto is not None and bool(enabled_for_auto) != profile.enabled_for_auto:
+                profile.enabled_for_auto = bool(enabled_for_auto)
+                changed = True
+            if changed:
+                profile.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._write(voices)
         logger.info("Голос %s: референс %s обновлён (%s)", voice_id, profile_id, profile.emotion)
         return profile

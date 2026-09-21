@@ -5,8 +5,14 @@
 хранятся разборы и как всё это уживается с TTS на 18 GB. Числа живого smoke —
 в `llm_analyzer_report.md`, политика памяти — в `ollama_memory_policy.md`.
 
-Дата: 2026-09-18. Код: `backend/llm/analyzer.py`, `backend/llm/integration.py`,
+Дата: 2026-09-19. Код: `backend/llm/analyzer.py`, `backend/llm/integration.py`,
 `backend/llm/analysis_cache.py`, `backend/llm/scheduler.py`, `backend/db/repositories/llm_analyses.py`.
+
+> **UPDATE 3.** Анализатор расширен до **Russian Dialogue Analyzer**: он
+> анализирует сцену (окно реплик), а не одну фразу, и возвращает по каждой
+> реплике интонацию. Схема — **v3**, рабочий prompt — **`analyzer.v4.txt`**
+> (оконный — **`analyzer.v5.txt`**). Подробности — в разделе 9; разделы 3 и 8 ниже
+> описывают контракт v2/v3 и остаются в силе, кроме явно устаревших номеров версий.
 
 ## 1. Место в pipeline
 
@@ -49,8 +55,10 @@ SOURCE → разбор диалога → проект (SQLite)
 
 ## 3. Контракт и валидация
 
-- Схема: `schemas.analysis_json_schema()`, `SCHEMA_VERSION = 1`; prompt v2
-  (`benchmarks/russian_linguistics/prompts/analyzer.v2.txt`) получает ту же схему
+- Схема: `schemas.analysis_json_schema()`, `SCHEMA_VERSION = 3` (в v2 добавлены
+  эмоция и речевой акт, в v3 — блок `prosody` с `intensity`/`pace`/`confidence` и
+  controlled `dialogue_act`); prompt `analyzer.v4.txt`
+  (`benchmarks/russian_linguistics/prompts/analyzer.v4.txt`) получает ту же схему
   плейсхолдером `{{schema}}` — prompt и валидатор не могут разойтись.
 - Ответ передаётся как `format="json"` + схема текстом в prompt (грамматический
   режим `format=<schema>` ломает ответы qwen3 — см. `llm_russian_benchmark.md`).
@@ -129,3 +137,143 @@ SQLite, детерминированная подготовка) слот не �
   Utterance Strategy.
 - При жёлтом давлении macOS анализ не запускается даже при низком проценте: это
   осознанное поведение, а не ошибка настройки.
+
+## 9. Russian Dialogue Analyzer (UPDATE 3)
+
+Тот же анализатор, но смотрящий на **сцену**, а не на одну строку. Отдельного
+`DialogueAnalyzer`, второго pipeline и второй модели не появилось: расширены схема,
+prompt и обход реплик (см. `dialogue_prosody_plan.md`, §AUDIT).
+
+### 9.1 Назначение
+
+Для каждой реплики диалога вернуть **метаданные интонации**: какой профиль
+референса подходит, насколько выраженно (`intensity`), в каком темпе (`pace`),
+с какой уверенностью, и как реплика зависит от соседей (`context_dependency`).
+Решение о том, **какой файл** пойдёт в модель, анализатор не принимает — это
+делает `ProsodyResolver` (см. `reference_profiles.md`). Анализатор не переписывает
+текст, не добавляет тегов и не выбирает голос: его ответ — это предложение,
+видимое человеку, а не команда движку.
+
+### 9.2 Архитектура
+
+```text
+ProjectLlmAnalyzer.run (llm/integration.py)
+  → build_context(target, before, after)      контекст одной реплики
+  → plan_windows(count)                        окна сцены (батчинг)
+  → LinguisticAnalyzer.analyze_window          один запрос на окно
+  → parse_analysis → locate_annotations        валидация и привязка к replica_id
+  → AnalysisCache.save                        сохранение разбора
+  → _apply_emotions → replicas                поля просодии у реплик
+```
+
+- `LinguisticAnalyzer` (`analyzer.py`) — адаптер: собирает case, шлёт в Ollama
+  (`ollama_client.py`), парсит и валидирует ответ; для одиночной реплики —
+  `_request_analysis`, для окна — `_request_window`.
+- `ProjectLlmAnalyzer` (`integration.py`) — встраивание в канонический проход
+  подготовки проекта: кандидаты словаря, подстатусы, `blocked_reason`.
+- Тяжёлые ресурсы — `HeavyScheduler` + `memory_policy` (раздел 6): LLM, синтез и
+  Whisper делят один слот, второго планировщика нет.
+
+### 9.3 Schema (v3)
+
+`SCHEMA_VERSION = "3"` (`backend/llm/schemas.py:35`). К прежним аннотациям
+словаря добавлен блок интонации внутри `utterance`:
+
+```jsonc
+{
+  "class": "NORMAL",
+  "context_dependency": "HIGH",          // LOW | MEDIUM | HIGH
+  "relevant_replica_ids": [11, 13],
+  "emotion": "QUESTION",                 // словарь emotions.py
+  "emotion_confidence": 0.94,
+  "dialogue_act": "QUESTION",            // controlled, ≤ DIALOGUE_ACT_MAX_CHARS = 40
+  "prosody": {
+    "profile": "QUESTION",               // рекомендуемый профиль
+    "recommended_profile": "QUESTION",
+    "intensity": 0.55,                   // 0.0–1.0
+    "pace": "NORMAL",                    // SLOW | NORMAL | FAST
+    "confidence": 0.94
+  }
+}
+```
+
+Словари живут в одном месте и проверяются при разборе: `CONTEXT_DEPENDENCIES`,
+`PROSODY_PACES`, `EMOTION_VALUES`, `ANNOTATION_TYPES`. Поля переписанного текста
+запрещены (`REWRITE_FIELDS`): ответ с новым текстом отвергается целиком, а не
+«применяется частично». Схема для модели и валидатор — один объект
+(`analysis_json_schema()`), поэтому prompt не может разойтись с проверкой.
+
+### 9.4 Prompt version
+
+`PROMPT_VERSION = "4"` (`backend/llm/versioning.py:35`); файлы —
+`benchmarks/russian_linguistics/prompts/`:
+
+| Файл | Роль |
+|---|---|
+| `analyzer.v4.txt` | рабочий одиночный prompt (`ANALYZER_PROMPT`) |
+| `analyzer.v5.txt` | оконный prompt для батчинга (`ANALYZER_WINDOW_PROMPT`) |
+| `analyzer.v1..v3.txt` | историчные; загружаются только для воспроизведения старых прогонов |
+
+Формат prompt'а обязателен: заголовок `# version:`, секции `[system]`/`[user]` и
+плейсхолдеры `{{schema}}` и `{{case}}` — иначе `parse_prompt` его отвергает.
+
+### 9.5 Context windows
+
+Контекст одной реплики собирает `build_context`
+(`DEFAULT_CONTEXT_REPLICAS = 2`, `DEFAULT_CONTEXT_CHARS = 4000`): до двух реплик
+до и после цели, с бюджетом по символам. Контекст хешируется (`context_hash`) и
+входит в ключ кеша — правка соседа честно устаревает разбор.
+
+### 9.6 Batching (окна сцены)
+
+Один запрос на окно, а не на реплику:
+
+- `plan_windows(count, size=DEFAULT_SCENE_REPLICAS = 6,
+  overlap=DEFAULT_CONTEXT_REPLICAS = 2)` — окна по 6 реплик с перекрытием 2,
+  шаг `step = max(size − overlap, 1) = 4`;
+- окно хешируется (`scene_hash`);
+- ответ привязан к `replica_id`; неизвестный id отбрасывается, а не «прилипает» к
+  соседней реплике.
+
+Именно это закрывает §77: «нет одного LLM-запроса на каждую реплику».
+
+### 9.7 Cache
+
+Таблица `llm_analyses` (миграция 7, `UNIQUE(project_id, replica_index)`), поверх
+неё `AnalysisCache`. Разбор действителен, только если совпали **все** шесть
+компонентов ключа: `source_text_hash`, `context_hash`, `dictionary_hash`,
+`model_digest`, `prompt_version`, `schema_version`. Поэтому смена prompt v3 → v4
+или схемы v2 → v3 инвалидирует старые разборы автоматически. Явная инвалидация
+метит реплику и по `CONTEXT_NEIGHBOURHOOD = 2` соседа с каждой стороны.
+
+### 9.8 Fallback (LLM не обязателен)
+
+- Анализатор выключен (`LLM_ANALYZER_ENABLED = false` по умолчанию) → статус
+  `DISABLED`, работает только детерминированный слой.
+- Анализ не удался (нет Ollama, таймаут, нет модели, мусор вместо JSON, HARD STOP
+  памяти) → статус `FAILED` с причиной; интонация берётся безопасной эвристикой
+  `emotions.heuristic_emotion(text)` с низкой уверенностью, а источник виден в API
+  (`emotion.source`: `llm` / `heuristic` / `none`).
+- `LLM_ANALYZER_REQUIRED_FOR_RENDER = false`: **отказ анализа не блокирует
+  обычный рендер**. `blocked_reason` объясняет, почему проход не состоялся.
+
+### 9.9 Failure modes
+
+| Статус | Что означает |
+|---|---|
+| `DISABLED` | анализатор выключен настройкой |
+| `PENDING` / `RUNNING` | проход поставлен / идёт |
+| `READY` | разбор валиден |
+| `NEEDS_REVIEW` | есть спорные кандидаты словаря — нужно решение человека |
+| `FAILED` | разбор не удался; причина в `error` |
+| `STALE` | вход изменился (текст, контекст, словарь, модель, версия) — разбор не отдаётся |
+
+Частые причины отказа: Ollama недоступна или модель не скачана, таймаут запроса,
+ответ не по схеме, блокировка по памяти. Все они дают честный `FAILED`, а не тихий
+успех с пустым результатом.
+
+### 9.10 Эндпоинты
+
+`GET /api/llm/status`, `GET /api/llm/models`, `POST /api/llm/settings`,
+`POST /api/projects/{id}/analyze` (канонический проход),
+`GET|POST /api/projects/{id}/linguistic-analysis`, `GET /api/projects/{id}/analysis`.
