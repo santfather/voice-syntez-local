@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -34,6 +35,9 @@ from . import (
     model_manager,
     project_analysis,
     project_export,
+    recording_audio,
+    recording_pipeline,
+    recording_store,
     recovery,
     reference_resolver,
     resource_guard,
@@ -3587,6 +3591,500 @@ async def replica_variant_audio(job_id: str, index: int, variant_id: str) -> Fil
         raise HTTPException(status_code=410, detail="Файл варианта удалён")
     # Варианты всегда wav: они служат для сравнения, а не для выдачи пользователю.
     return FileResponse(variant.path, media_type="audio/wav")
+
+
+# --- записи пользователя: «Сам себе звукорежиссер» ------------------------------
+# Отдельный namespace: у режима свой источник звука (микрофон) и свой жизненный
+# цикл, но разбор диалога — тот же общий парсер, а сборка заканчивается теми же
+# LUFS и лимитером, что у TTS-рендера.
+class RecordingProjectRequest(BaseModel):
+    """Создание проекта записи: имя и текст диалога."""
+
+    name: str
+    dialogue_text: str = ""
+
+
+class RecordingProjectUpdate(BaseModel):
+    """Правка проекта записи; непришедшее поле — «не трогать»."""
+
+    name: str | None = None
+    dialogue_text: str | None = None
+    # Порядок записи влияет только на отображение, не на монтаж.
+    recording_order: Literal["dialogue", "roles"] | None = None
+    render_settings: dict | None = None
+
+
+class RecordingVoiceProfileRequest(BaseModel):
+    """Записываемый голос: имя и неразрушающие настройки обработки."""
+
+    name: str
+    speed: float = 1.0
+    pitch_semitones: float = 0.0
+    denoise: bool = False
+
+
+class RecordingVoiceProfileUpdate(BaseModel):
+    name: str | None = None
+    speed: float | None = None
+    pitch_semitones: float | None = None
+    denoise: bool | None = None
+
+
+class RecordingRoleRequest(BaseModel):
+    """Назначение роли: `profile_id = null` снимает назначение."""
+
+    profile_id: str | None = None
+
+
+class RecordingPreviewRequest(BaseModel):
+    """Превью обработки: настройки, с которыми показать дубль."""
+
+    speed: float | None = None
+    pitch_semitones: float | None = None
+    denoise: bool | None = None
+
+
+class RecordingRenderRequest(BaseModel):
+    pause_ms: int | None = None
+
+
+def _recording_or_404(project_id: str) -> recording_store.RecordingProject:
+    try:
+        return recording_store.get_store().require_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Проект записи не найден") from exc
+
+
+def _recording_payload(project: recording_store.RecordingProject) -> dict:
+    """Проект записи для интерфейса: роли, дубли со ссылками и готовность.
+
+    Считается на каждый запрос, а не хранится: готовность — производная от
+    активных дублей, и второй источник правды разошёлся бы с первым после
+    удаления дубля.
+    """
+    data = project.to_dict()
+    data["readiness"] = project.readiness()
+    data["speakers"] = project.speakers
+    # Роли с назначением голоса и счётчиком записанного — панель «Роли и голоса».
+    roles = []
+    for speaker in project.speakers:
+        indexes = [
+            int(replica["index"])
+            for replica in project.replicas
+            if str(replica.get("speaker")) == speaker
+        ]
+        recorded = sum(1 for index in indexes if project.active_take(index) is not None)
+        roles.append(
+            {
+                "speaker": speaker,
+                "replicas": indexes,
+                "recorded": recorded,
+                "total": len(indexes),
+                "voice_profile_id": str(project.role_voices.get(speaker) or ""),
+            }
+        )
+    data["roles"] = roles
+    data["render"] = {
+        key: value
+        for key, value in recording_pipeline.render_state(project.id).__dict__.items()
+        if key != "output_path"
+    }
+    data["has_output"] = bool(recording_pipeline.render_state(project.id).output_path) and Path(
+        recording_pipeline.render_state(project.id).output_path
+    ).exists()
+    takes = []
+    for take in project.takes:
+        item = take.to_dict()
+        item["audio_url"] = (
+            f"/api/recording-projects/{project.id}/takes/{take.id}/audio"
+        )
+        item["active"] = str(project.active_takes.get(str(take.replica_index)) or "") == take.id
+        takes.append(item)
+    data["takes"] = takes
+    return data
+
+
+@app.get("/api/recording-projects")
+async def list_recording_projects() -> dict:
+    """Список проектов записи — для выбора при открытии вкладки."""
+    return {"projects": recording_store.get_store().list_projects()}
+
+
+@app.post("/api/recording-projects", status_code=201)
+async def create_recording_project(payload: RecordingProjectRequest) -> dict:
+    """Создаёт проект записи: текст диалога разбирается общим парсером."""
+    try:
+        project = recording_store.get_store().create_project(
+            payload.name, payload.dialogue_text
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.dialogue_text.strip():
+        project = _recording_parse(project, payload.dialogue_text)
+    return _recording_payload(project)
+
+
+def _recording_parse(
+    project: recording_store.RecordingProject, text: str
+) -> recording_store.RecordingProject:
+    """Разбор диалога **существующим** парсером: свой у режима не заводится (§3).
+
+    Индексы реплик берутся из общего разбора и дальше не меняются: именно они
+    задают порядок монтажа, независимо от того, в каком порядке записывали роли.
+    """
+    try:
+        parsed = parse_dialogue(text, config.chunk_chars(config.CHUNK_STRATEGY_DEFAULT))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not parsed.replicas:
+        raise HTTPException(status_code=400, detail="Диалог пуст — нечего записывать")
+    store = recording_store.get_store()
+    return store.set_replicas(
+        project.id,
+        [
+            {"index": index, "speaker": replica.voice, "text": replica.text}
+            for index, replica in enumerate(parsed.replicas)
+        ],
+    )
+
+
+@app.get("/api/recording-projects/{project_id}")
+async def get_recording_project(project_id: str) -> dict:
+    return _recording_payload(_recording_or_404(project_id))
+
+
+@app.patch("/api/recording-projects/{project_id}")
+async def update_recording_project(
+    project_id: str, payload: RecordingProjectUpdate
+) -> dict:
+    """Правит проект; новый текст диалога разбирается заново тем же парсером."""
+    fields = payload.model_dump(exclude_unset=True)
+    store = recording_store.get_store()
+    try:
+        project = store.update_project(
+            project_id,
+            name=fields.get("name"),
+            dialogue_text=fields.get("dialogue_text"),
+            recording_order=fields.get("recording_order"),
+            render_settings=fields.get("render_settings"),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Проект записи не найден") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if fields.get("dialogue_text") is not None:
+        project = _recording_parse(project, str(fields["dialogue_text"]))
+    return _recording_payload(project)
+
+
+@app.delete("/api/recording-projects/{project_id}")
+async def delete_recording_project(project_id: str) -> dict:
+    if not recording_store.get_store().delete_project(project_id):
+        raise HTTPException(status_code=404, detail="Проект записи не найден")
+    recording_pipeline.reset_states()
+    return {"deleted": project_id}
+
+
+@app.post("/api/recording-projects/{project_id}/parse")
+async def parse_recording_project(project_id: str) -> dict:
+    """Повторный разбор уже сохранённого текста (кнопка «Разобрать диалог»)."""
+    project = _recording_or_404(project_id)
+    if not project.dialogue_text.strip():
+        raise HTTPException(status_code=400, detail="Текст диалога пуст")
+    return _recording_payload(_recording_parse(project, project.dialogue_text))
+
+
+@app.post("/api/recording-projects/{project_id}/voice-profiles", status_code=201)
+async def create_recording_voice_profile(
+    project_id: str, payload: RecordingVoiceProfileRequest
+) -> dict:
+    """Создаёт записываемый голос с настройками обработки (§6)."""
+    store = recording_store.get_store()
+    try:
+        recording_audio.validate_speed(payload.speed)
+        recording_audio.validate_pitch(payload.pitch_semitones)
+    except recording_audio.RecordingAudioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        store.add_voice_profile(
+            project_id,
+            payload.name,
+            speed=payload.speed,
+            pitch_semitones=payload.pitch_semitones,
+            denoise=payload.denoise,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Проект записи не найден") from exc
+    return _recording_payload(store.require_project(project_id))
+
+
+@app.patch("/api/recording-projects/{project_id}/voice-profiles/{profile_id}")
+async def update_recording_voice_profile(
+    project_id: str, profile_id: str, payload: RecordingVoiceProfileUpdate
+) -> dict:
+    """Меняет настройки обработки голоса; raw-записи не трогаются (§16)."""
+    fields = payload.model_dump(exclude_unset=True)
+    store = recording_store.get_store()
+    try:
+        if fields.get("speed") is not None:
+            recording_audio.validate_speed(fields["speed"])
+        if fields.get("pitch_semitones") is not None:
+            recording_audio.validate_pitch(fields["pitch_semitones"])
+        store.update_voice_profile(
+            project_id,
+            profile_id,
+            name=fields.get("name"),
+            speed=fields.get("speed"),
+            pitch_semitones=fields.get("pitch_semitones"),
+            denoise=fields.get("denoise"),
+        )
+    except recording_audio.RecordingAudioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Голос или проект записи не найден") from exc
+    return _recording_payload(store.require_project(project_id))
+
+
+@app.put("/api/recording-projects/{project_id}/roles/{speaker}")
+async def assign_recording_role(
+    project_id: str, speaker: str, payload: RecordingRoleRequest
+) -> dict:
+    """Назначает роли записываемый голос; один голос можно дать нескольким ролям."""
+    store = recording_store.get_store()
+    try:
+        store.assign_role(project_id, speaker, payload.profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Роль, голос или проект не найдены") from exc
+    return _recording_payload(store.require_project(project_id))
+
+
+@app.post("/api/recording-projects/{project_id}/replicas/{index}/takes", status_code=201)
+async def upload_recording_take(
+    project_id: str, index: int, file: Annotated[UploadFile, File()]
+) -> dict:
+    """Сохраняет дубль реплики: браузерная запись → PCM → сырой файл.
+
+    Сырой дубль не изменяется обработкой никогда, поэтому здесь только
+    декодирование в единый формат, длительность и лёгкая проверка уровня (§8, §10).
+    """
+    store = recording_store.get_store()
+    project = _recording_or_404(project_id)
+    data = await file.read()
+    try:
+        suffix = recording_audio.validate_suffix(file.filename or "")
+        audio = await asyncio.to_thread(recording_audio.decode, data, suffix)
+    except recording_audio.RecordingAudioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    duration = recording_audio.duration_sec(audio)
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="В записи нет звука")
+    if duration > config.MAX_RECORDING_SEC:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Запись длиннее {config.MAX_RECORDING_SEC:.0f} с — одна реплика не может быть такой",
+        )
+    # Отдаём дальше уже WAV: внутренний формат один, и повторное декодирование при
+    # каждом обращении к дублю не нужно (§8).
+    wav_bytes = await asyncio.to_thread(recording_audio.encode, audio, "wav")
+    role = next(
+        (item for item in project.replicas if int(item["index"]) == int(index)), None
+    )
+    if role is None:
+        raise HTTPException(status_code=404, detail="Реплика не найдена")
+    profile_id = str(project.role_voices.get(str(role.get("speaker"))) or "")
+    try:
+        take = await asyncio.to_thread(
+            store.add_take,
+            project_id,
+            int(index),
+            voice_profile_id=profile_id,
+            raw_bytes=wav_bytes,
+            suffix=".wav",
+            duration_sec=duration,
+            level_warning=recording_audio.level_warning(audio),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Реплика не найдена") from exc
+    return {"take": take.to_dict(), "project": _recording_payload(store.require_project(project_id))}
+
+
+@app.get("/api/recording-projects/{project_id}/replicas/{index}/takes")
+async def list_recording_takes(project_id: str, index: int) -> dict:
+    _recording_or_404(project_id)
+    takes = recording_store.get_store().list_takes(project_id, index)
+    return {
+        "replica_index": index,
+        "takes": [take.to_dict() for take in takes],
+    }
+
+
+@app.get("/api/recording-projects/{project_id}/takes/{take_id}/audio")
+async def recording_take_audio(project_id: str, take_id: str) -> FileResponse:
+    """Отдаёт **сырой** дубль: сравнение дублей идёт без обработки."""
+    store = recording_store.get_store()
+    project = _recording_or_404(project_id)
+    take = next((item for item in project.takes if item.id == take_id), None)
+    if take is None:
+        raise HTTPException(status_code=404, detail="Дубль не найден")
+    path = store.raw_path(project_id, take)
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="Файл дубля удалён")
+    return FileResponse(path, media_type="audio/wav")
+
+
+@app.delete("/api/recording-projects/{project_id}/replicas/{index}/takes/{take_id}")
+async def delete_recording_take(project_id: str, index: int, take_id: str) -> dict:
+    """Удаляет дубль; если дублей не осталось, реплика снова считается незаписанной."""
+    store = recording_store.get_store()
+    _recording_or_404(project_id)
+    try:
+        project = store.delete_take(project_id, index, take_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Дубль не найден") from exc
+    return _recording_payload(project)
+
+
+@app.post("/api/recording-projects/{project_id}/replicas/{index}/takes/{take_id}/select")
+async def select_recording_take(project_id: str, index: int, take_id: str) -> dict:
+    store = recording_store.get_store()
+    _recording_or_404(project_id)
+    try:
+        project = store.select_take(project_id, index, take_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Дубль не найден у этой реплики") from exc
+    return _recording_payload(project)
+
+
+@app.post("/api/recording-projects/{project_id}/takes/{take_id}/preview")
+async def preview_recording_take(
+    project_id: str, take_id: str, payload: RecordingPreviewRequest | None = None
+) -> dict:
+    """Обработанное превью дубля: настройки применяются к **сырому** файлу (§16, §17)."""
+    payload = payload or RecordingPreviewRequest()
+    store = recording_store.get_store()
+    project = _recording_or_404(project_id)
+    take = next((item for item in project.takes if item.id == take_id), None)
+    if take is None:
+        raise HTTPException(status_code=404, detail="Дубль не найден")
+    profile = project.profile(take.voice_profile_id) if take.voice_profile_id else None
+    try:
+        speed = recording_audio.validate_speed(
+            payload.speed if payload.speed is not None else (profile.speed if profile else 1.0)
+        )
+        pitch = recording_audio.validate_pitch(
+            payload.pitch_semitones
+            if payload.pitch_semitones is not None
+            else (profile.pitch_semitones if profile else 0.0)
+        )
+    except recording_audio.RecordingAudioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    denoise_enabled = (
+        bool(payload.denoise)
+        if payload.denoise is not None
+        else bool(profile.denoise) if profile else False
+    )
+    try:
+        audio, warnings = await asyncio.to_thread(
+            recording_pipeline.processed_take, project, take, text=""
+        )
+    except recording_pipeline.RecordingRenderError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    if (
+        abs(speed - (profile.speed if profile else 1.0)) > 1e-6
+        or abs(pitch - (profile.pitch_semitones if profile else 0.0)) > 1e-6
+        or denoise_enabled != (bool(profile.denoise) if profile else False)
+    ):
+        # Превью показывает именно запрошенные настройки, а не сохранённые:
+        # пользователь слушает то, что собирается сохранить (§17).
+        raw_path = store.raw_path(project_id, take)
+        raw = await asyncio.to_thread(
+            recording_audio.decode, raw_path.read_bytes(), ".wav"
+        )
+        audio, warnings = await asyncio.to_thread(
+            recording_audio.process,
+            raw,
+            speed=speed,
+            pitch_semitones=pitch,
+            denoise_enabled=denoise_enabled,
+        )
+    key = recording_audio.settings_key(speed, pitch, denoise_enabled)
+    name = f"{recording_store.safe_component(take_id)}-{key}.wav"
+    path = store.preview_path(project_id, name)
+    await asyncio.to_thread(audio_pipeline._write_audio, path, audio, "wav")
+    return {
+        "preview_id": name,
+        "url": f"/api/recording-projects/{project_id}/previews/{name}/audio",
+        "settings": {"speed": speed, "pitch_semitones": pitch, "denoise": denoise_enabled},
+        "warnings": warnings,
+    }
+
+
+@app.get("/api/recording-projects/{project_id}/previews/{name}/audio")
+async def recording_preview_audio(project_id: str, name: str) -> FileResponse:
+    store = recording_store.get_store()
+    _recording_or_404(project_id)
+    path = store.preview_path(project_id, name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Превью не найдено")
+    return FileResponse(path, media_type="audio/wav")
+
+
+@app.post("/api/recording-projects/{project_id}/render", status_code=202)
+async def render_recording_project(
+    project_id: str, payload: RecordingRenderRequest | None = None
+) -> dict:
+    """Запускает монтаж диалога. Пустая реплика блокирует сборку (§19, Test F)."""
+    payload = payload or RecordingRenderRequest()
+    project = _recording_or_404(project_id)
+    missing = recording_pipeline.missing_replicas(project)
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "не записаны реплики",
+                "missing": missing,
+                "message": "Диалог собирается только целиком: запишите оставшиеся реплики.",
+            },
+        )
+    state = recording_pipeline.render_state(project_id)
+    if state.status == "running":
+        raise HTTPException(status_code=409, detail="Монтаж уже идёт")
+    # Запуск объявляется до ухода в поток: иначе первый опрос `render/status`
+    # успевает увидеть состояние прошлого монтажа и отдаёт клиенту старую
+    # длительность — «сменил дубль, а файл не изменился» (§22).
+    try:
+        recording_pipeline.begin_render(project_id)
+    except recording_pipeline.RenderBusyError as exc:
+        raise HTTPException(status_code=409, detail="Монтаж уже идёт") from exc
+    # Тяжёлая обработка — в потоке: в HTTP-запросе ей делать нечего (§22).
+    try:
+        asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(recording_pipeline.render, project_id, pause_ms=payload.pause_ms)
+        )
+    except Exception as exc:  # noqa: BLE001 — состояние обязано быть видимым
+        recording_pipeline.abort_render(project_id, f"монтаж не запустился: {exc}")
+        raise HTTPException(status_code=500, detail="Не удалось запустить монтаж") from exc
+    return {"status": "running", "project_id": project_id}
+
+
+@app.get("/api/recording-projects/{project_id}/render/status")
+async def recording_render_status(project_id: str) -> dict:
+    _recording_or_404(project_id)
+    return recording_pipeline.render_state(project_id).__dict__
+
+
+@app.get("/api/recording-projects/{project_id}/audio")
+async def recording_output_audio(project_id: str, download: bool = False) -> FileResponse:
+    """Готовый диалог одним файлом — главный результат режима (§41)."""
+    _recording_or_404(project_id)
+    state = recording_pipeline.render_state(project_id)
+    if not state.output_path:
+        raise HTTPException(status_code=409, detail="Диалог ещё не собран")
+    path = Path(state.output_path)
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="Файл не найден")
+    media = "audio/mpeg" if path.suffix == ".mp3" else MIME_BY_FORMAT.get(path.suffix.lstrip("."), "audio/wav")
+    return FileResponse(path, media_type=media, filename=path.name if download else None)
 
 
 @app.get("/api/jobs/{job_id}/audio")

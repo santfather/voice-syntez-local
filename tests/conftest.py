@@ -113,6 +113,13 @@ def workspace(tmp_path, monkeypatch):
     # рабочий `output/diagnostics`, а чужой лог делал бы тест недетерминированным.
     monkeypatch.setattr(config, "DIAGNOSTICS_DIR", output_dir / "diagnostics")
     monkeypatch.setattr(config, "LOG_PATH", tmp_path / "voice_syntez.log")
+    # Записи пользователя («Сам себе звукорежиссер») — туда же: иначе тесты писали
+    # бы в рабочий каталог `recordings/`, а прогон зависел бы от прошлых записей.
+    monkeypatch.setattr(config, "RECORDINGS_DIR", tmp_path / "recordings")
+    from backend import recording_pipeline, recording_store
+
+    recording_store.reset_store()
+    recording_pipeline.reset_states()
     # Менеджер моделей держит состояние скачиваний в памяти, а замеры размеров —
     # в кеше модуля: без сброса тесты влияли бы друг на друга.
     model_manager.reset_manager()

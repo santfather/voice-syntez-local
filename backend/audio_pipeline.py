@@ -2440,18 +2440,59 @@ async def apply_variant(
 
 
 def _read_audio(path: Path, output_format: str) -> np.ndarray:
-    """Читает готовый файл обратно в float32-моно при SAMPLE_RATE."""
+    """Читает готовый файл обратно в float32-моно при SAMPLE_RATE.
+
+    Приведение к внутреннему формату — не косметика: файл может прийти извне
+    (браузерная запись в WebM/Opus почти всегда 48 кГц и часто стерео), и без
+    ресемплинга со сведением в моно его длительность, темп и расстановка пауз
+    уехали бы ровно во столько раз, во сколько отличается частота. Свои файлы
+    проект всегда пишет моно при `SAMPLE_RATE`, поэтому для них это no-op.
+    """
     if (output_format or "wav").lower() == "wav":
         import soundfile as sf
 
-        data, _ = sf.read(path, dtype="float32")
-        return np.asarray(data, dtype=np.float32).reshape(-1)
+        data, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    else:
+        from pydub import AudioSegment
 
-    from pydub import AudioSegment
+        segment = AudioSegment.from_file(path, format=output_format)
+        sample_rate = segment.frame_rate
+        channels = max(1, int(segment.channels))
+        data = (
+            np.frombuffer(segment.raw_data, dtype=np.int16)
+            .astype(np.float32)
+            .reshape(-1, channels)
+            / 32768.0
+        )
 
-    segment = AudioSegment.from_file(path, format=output_format)
-    samples = np.frombuffer(segment.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-    return samples
+    audio = np.asarray(data, dtype=np.float32)
+    if audio.ndim == 2 and audio.shape[1] > 1:
+        # Сведение усреднением, а не выбором первого канала: иначе при записи в
+        # стерео терялась бы половина сигнала (например, второй микрофон).
+        audio = audio.mean(axis=1, dtype=np.float32)
+    else:
+        audio = audio.reshape(-1)
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+
+    if sample_rate and int(sample_rate) != int(SAMPLE_RATE):
+        import librosa
+
+        try:
+            audio = librosa.resample(
+                audio,
+                orig_sr=int(sample_rate),
+                target_sr=int(SAMPLE_RATE),
+                res_type="soxr_hq",
+            )
+        except ImportError:  # soxr необязателен — kaiser_best это чистый scipy
+            audio = librosa.resample(
+                audio,
+                orig_sr=int(sample_rate),
+                target_sr=int(SAMPLE_RATE),
+                res_type="kaiser_best",
+            )
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+    return audio
 
 
 def _write_audio(target: Path, audio: np.ndarray, output_format: str) -> None:

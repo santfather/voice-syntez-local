@@ -48,8 +48,12 @@
   <button class="tab active" data-tab="voices"><span>01</span>Голоса</button>
   <button class="tab" data-tab="dialogue"><span>02</span>Озвучка диалога</button>
   <button class="tab" data-tab="text"><span>03</span>Сплошной текст</button>
-  <button class="tab" data-tab="dictionary"><span>04</span>Словарь</button>
-  <button class="tab" data-tab="models"><span>05</span>Модели</button>
+  <!-- Новая вкладка вставлена по номеру из ТЗ фазы 2 («04 · Сам себе звукорежиссер»).
+       Номера соседних кнопок не трогаем: их разметка принадлежит существующим
+       вкладкам, а переключение идёт по data-tab, а не по видимому числу. -->
+  <button class="tab" data-tab="recording"><span>04</span>Сам себе звукорежиссер</button>
+  <button class="tab" data-tab="dictionary"><span>05</span>Словарь</button>
+  <button class="tab" data-tab="models"><span>06</span>Модели</button>
 </nav>
 </div>
 
@@ -931,12 +935,244 @@
 </div>
 </main>
 
+<!-- Вкладка 4: сам себе звукорежиссер -->
+<!-- Отдельный режим, а не расширение «Озвучки диалога»: источник звука здесь —
+     микрофон, а не модель. Проект записи живёт в backend (`recordings/`), поэтому
+     разметка вкладки переживает перезагрузку страницы; локально во фронтенде
+     остаются только открытая реплика и несохранённые ползунки обработки. -->
+<main class="tab-panel" id="tab-recording" hidden>
+<div class="workspace">
+  <section class="section-heading">
+    <div>
+      <p class="eyebrow">04 · САМ СЕБЕ ЗВУКОРЕЖИССЕР</p>
+      <h1>Своя запись <span>//</span> реплики, дубли, монтаж</h1>
+    </div>
+    <span class="muted" id="rec-readiness">—</span>
+  </section>
+
+  <div class="dialogue-grid">
+    <div class="column">
+
+      <!-- Панель 1 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">01</span>
+          <div>
+            <h2>ДИАЛОГ</h2>
+            <p>Текст разбирает тот же парсер, что и в «Озвучке диалога»: роли определяются автоматически.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="row" style="margin-bottom: 12px">
+            <label class="field" style="flex: 1 1 200px; margin: 0">
+              <span>Имя проекта</span>
+              <input type="text" id="rec-name" autocomplete="off" placeholder="Например: Интервью" />
+            </label>
+            <label class="field" style="flex: 0 1 240px; margin: 0">
+              <span>Сохранённые проекты</span>
+              <select id="rec-project-select"></select>
+            </label>
+          </div>
+          <textarea id="rec-dialogue" spellcheck="false"
+            placeholder="АРТЕМ: Привет! Как дела?&#10;МАРГО: И тебе привет."></textarea>
+          <div class="row" style="margin-top: 12px">
+            <button class="primary" id="rec-btn-apply">Создать проект</button>
+            <button class="tiny ghost" id="rec-btn-reparse" hidden>разобрать заново</button>
+            <button class="tiny ghost" id="rec-btn-reload-projects">обновить список</button>
+            <button class="tiny ghost danger" id="rec-btn-delete" hidden>удалить проект</button>
+          </div>
+          <div class="row between" style="margin-top: 10px">
+            <span class="muted" id="rec-summary">Проект не открыт</span>
+            <span class="muted" id="rec-source-state"></span>
+          </div>
+          <div class="alert error" id="rec-dialogue-error"></div>
+          <p class="hint muted">
+            Разметка та же, что в «Озвучке диалога»: имени-метка <code>АРТЕМ: Привет!</code>
+            или маркер слота <code>(1)</code>. Слоты здесь означают только спикера — голос
+            назначается роли в панели ниже, — поэтому записывать можно в любом порядке,
+            а смонтирован диалог будет в исходном.
+            Разбор идёт <b>сразу</b> при создании; повторное «Разобрать диалог» переразбирает
+            текст и <b>сохраняет уже записанные дубли</b> тех реплик, чей номер не изменился.
+          </p>
+        </div>
+      </section>
+
+      <!-- Панель 2 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">02</span>
+          <div>
+            <h2>РОЛИ И ГОЛОСА</h2>
+            <p>Голос — это набор обработки записи, а не модель: сырые дубли он не меняет.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="rec-roles" class="muted">Разберите диалог — появятся роли.</div>
+          <div class="alert error" id="rec-roles-error"></div>
+          <audio id="rec-preview-player" controls hidden></audio>
+          <p class="hint muted">
+            «Прослушать обработку» собирает превью из <b>сырого</b> дубля роли с текущими
+            ползунками — в том числе несохранёнными. Настройки применяются при монтаже,
+            а сам дубль остаётся неизменным: перезапись обработки не портит оригинал.
+          </p>
+        </div>
+      </section>
+
+      <!-- Панель 3 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">03</span>
+          <div>
+            <h2>ЗАПИСЬ</h2>
+            <p>Одна реплика — сколько угодно дублей; лучший выбирается вручную.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="view-switch" id="rec-order" role="tablist">
+            <button class="tiny ghost active" data-order="dialogue" role="tab">По диалогу</button>
+            <button class="tiny ghost" data-order="roles" role="tab">По ролям</button>
+          </div>
+
+          <div class="card" id="rec-replica-card">
+            <div class="row between">
+              <span class="replica-label" id="rec-replica-label">—</span>
+              <span class="muted" id="rec-replica-progress"></span>
+            </div>
+            <blockquote class="ref-phrase" id="rec-replica-text">Диалог не разобран.</blockquote>
+            <div class="row">
+              <button class="tiny ghost" id="rec-btn-prev">← Предыдущая</button>
+              <button class="tiny ghost" id="rec-btn-next">Следующая →</button>
+              <button class="tiny ghost" id="rec-btn-next-missing">Следующая незаписанная</button>
+            </div>
+          </div>
+
+          <label class="field" id="rec-device-field" hidden>
+            <span>Микрофон</span>
+            <select id="rec-device"></select>
+          </label>
+
+          <div class="row between" style="margin-top: 4px">
+            <span class="muted">Уровень записи</span>
+            <span class="muted" id="rec-record-status">—</span>
+          </div>
+          <canvas id="rec-level" width="720" height="46"></canvas>
+
+          <div class="row" style="margin-top: 12px">
+            <label class="field" style="margin: 0">
+              <span>Отсчёт перед записью</span>
+              <select id="rec-countdown">
+                <option value="0">0 секунд</option>
+                <option value="1" selected>1 секунда</option>
+                <option value="2">2 секунды</option>
+                <option value="3">3 секунды</option>
+              </select>
+            </label>
+            <label class="toggle" style="margin: 0">
+              <input type="checkbox" id="rec-autonext" checked />
+              Автопереход к следующей незаписанной
+            </label>
+          </div>
+
+          <div class="row" style="margin-top: 12px">
+            <button class="primary" id="rec-btn-record">● Записать</button>
+            <span class="muted" id="rec-timer">00:00.0</span>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <button class="tiny ghost" id="rec-btn-listen" hidden>▶ Прослушать</button>
+            <button class="tiny ghost" id="rec-btn-rerecord" hidden>Перезаписать</button>
+            <button class="tiny ghost" id="rec-btn-save-take" hidden>Сохранить дубль</button>
+          </div>
+          <audio id="rec-take-player" controls hidden></audio>
+          <div class="alert error" id="rec-record-error"></div>
+          <div class="alert error" id="rec-take-warning"></div>
+
+          <div class="subheading" style="margin-top: 14px">
+            <span>ДУБЛИ РЕПЛИКИ</span>
+          </div>
+          <div id="rec-takes" class="muted">—</div>
+          <audio id="rec-takes-player" hidden></audio>
+          <p class="hint muted">
+            Отсчёт гасит обрезанную первую фонему: микрофон уже открыт, но запись ещё не
+            началась. Уровень подсказывает, не говорите ли вы в тишину или не перегружен
+            ли вход; предупреждение о тихой или перегруженной записи приходит от backend
+            уже после сохранения дубля и ничего не блокирует.
+          </p>
+        </div>
+      </section>
+    </div>
+
+    <div class="column">
+      <!-- Панель 4 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">04</span>
+          <div>
+            <h2>МОНТАЖ</h2>
+            <p>Порядок итогового диалога задаёт исходный текст, а не порядок записи.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="rec-montage" class="muted">Разберите диалог — появится список реплик.</div>
+          <div class="grid-2" style="margin-top: 12px">
+            <label class="field" style="margin: 0">
+              <span class="slider-head">Пауза между репликами <b id="rec-pause-value">400 мс</b></span>
+              <input type="range" id="rec-pause" min="0" max="2000" step="50" value="400" />
+            </label>
+            <label class="field" style="margin: 0">
+              <span>Формат вывода</span>
+              <select id="rec-format">
+                <option value="mp3">MP3</option>
+              </select>
+              <span class="muted">Режим собирает один MP3: так устроен backend.</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 12px">
+            <button class="primary" id="rec-btn-render" disabled>Собрать диалог</button>
+            <span class="muted" id="rec-missing-note"></span>
+            <button class="tiny ghost" id="rec-btn-goto-missing" hidden>Перейти к первой незаписанной</button>
+          </div>
+          <div class="alert error" id="rec-render-error"></div>
+          <p class="hint muted">
+            Кнопка заблокирована, пока у каждой реплики нет активного дубля: диалог
+            собирается только целиком. Пауза вставляется <b>между</b> репликами, а не
+            внутрь записи — тишина по краям дублей срезается перед монтажом, поэтому
+            реальный зазор равен выставленному. Пауза сохраняется в проекте.
+          </p>
+        </div>
+      </section>
+
+      <!-- Панель 5 -->
+      <section class="panel">
+        <div class="panel-title">
+          <span class="number">05</span>
+          <div>
+            <h2>ГОТОВЫЙ ЗВУК</h2>
+            <p>Реплики в исходном порядке, финальные LUFS и лимитер по всему диалогу.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="progress"><div id="rec-render-bar"></div></div>
+          <span class="muted job-line" id="rec-render-status">Диалог ещё не собран</span>
+          <div class="alert error" id="rec-output-error"></div>
+          <audio id="rec-player" controls hidden></audio>
+          <div class="row" style="margin-top: 12px">
+            <a id="rec-download" class="muted" href="#" download hidden>скачать MP3</a>
+            <span class="muted" id="rec-output-meta"></span>
+          </div>
+          <div class="alert info" id="rec-output-warnings"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+</main>
+
 <!-- Вкладка 4: словарь произношения -->
 <main class="tab-panel" id="tab-dictionary" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>
-      <p class="eyebrow">04 · СЛОВАРЬ ПРОИЗНОШЕНИЯ</p>
+      <p class="eyebrow">05 · СЛОВАРЬ ПРОИЗНОШЕНИЯ</p>
       <h1>Словарь <span>//</span> как читать термины</h1>
     </div>
   </section>
@@ -1054,7 +1290,7 @@
 <div class="workspace">
   <section class="section-heading">
     <div>
-      <p class="eyebrow">05 · МЕНЕДЖЕР МОДЕЛЕЙ</p>
+      <p class="eyebrow">06 · МЕНЕДЖЕР МОДЕЛЕЙ</p>
       <h1>Модели <span>//</span> веса, диск и загрузка</h1>
     </div>
     <button class="outline-button" id="btn-reload-models">Обновить</button>

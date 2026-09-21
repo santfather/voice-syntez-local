@@ -58,9 +58,33 @@ DIAGNOSTICS_MAX_AUDIO_MB = float(os.environ.get("TTS_DIAGNOSTICS_MAX_AUDIO_MB", 
 DIAGNOSTICS_LOG_LINES = int(os.environ.get("TTS_DIAGNOSTICS_LOG_LINES", "600"))
 # Лог приложения: run.sh пишет stdout в этот файл. Пустой путь или отсутствующий
 # файл — не ошибка: архив собирается без логов, а причина указывается в README.
+# --- Записи пользователя («Сам себе звукорежиссер») ----------------------------
+# Отдельный каталог, а не `voices/`: там лежат референсы TTS-голосов, и смешивать
+# с ними сырые записи диалога нельзя (и по смыслу, и по жизненному циклу).
+RECORDINGS_DIR = Path(os.environ.get("TTS_RECORDINGS_DIR", BASE_DIR / "recordings"))
+# Пределы загрузки одной записи. Ограничения — часть контракта безопасности:
+# без них один upload может заполнить диск или подвесить декодер.
+MAX_RECORDING_BYTES = int(os.environ.get("TTS_RECORDING_MAX_BYTES", str(64 * 1024 * 1024)))
+MAX_RECORDING_SEC = float(os.environ.get("TTS_RECORDING_MAX_SEC", "300"))
+# Настройки обработки записанного голоса. UI показывает уже (0.75–1.25 и ±6), а
+# backend допускает более широкий диапазон: голову за голову не отвечает, но и не
+# даёт выйти за пределы, где time-stretch и pitch-shift перестают звучать.
+RECORDING_SPEED_RANGE = (
+    float(os.environ.get("TTS_RECORDING_SPEED_MIN", "0.5")),
+    float(os.environ.get("TTS_RECORDING_SPEED_MAX", "2.0")),
+)
+RECORDING_PITCH_RANGE = (
+    float(os.environ.get("TTS_RECORDING_PITCH_MIN", "-12")),
+    float(os.environ.get("TTS_RECORDING_PITCH_MAX", "12")),
+)
+# Формат финального файла записи. Задача фазы — единый MP3, поэтому формат не
+# выбирается пользователем, а зафиксирован; WAV остаётся внутренним мастером.
+RECORDING_OUTPUT_FORMAT = os.environ.get("TTS_RECORDING_FORMAT", "mp3")
+
 LOG_PATH = Path(os.environ.get("TTS_LOG_PATH", BASE_DIR / "logs" / "voice_syntez.log"))
 
 for _d in (
+    RECORDINGS_DIR,
     MODELS_DIR,
     VOICES_DIR,
     OUTPUT_DIR,

@@ -935,3 +935,97 @@ footer b { color: #aaa8b0; font-weight: 400; }
   font-size: 12px;
   margin: 4px 0 8px;
 }
+
+/* --- вкладка «Сам себе звукорежиссер» ----------------------------------------- */
+/* Классы только для того, чего нет в существующих вкладках: список дублей,
+   список монтажа и индикатор уровня. Всё остальное берётся из общих классов
+   (.panel, .card, .field, .toggle, .row, .muted, .primary, .alert). */
+
+#rec-level {
+  display: block;
+  width: 100%;
+  height: 46px;
+  margin-top: 8px;
+  border-radius: 4px;
+}
+
+.take-row,
+.montage-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid #1e1d24;
+  font-size: 11px;
+}
+
+.take-row:last-child,
+.montage-row:last-child { border-bottom: 0; }
+
+.take-row.active { color: var(--lime); }
+
+.take-row .take-id,
+.montage-row .take-id {
+  flex: 0 0 auto;
+  color: var(--muted-2);
+  font: 9px var(--mono);
+}
+
+.take-row .take-dur,
+.montage-row .montage-dur {
+  flex: 0 0 auto;
+  font: 9px var(--mono);
+}
+
+.take-row .take-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--amber);
+  font: 9px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.take-row button { flex: 0 0 auto; }
+
+.montage-row { cursor: pointer; }
+.montage-row:hover { color: var(--text); background: #15151b; }
+
+.montage-mark {
+  flex: 0 0 auto;
+  width: 13px;
+  font: 700 11px var(--mono);
+}
+
+.montage-mark.ok { color: var(--lime); }
+.montage-mark.miss { color: var(--amber); }
+
+.montage-name {
+  flex: 0 0 84px;
+  min-width: 0;
+  color: var(--muted);
+  font: 9px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.montage-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #b9b7c0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Пометка «есть несохранённые изменения»: показывается рядом с кнопкой
+   сохранения и гаснет сразу после PATCH профиля. */
+.profile-hint {
+  margin: 0;
+  color: var(--amber);
+  font: 9px var(--mono);
+}
+
+.profile-hint[hidden] { display: none; }
