@@ -34,7 +34,9 @@ from backend.llm import schemas as schemas_mod
 from backend.llm import versioning
 
 DEFAULT_RESULTS = ROOT / "benchmarks" / "russian_linguistics" / "results" / "full"
-REPORT_PATH = ROOT / "llm_benchmark_report.md"
+# Отчёт лежит рядом со своими результатами, а не в корне проекта: корень держим
+# чистым, а артефакт прогона — часть корпуса, из которого он собран.
+REPORT_PATH = ROOT / "benchmarks" / "russian_linguistics" / "llm_benchmark_report.md"
 # Порядок критериев выбора (Phase 6). Первое отличие решает; задержка — последняя,
 # потому что «быстрее» не значит «правильнее».
 #
