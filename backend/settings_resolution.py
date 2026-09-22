@@ -13,7 +13,7 @@
 from typing import Any
 
 from . import config
-from .engines.base import engine_info
+from .engines.base import ENGINE_MODE_KEY, engine_info
 
 # Слои иерархии; порядок = приоритет, каждое следующее значение перекрывает предыдущее.
 SOURCE_ENGINE = "engine"
@@ -55,6 +55,13 @@ def engine_defaults(engine_id: str) -> dict:
     ручки этого движка, а вызывающему не приходится передавать его отдельно.
     """
     info = engine_info(engine_id)
+    params = {param.name: param.default for param in info.params}
+    if info.modes:
+        # Режим — такая же ручка, как температура: он объявлен паспортом и
+        # перекрывается слоями (голос → слот → реплика), поэтому лежит в том же
+        # словаре. Без этой строки выбор режима не дошёл бы до модели: ниже по
+        # коду в `engine_params` пропускаются только объявленные поля.
+        params[ENGINE_MODE_KEY] = info.default_mode
     return {
         "engine": engine_id,
         "speed": config.DEFAULT_SPEED,
@@ -64,7 +71,7 @@ def engine_defaults(engine_id: str) -> dict:
         "gain_db": config.DEFAULT_GAIN_DB,
         "pitch_semitones": config.DEFAULT_PITCH_SEMITONES,
         "pause_override_ms": None,
-        "engine_params": {param.name: param.default for param in info.params},
+        "engine_params": params,
     }
 
 

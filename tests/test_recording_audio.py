@@ -13,6 +13,10 @@ DeepFilterNet подменяется моками, librosa использует�
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -89,6 +93,42 @@ def test_decode_normalizes_stereo_and_foreign_sample_rate(workspace):
     audio = recording_audio.decode(buffer.getvalue(), ".wav")
     assert audio.ndim == 1, "каналы должны быть сведены в моно"
     assert recording_audio.duration_sec(audio) == pytest.approx(1.0, rel=0.02)
+
+
+def _opus_bytes(seconds: float = 1.0, freq: float = 220.0, source_rate: int = 48000) -> bytes:
+    """WebM/Opus, как его отдаёт браузер: моно при 48 кГц.
+
+    Opus — тот случай, на котором разбор сырых сэмплов pydub даёт неверный
+    результат: ffmpeg выдаёт для него 32-битный float.
+    """
+    timeline = np.arange(int(source_rate * seconds), dtype=np.float32) / source_rate
+    source = 0.3 * np.sin(2 * np.pi * freq * timeline)
+    with tempfile.TemporaryDirectory(prefix="tts-test-opus-") as tmpdir:
+        wav_path = Path(tmpdir) / "source.wav"
+        webm_path = Path(tmpdir) / "take.webm"
+        sf.write(wav_path, source, source_rate, format="WAV")
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav_path),
+             "-c:a", "libopus", "-b:a", "64k", str(webm_path)],
+            check=True,
+            capture_output=True,
+        )
+        return webm_path.read_bytes()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="для opus нужен ffmpeg")
+def test_decode_opus_keeps_duration_and_pitch(workspace):
+    """Запись из браузера — это голос, а не шум вдвое длиннее (§9, §24).
+
+    Для opus (webm/ogg — любой браузерный MediaRecorder) ffmpeg отдаёт сэмплы
+    32-битным float. Если разобрать эти байты как int16, сэмплов становится вдвое
+    больше: секунда записи превращается в две секунды шума. В интерфейсе это
+    выглядело так: браузерное превью дубля звучит верно, а сохранённый файл —
+    иначе, потому что портится он на сервере при декодировании.
+    """
+    audio = recording_audio.decode(_opus_bytes(1.0), ".webm")
+    assert recording_audio.duration_sec(audio) == pytest.approx(1.0, rel=0.05)
+    assert dominant_hz(audio) == pytest.approx(220.0, rel=PITCH_TOLERANCE)
 
 
 # --- 10. Уровень записи ------------------------------------------------------

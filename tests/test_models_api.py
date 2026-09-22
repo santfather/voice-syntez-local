@@ -18,6 +18,9 @@ from backend.engines import registry
 F5_ID = "f5"
 XTTS_ID = "xtts"
 BANANA_ID = "xtts-banana"
+QWEN_BASE_ID = "qwen3-tts-base"
+QWEN_TOKENIZER_ID = "qwen3-tts-tokenizer"
+KOKORO_ID = "kokoro-ru"
 
 
 def write(path, size: int = 64):
@@ -94,7 +97,15 @@ def test_models_endpoint_lists_state_and_disk(models_dir, downloader):
             body = response.json()
             assert {"models", "disk"} <= set(body)
             models = {item["id"]: item for item in body["models"]}
-            assert {F5_ID, XTTS_ID, BANANA_ID, "whisper"} == set(models)
+            assert {
+                F5_ID,
+                XTTS_ID,
+                BANANA_ID,
+                QWEN_BASE_ID,
+                QWEN_TOKENIZER_ID,
+                KOKORO_ID,
+                "whisper",
+            } == set(models)
             assert models[F5_ID]["installed"] is True
             assert models[XTTS_ID]["installed"] is False
             assert models[XTTS_ID]["missing_files"] == ["model.pth", "config.json"]

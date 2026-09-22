@@ -15,15 +15,19 @@ from conftest import StubEngine
 
 from backend import config, model_manager
 from backend.engines import registry
+from backend.engines.base import ENGINE_KOKORO, ENGINE_QWEN
 from backend.model_manager import (
     DOWNLOAD_DONE,
     DOWNLOAD_DOWNLOADING,
     DOWNLOAD_ERROR,
+    DOWNLOAD_SNAPSHOT,
     KIND_CACHE,
     KIND_LOCAL,
     ModelBusyError,
     ModelNotDownloadableError,
     ModelPathError,
+    engine_available,
+    forget_availability,
     get_manager,
     model_specs,
     validate_model_path,
@@ -32,6 +36,7 @@ from backend.model_manager import (
 F5_ID = "f5"
 XTTS_ID = "xtts"
 BANANA_ID = "xtts-banana"
+KOKORO_ID = "kokoro-ru"
 
 
 # --- окружение ----------------------------------------------------------------
@@ -43,6 +48,13 @@ def models_dir(workspace, monkeypatch):
     monkeypatch.setattr(config, "MODELS_DIR", root)
     monkeypatch.setattr(config, "XTTS_BASE_DIR", root / "xtts_v2")
     monkeypatch.setattr(config, "XTTS_BANANA_DIR", root / "xtts_v2_banana")
+    # Qwen3-TTS — две модели; обе обязаны смотреть в tmp_path, иначе проверка
+    # доступности движка читала бы рабочие веса проекта.
+    monkeypatch.setattr(config, "QWEN_BASE_DIR", root / "qwen3_tts_base")
+    monkeypatch.setattr(config, "QWEN_TOKENIZER_DIR", root / "qwen3_tts_tokenizer")
+    # Kokoro-ru — один каталог, но и он обязан смотреть в tmp_path: иначе
+    # установленный в проекте движок выглядел бы готовым в тестах.
+    monkeypatch.setattr(config, "KOKORO_DIR", root / "kokoro_ru")
     monkeypatch.setattr(
         config,
         "CKPT_FILE",
@@ -56,6 +68,9 @@ def models_dir(workspace, monkeypatch):
 def no_created_engines(monkeypatch):
     """Реестр движков пуст: `loaded` не должен подтягиваться из чужих тестов."""
     monkeypatch.setattr(registry, "_instances", {})
+    # Память о доступности движков — модульная (`_availability`): без сброса
+    # тест, создавший файлы модели, влиял бы на все следующие.
+    forget_availability()
     return {}
 
 
@@ -77,6 +92,21 @@ def install_xtts(root: Path, spec_id: str = XTTS_ID) -> None:
     target = base / "model_banana" / "v2.0.2" if spec_id == BANANA_ID else base
     write(target / "model.pth")
     write(target / "config.json")
+
+
+def install_kokoro(root: Path) -> None:
+    """Ставит Kokoro-ru: словарь фонем, два чекпоинта, G2P и голосовые пакеты.
+
+    Проверяются и вложенные файлы: `ru_dict` лежит в `espeak-data/` репозитория,
+    а `*.pt` — в `voices/`, и перечислить их по одному нельзя (см. спек).
+    """
+    target = config.KOKORO_DIR
+    for name in ("config.json", "kokoro-config.json", "ru_g2p.py"):
+        write(target / name)
+    write(target / config.KOKORO_BASE_WEIGHTS)
+    write(target / config.KOKORO_DIMA_WEIGHTS)
+    write(target / "espeak-data" / "ru_dict")
+    write(target / "voices" / f"{config.KOKORO_VOICE_OTHER}.pt")
 
 
 class FakeDownloader:
@@ -178,7 +208,8 @@ def test_banana_checkpoint_is_found_recursively(models_dir, downloader):
 # --- 11. метаданные реестра ---------------------------------------------------
 def test_registry_metadata_matches_config(models_dir):
     specs = {spec.id: spec for spec in model_specs()}
-    assert len(specs) == 4  # f5, xtts, xtts-banana и вспомогательный whisper
+    # f5, xtts, xtts-banana, две модели Qwen3-TTS, Kokoro-ru и вспомогательный whisper
+    assert len(specs) == 7
 
     f5 = specs[F5_ID]
     assert f5.repo_id == config.HF_REPO_ID
@@ -202,6 +233,91 @@ def test_registry_metadata_matches_config(models_dir):
     assert whisper.repo_id == "openai/whisper-large-v3-turbo"
     assert whisper.kind == KIND_CACHE
     assert whisper.engine_id is None
+
+    kokoro = specs[KOKORO_ID]
+    assert kokoro.repo_id == config.KOKORO_REPO_ID
+    assert kokoro.local_dir == config.KOKORO_DIR
+    assert kokoro.engine_id == ENGINE_KOKORO
+    # Состав репозитория не сводится к двум именам: словарь фонем, два чекпоинта,
+    # произносительный словарь, пересобранный `ru_dict` и голосовые пакеты —
+    # отсюда снимок целиком, а не скачивание по одному объявленному файлу.
+    assert kokoro.download_mode == DOWNLOAD_SNAPSHOT
+    assert set(kokoro.required_files) == set(config.KOKORO_REQUIRED_FILES)
+
+
+def test_kokoro_is_one_model_of_its_engine(models_dir, downloader):
+    """Kokoro-ru — единственная модель своего движка: паспорт и реестр согласованы.
+
+    Проверка нужна потому, что доступность движка считается по всем его моделям
+    (`engine_available`): пока ни одной строки Kokoro в реестре нет, движок
+    считался бы недоступным, и пайплайн молча откатывал бы голоса на F5.
+    """
+    assert engine_available(ENGINE_KOKORO) is False
+
+    install_kokoro(models_dir)
+    forget_availability()
+
+    assert engine_available(ENGINE_KOKORO) is True
+    assert state(KOKORO_ID)["missing_files"] == []
+
+
+def test_kokoro_requires_voice_packs(models_dir, downloader):
+    """Голосовые пакеты обязательны: без них встроенный голос не поднять.
+
+    Пакеты лежат в `voices/*.pt` — файлами, а не каталогом весов, поэтому
+    проверка «все файлы на месте» должна их видеть так же, как чекпоинты.
+    """
+    install_kokoro(models_dir)
+    (config.KOKORO_DIR / "voices" / f"{config.KOKORO_VOICE_OTHER}.pt").unlink()
+
+    assert state(KOKORO_ID)["installed"] is False
+    assert "*.pt" in state(KOKORO_ID)["missing_files"]
+    assert engine_available(ENGINE_KOKORO) is False
+
+
+def test_qwen_models_share_one_engine(models_dir):
+    """Две модели Qwen3-TTS — один движок: основание и декодер звука вместе.
+
+    Проверка нужна потому, что доступность движка считается по всем его моделям
+    (`engine_available`): если бы декодер остался без `engine_id`, установленный
+    «наполовину» Qwen выглядел бы готовым к синтезу.
+    """
+    specs = {spec.id: spec for spec in model_specs()}
+    base = specs["qwen3-tts-base"]
+    tokenizer = specs["qwen3-tts-tokenizer"]
+
+    assert base.engine_id == tokenizer.engine_id == ENGINE_QWEN
+    assert base.repo_id == config.QWEN_BASE_REPO_ID
+    assert tokenizer.repo_id == config.QWEN_TOKENIZER_REPO_ID
+    assert base.local_dir == config.QWEN_BASE_DIR
+    assert tokenizer.local_dir == config.QWEN_TOKENIZER_DIR
+    # Веса шардированы: обязателен шаблон, а не имя одного файла.
+    assert base.required_files == ("config.json", "*.safetensors")
+    assert base.download_mode == DOWNLOAD_SNAPSHOT
+    assert tokenizer.download_mode == DOWNLOAD_SNAPSHOT
+
+
+def test_engine_available_requires_all_models(models_dir, monkeypatch):
+    """Движок считается установленным только когда на месте все его модели."""
+    assert engine_available(ENGINE_QWEN) is False
+
+    qwen_files = (config.QWEN_BASE_DIR, config.QWEN_TOKENIZER_DIR)
+    for directory in qwen_files:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.json").write_text("{}", encoding="utf-8")
+        (directory / "model.safetensors").write_bytes(b"weights")
+
+    forget_availability()
+    assert engine_available(ENGINE_QWEN) is True
+
+    (config.QWEN_TOKENIZER_DIR / "model.safetensors").unlink()
+    forget_availability()
+    assert engine_available(ENGINE_QWEN) is False
+
+
+def test_engine_without_models_is_available(models_dir):
+    """Движок без паспорта модели не судится: менеджер о нём ничего не знает."""
+    assert engine_available("неизвестный-движок") is True
 
 
 def test_registry_paths_are_read_at_call_time(models_dir, workspace, monkeypatch):

@@ -190,6 +190,101 @@ XTTS_MAX_REF_SEC = int(os.environ.get("TTS_XTTS_MAX_REF_SEC", "30"))
 # Сколько голосов держать в кеше conditioning latents (по одному набору тензоров на голос).
 XTTS_LATENTS_CACHE_SIZE = int(os.environ.get("TTS_XTTS_LATENTS_CACHE", "8"))
 
+# --- Веса Qwen3-TTS (третий движок синтеза) -----------------------------------
+# Две модели одного семейства, и обе нужны вместе: `-Base` синтезирует и умеет
+# клонирование по 3 с референса, `-Tokenizer-12Hz` превращает её коды в звук.
+# Пути локальные: `qwen-tts` умеет качать веса сам, но тогда первый синтез
+# требует сети, а проект работает офлайн (см. `model_manager`).
+QWEN_BASE_REPO_ID = os.environ.get(
+    "TTS_QWEN_BASE_REPO_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+)
+QWEN_TOKENIZER_REPO_ID = os.environ.get(
+    "TTS_QWEN_TOKENIZER_REPO_ID", "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+)
+QWEN_BASE_DIR = Path(os.environ.get("TTS_QWEN_BASE_DIR", MODELS_DIR / "qwen3_tts_base"))
+QWEN_TOKENIZER_DIR = Path(
+    os.environ.get("TTS_QWEN_TOKENIZER_DIR", MODELS_DIR / "qwen3_tts_tokenizer")
+)
+# Язык проекта. Qwen3-TTS принимает не код, а имя языка («Russian»), и по нему
+# выбирает фонетику: «ru» она бы не поняла и ушла бы в автоопределение.
+QWEN_LANGUAGE = os.environ.get("TTS_QWEN_LANGUAGE", "Russian")
+# Потолок референса в секундах. Модель клонирует по 3 с; длинную запись она
+# обрежет сама, но промпт считается на каждый новый файл, и платить за это
+# минутами записи незачем.
+QWEN_MAX_REF_SEC = int(os.environ.get("TTS_QWEN_MAX_REF_SEC", "15"))
+# Сколько голосов держать в кеше clone-prompt. Промпт — это уже посчитанные
+# фичи референса на устройстве модели, поэтому кеш маленький: у XTTS десяток
+# наборов латентов стоит десятки мегабайт, здесь — сотни.
+QWEN_PROMPT_CACHE_SIZE = int(os.environ.get("TTS_QWEN_PROMPT_CACHE", "4"))
+# Принудительный отказ от MPS. Нужен и для отладки шима, и как аварийный тормоз:
+# если проба устройства ошибается, пользователь должен уметь вернуться на CPU
+# одной переменной, не удаляя модель.
+QWEN_FORCE_CPU_ENV = "TTS_QWEN_FORCE_CPU"
+# Устройство по умолчанию для Qwen, выясненное пробой. `qwen-tts` заявляет
+# только CUDA, а на Apple Silicon остаётся MPS без гарантий: значение ниже —
+# результат прогона `tools/qwen_feasibility.py`, а не предположение.
+QWEN_DEVICE = os.environ.get("TTS_QWEN_DEVICE", "auto")
+# Реализация attention. По умолчанию `eager`: flash-attention требует CUDA, а
+# `sdpa` на MPS работает не для всех масок, и падение внутри модели выглядело бы
+# как «движок сломался». Медленнее — но одинаково предсказуемо на обоих
+# устройствах, а ускорение включается осознанно, после живой пробы.
+QWEN_ATTN_IMPLEMENTATION = os.environ.get("TTS_QWEN_ATTN", "eager")
+
+# --- Веса Kokoro-ru (четвёртый движок синтеза) --------------------------------
+# Русского в официальном Kokoro-82M нет: модель объявляет восемь языков
+# (`a,b,e,f,h,i,p,j,z`), и ни одного славянского среди них нет. Поэтому движок
+# работает на комьюнити-файнтюне `zaakirio/kokoro-ru` — те же 82 млн параметров
+# и 24 кГц, но русская фонетика. Репозиторий скачивается целиком (снапшотом):
+# кроме двух чекпоинтов в нём лежат произносительный словарь `ru_g2p.py`,
+# пересобранный под ударения `espeak-data/` и голосовые пакеты `voices/`, и по
+# отдельным файлам этот набор не собрать.
+KOKORO_REPO_ID = os.environ.get("TTS_KOKORO_REPO_ID", "zaakirio/kokoro-ru")
+KOKORO_DIR = Path(os.environ.get("TTS_KOKORO_DIR", MODELS_DIR / "kokoro_ru"))
+# Код языка для espeak-ng (`misaki_espeak.EspeakG2P(language=...)`), а не для
+# интерфейса: русский здесь единственный, и другого файнтюн не обещает.
+KOKORO_LANGUAGE = os.environ.get("TTS_KOKORO_LANGUAGE", "ru")
+# Два чекпоинта одного релиза: `base` несёт женские голоса (sveta и masha
+# отличаются только голосовым пакетом), `dima` — мужской. Разделение по файлам,
+# а не по голосовым пакетам: пакет задаёт тембр, чекпоинт — обученную на нём
+# модель.
+KOKORO_BASE_WEIGHTS = os.environ.get("TTS_KOKORO_BASE_WEIGHTS", "kokoro-ru-v2-base.pth")
+KOKORO_DIMA_WEIGHTS = os.environ.get("TTS_KOKORO_DIMA_WEIGHTS", "kokoro-ru-v2-dima.pth")
+# Встроенный голос выбирается по полу карточки голоса: пользователь уже ответил
+# на этот вопрос при создании голоса, и вторая ручка «каким из трёх встроенных
+# голосов говорить» была бы вопросом про то же самое. `other` достаётся masha —
+# второй женский пакет того же чекпоинта.
+KOKORO_VOICE_FEMALE = os.environ.get("TTS_KOKORO_VOICE_FEMALE", "sveta")
+KOKORO_VOICE_MALE = os.environ.get("TTS_KOKORO_VOICE_MALE", "dima")
+KOKORO_VOICE_OTHER = os.environ.get("TTS_KOKORO_VOICE_OTHER", "masha")
+# Потолок одной фонемной строки. Контекст `KModel` — 512 позиций, две из них
+# служебные (`assert len(input_ids) + 2 <= context_length`), поэтому более
+# длинный кусок режется по границам слов: без этого длинная реплика падала бы
+# не ошибкой модели, а `AssertionError` внутри неё.
+KOKORO_MAX_PHONEMES = int(os.environ.get("TTS_KOKORO_MAX_PHONEMES", "510"))
+# Сколько голосовых пакетов держать в памяти. Пакет — 510×256 float32 (около
+# 0.5 МБ), но читается с диска `torch.load`; кеш нужен, чтобы не платить за это
+# на каждой реплике.
+KOKORO_VOICE_CACHE_SIZE = int(os.environ.get("TTS_KOKORO_VOICE_CACHE", "4"))
+# Устройство. По умолчанию CPU: файнтюн объявлен CPU-only и измерен на нём
+# (RTF ~0.1), а 82 млн параметров на MPS не выигрывают столько, чтобы платить за
+# непроверенные операции. `mps` — осознанная проба, не режим по умолчанию.
+KOKORO_DEVICE = os.environ.get("TTS_KOKORO_DEVICE", "cpu")
+# Обязательные файлы модели. Список один на двоих — паспорт модели
+# (`model_manager`) и сам движок (`engines/kokoro_engine.py`) проверяют по нему:
+# «установлено» на вкладке «Модели» и успешная загрузка обязаны совпадать, иначе
+# интерфейс обещал бы рабочую модель, которую движок не находит.
+KOKORO_REQUIRED_FILES = (
+    "config.json",  # конфигурация `KModel`: словарь фонем и архитектура
+    "kokoro-config.json",  # словарь фонем для произносительного словаря
+    KOKORO_BASE_WEIGHTS,
+    KOKORO_DIMA_WEIGHTS,
+    "ru_g2p.py",  # произносительный словарь репозитория (ударения через RUAccent)
+    # Пересобранный под ударения словарь espeak-ng: без него ударения теряются
+    # молча, и словарь репозитория отказывается работать — и правильно делает.
+    "ru_dict",
+    "*.pt",  # голосовые пакеты `voices/{sveta,masha,dima}.pt`
+)
+
 # --- Ресурсы ------------------------------------------------------------------
 # Не занимать все P-ядра разом: модель крутится строго последовательно.
 # По умолчанию совпадает с TTS_THREAD_LIMIT (см. блок лимитов потоков в начале файла).
@@ -620,6 +715,22 @@ DEFAULT_XTTS_REPETITION_PENALTY = float(os.environ.get("TTS_XTTS_REPETITION_PENA
 DEFAULT_XTTS_TOP_K = 50
 DEFAULT_XTTS_TOP_P = 0.85
 
+# --- Дефолтные параметры Qwen3-TTS --------------------------------------------
+# Стартовые значения, а не измеренные: у проекта пока нет живого прогона этой
+# модели (ни весов, ни MPS-гарантий), поэтому честная формулировка — «с чего
+# начинать подбор». Диапазоны заданы там, где за их пределами речь распадается:
+# ниже 0.1 модель «залипает» на одном слоге, выше 1.5 — перестаёт держать текст.
+DEFAULT_QWEN_TEMPERATURE = float(os.environ.get("TTS_QWEN_TEMPERATURE", "0.9"))
+DEFAULT_QWEN_TOP_P = float(os.environ.get("TTS_QWEN_TOP_P", "0.9"))
+DEFAULT_QWEN_REPETITION_PENALTY = float(os.environ.get("TTS_QWEN_REPETITION_PENALTY", "1.05"))
+# Потолок генерации: страховка от «разговорившейся» языковой модели, а не
+# регулятор длины реплики. 2048 кодовых кадров при 12 Гц — это ~170 с звука,
+# то есть заведомо больше самого длинного куска (600 знаков).
+DEFAULT_QWEN_MAX_NEW_TOKENS = int(os.environ.get("TTS_QWEN_MAX_NEW_TOKENS", "2048"))
+# Черновик — тот же движок с меньшим потолком: короткие куски пишутся быстрее,
+# а качество клонирования от потолка не зависит.
+QWEN_DRAFT_MAX_NEW_TOKENS = int(os.environ.get("TTS_QWEN_DRAFT_MAX_NEW_TOKENS", "1024"))
+
 # Фраза для прослушивания голоса во вкладке «Голоса»
 DEFAULT_PREVIEW_TEXT = "Привет! Так звучит этот голос в диалоге."
 
@@ -643,6 +754,13 @@ TARGET_RMS_RANGE = (0.02, 0.3)
 # распадается в шум; штраф за повторы ниже 1.0 бессмыслен, выше 20 речь становится рваной.
 XTTS_TEMPERATURE_RANGE = (0.1, 1.5)
 XTTS_REPETITION_PENALTY_RANGE = (1.0, 20.0)
+# Границы ручек Qwen3-TTS: это разброс языковой модели, а не диффузии, поэтому
+# они уже, чем у XTTS, а штраф за повторы считается множителем лог-вероятностей
+# и за 2.0 делает речь рваной (каждое слово «впервые»).
+QWEN_TEMPERATURE_RANGE = (0.1, 1.5)
+QWEN_TOP_P_RANGE = (0.1, 1.0)
+QWEN_REPETITION_PENALTY_RANGE = (1.0, 2.0)
+QWEN_MAX_NEW_TOKENS_RANGE = (256, 8192)
 
 _torch = None
 
@@ -665,3 +783,21 @@ def pick_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def qwen_force_cpu() -> bool:
+    """Запрещён ли MPS для Qwen3-TTS — читается **в момент вызова**.
+
+    Функцией, а не константой: это аварийный переключатель. Если проба MPS
+    оказалась неверной, пользователь возвращает движок на CPU переменной
+    окружения и перезапускает задачу, не удаляя модель и не переустанавливая
+    зависимости. Читать её на импорте значило бы требовать полного перезапуска
+    сервера ради одной настройки одного движка.
+    """
+    return os.environ.get(QWEN_FORCE_CPU_ENV, "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )

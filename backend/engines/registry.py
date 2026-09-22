@@ -22,6 +22,8 @@ from .. import config
 from .base import (
     ENGINE_F5,
     ENGINE_INFOS,
+    ENGINE_KOKORO,
+    ENGINE_QWEN,
     ENGINE_XTTS,
     ENGINE_XTTS_BANANA,
     SynthesisEngine,
@@ -43,6 +45,14 @@ def create_local_engine(engine_id: str) -> SynthesisEngine:
         from .xtts_engine import create_xtts_engine
 
         return create_xtts_engine(engine_id)
+    if engine_id == ENGINE_QWEN:
+        from .qwen_engine import create_qwen_engine
+
+        return create_qwen_engine()
+    if engine_id == ENGINE_KOKORO:
+        from .kokoro_engine import create_kokoro_engine
+
+        return create_kokoro_engine()
     raise ValueError(f"Неизвестный движок синтеза: {engine_id}")
 
 

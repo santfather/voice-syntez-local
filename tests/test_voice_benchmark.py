@@ -24,7 +24,10 @@ from backend.job_queue import JobPayload, JobQueue
 from backend.voices_store import Voice, check_engine
 
 TEXT = "Тестовая фраза для сравнения движков."
-ALL_ENGINES = ["f5", "xtts", "xtts-banana"]
+# Все объявленные в паспортах движки: сравнение по умолчанию берёт именно их,
+# и список обязан совпадать с `ENGINE_INFOS`, иначе «сравнить все» молча
+# пропускало бы движок.
+ALL_ENGINES = ["f5", "xtts", "xtts-banana", "qwen3-tts", "kokoro-ru"]
 
 
 @pytest.fixture(autouse=True)

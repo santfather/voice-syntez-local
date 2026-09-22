@@ -301,28 +301,117 @@ function engineNote(engineId) {
     : `${info.label} · ударения не поддерживаются — текст идёт как есть`;
 }
 
+// Читает ли движок референс голоса. Спрашивается у паспорта, а не у списка id:
+// новый движок без клонирования объявляет это одним полем (см. supports_cloning
+// в backend/engines/base.py), и интерфейсу не нужно про него знать.
+function usesReference(engineId) {
+  const info = engineInfo(engineId);
+  return !info || info.supports_cloning;
+}
+
+// Предупреждение о движке без клонирования: он синтезирует встроенным голосом
+// модели, и записанный референс в синтез не попадает вовсе — пайплайн даже не
+// зовёт резолвер профилей. Молчать об этом нельзя: референс выглядел бы
+// используемым, а его настройки — действующими.
+function cloningNote(engineId) {
+  if (usesReference(engineId)) return '';
+  return `${engineLabel(engineId)} синтезирует встроенным голосом модели — записанный референс не используется`;
+}
+
 const fmtByStep = (value, step) =>
   (step >= 1 ? String(Math.round(value)) : value.toFixed(step < 0.1 ? 2 : 1));
 
+// Режимы работы движка (черновик/качество/эксперимент) объявлены паспортом: у F5 и
+// XTTS их нет, и переключателя им не рисуется — обещать выбор, который ничего не
+// меняет, нельзя. Режим — такая же ручка, как температура: он живёт в том же
+// словаре `engine_params` под ключом `mode` и уходит и в запрос, и в голос.
+function engineModeFor(engineId, values) {
+  const info = engineInfo(engineId);
+  if (!info || !info.modes.length) return '';
+  const raw = values ? values.mode : undefined;
+  if (typeof raw === 'string' && info.modes.some((mode) => mode.id === raw)) return raw;
+  return info.default_mode || info.modes[0].id;
+}
+
+// Пресет выбранного режима: значения объявленных ручек, которые режим ставит сам.
+function modePreset(engineId, values) {
+  const info = engineInfo(engineId);
+  const mode = info && info.modes.find((item) => item.id === engineModeFor(engineId, values));
+  return (mode && mode.overrides) || {};
+}
+
+function engineModesHtml(engineId, values) {
+  const info = engineInfo(engineId);
+  if (!info || !info.modes.length) return '';
+  const current = engineModeFor(engineId, values);
+  const mode = info.modes.find((item) => item.id === current) || {};
+  return `
+    <label class="field">
+      <span>Режим работы</span>
+      <select data-engine-mode>${info.modes
+        .map((item) => `<option value="${esc(item.id)}"${item.id === current ? ' selected' : ''}>${esc(item.label)}</option>`)
+        .join('')}</select>
+      <span class="muted">${esc(mode.hint || '')}</span>
+    </label>`;
+}
+
 // Значения ручек движка: то, что уже сохранено у голоса или набрано в карточке,
-// иначе — дефолт из паспорта. Ручки чужого движка отбрасываются: у XTTS нет
-// nfe_step, а у F5 нет temperature, и тащить их через запрос незачем.
+// иначе — пресет выбранного режима, а за ним дефолт из паспорта. Ручки чужого
+// движка отбрасываются: у XTTS нет nfe_step, а у F5 нет temperature, и тащить их
+// через запрос незачем.
 function engineParamsFor(engineId, values) {
   const info = engineInfo(engineId);
   const result = {};
   if (!info) return result;
+  const preset = modePreset(engineId, values);
   info.params.forEach((param) => {
     const raw = values ? values[param.name] : undefined;
-    result[param.name] = typeof raw === 'number' ? raw : param.default;
+    if (typeof raw === 'number') {
+      result[param.name] = raw;
+      return;
+    }
+    result[param.name] = typeof preset[param.name] === 'number' ? preset[param.name] : param.default;
   });
+  if (info.modes.length) result.mode = engineModeFor(engineId, values);
   return result;
+}
+
+const sameNumber = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b));
+
+// Выбор пользователя: ручки, отличающиеся от базовой линии — пресета режима или
+// дефолта движка. Совпавшее с базовой линией не отправляем и не храним: записать
+// его — значит явно перекрыть пресет выбранного режима, и переключатель режимов
+// не менял бы ничего.
+function chosenEngineParams(engineId, values) {
+  const info = engineInfo(engineId);
+  if (!info) return {};
+  const preset = modePreset(engineId, values);
+  const current = engineParamsFor(engineId, values);
+  const result = {};
+  info.params.forEach((param) => {
+    const baseline = typeof preset[param.name] === 'number' ? preset[param.name] : param.default;
+    if (!sameNumber(current[param.name], baseline)) result[param.name] = current[param.name];
+  });
+  if (info.modes.length) result.mode = engineModeFor(engineId, values);
+  return result;
+}
+
+// Смена режима: ручки, которых пользователь не выбирал, пересчитываются по пресету
+// нового режима. Иначе ползунки показывали бы прошлый режим, а модель считала бы
+// новый. Подобранное руками остаётся и по-прежнему важнее пресета — тот же порядок,
+// что и на бэкенде (дефолты → пресет режима → явные ручки).
+function applyEngineMode(container, engineId, values, modeId) {
+  values.mode = modeId;
+  container.innerHTML = engineParamsHtml(engineId, values);
+  return chosenEngineParams(engineId, readEngineParams(container));
 }
 
 function engineParamsHtml(engineId, values) {
   const info = engineInfo(engineId);
-  if (!info || !info.params.length) return '';
+  const modes = engineModesHtml(engineId, values);
+  if (!info || !info.params.length) return modes;
   const current = engineParamsFor(engineId, values);
-  return `<div class="grid-2">${info.params.map((param) => `
+  return `${modes}<div class="grid-2">${info.params.map((param) => `
     <label class="field">
       <span class="slider-head">${esc(param.label)}
         <b data-param-label="${esc(param.name)}">${fmtByStep(current[param.name], param.step)}</b></span>
@@ -337,6 +426,8 @@ function readEngineParams(container) {
   container.querySelectorAll('[data-engine-param]').forEach((input) => {
     result[input.dataset.engineParam] = parseFloat(input.value);
   });
+  const mode = container.querySelector('[data-engine-mode]');
+  if (mode) result.mode = mode.value;
   return result;
 }
 
@@ -1832,7 +1923,10 @@ function renderVoiceCards() {
     // подзаголовке короткая — расшифровка «ударения/не поддерживаются» ушла в
     // подсказку тега (engineNote).
     const tags = voiceTags(voice)
-      + (voice.ref_text ? '' : '<span class="tag warn" title="Без референс-текста синтез невозможен">нет текста</span>');
+      + (voice.ref_text || !usesReference(voice.engine)
+        ? ''
+        : '<span class="tag warn" title="Без референс-текста синтез невозможен">нет текста</span>');
+    const cloning = cloningNote(voice.engine);
     return `
       <div class="card" data-voice-id="${esc(voice.id)}">
         <div class="voice-top">
@@ -1852,6 +1946,7 @@ function renderVoiceCards() {
         <label class="field">
           <span>Движок синтеза</span>
           <select data-role="engine">${engineOptionsHtml(voice.engine)}</select>
+          ${cloning ? `<span class="muted" data-role="cloning-note">${esc(cloning)}</span>` : ''}
         </label>
 
         <div class="grid-2">
@@ -3639,7 +3734,7 @@ function renderVoiceConfigs() {
     const reset = (field) => resetButtonHtml(item(field), field, '', field, SOURCE_SPEAKER);
     const note = (field) => sourceNoteHtml(item(field), voiceLabel, SOURCE_SPEAKER);
     const noteText = voice
-      ? engineNote(voice.engine)
+      ? [engineNote(voice.engine), cloningNote(voice.engine)].filter(Boolean).join(' · ')
       : 'выберите голос — набор настроек появится под движок этого голоса';
     return `
       <div class="card" data-voice="${esc(key)}">
@@ -5208,13 +5303,23 @@ function renderTextEngineParams() {
   // другой причине (обновился список голосов) значения не сбрасывает.
   const sameVoice = state.textEngineVoice === voice.id;
   state.textEngineVoice = voice.id;
-  state.textEngineParams = engineParamsFor(
+  state.textEngineParams = chosenEngineParams(
     voice.engine,
     sameVoice ? readEngineParams(box) : voice.engine_params,
   );
   box.innerHTML = engineParamsHtml(voice.engine, state.textEngineParams);
-  $('text-engine-note').textContent = engineNote(voice.engine);
+  $('text-engine-note').textContent = [engineNote(voice.engine), cloningNote(voice.engine)]
+    .filter(Boolean)
+    .join(' · ');
   $('text-f5-params').hidden = voice.engine !== ENGINE_F5;
+}
+
+// Ручки сплошного текста: выбор пользователя, без значений, которые и так следуют
+// из режима и дефолтов движка (см. chosenEngineParams). Отправить их явно — значит
+// перекрыть пресет режима, и «черновик» перестал бы отличаться от «качества».
+function readTextEngineParams() {
+  const voice = voiceById($('text-voice').value);
+  return voice ? chosenEngineParams(voice.engine, readEngineParams($('text-engine-params'))) : {};
 }
 
 function updateTextSummary() {
@@ -5320,7 +5425,7 @@ async function renderText() {
     speed: parseFloat($('text-speed').value),
     cfg_strength: parseFloat($('text-cfg').value),
     nfe_step: parseInt($('text-nfe').value, 10),
-    engine_params: readEngineParams($('text-engine-params')),
+    engine_params: readTextEngineParams(),
     gain_db: parseFloat($('text-gain').value),
     pitch_semitones: parseFloat($('text-pitch').value),
     target_rms: parseFloat($('text-rms').value),
@@ -5736,7 +5841,19 @@ function bindEvents() {
   $('text-body').addEventListener('input', () => { updateTextSummary(); updateTextButton(); });
   $('text-voice').addEventListener('change', () => { renderTextEngineParams(); updateTextButton(); });
   $('text-engine-params').addEventListener('input', (event) => {
-    if (event.target.dataset.engineParam) updateEngineParamLabel($('text-engine-params'), event.target);
+    if (event.target.dataset.engineParam) {
+      updateEngineParamLabel($('text-engine-params'), event.target);
+      state.textEngineParams = readTextEngineParams();
+    }
+  });
+  // Смена режима перерисовывает блок: пресет нового режима мог поменять ручки,
+  // и ползунки обязаны показывать то, чем движок читает текст.
+  $('text-engine-params').addEventListener('change', (event) => {
+    if (event.target.dataset.engineMode === undefined) return;
+    const engine = (voiceById($('text-voice').value) || {}).engine;
+    state.textEngineParams = applyEngineMode(
+      $('text-engine-params'), engine, state.textEngineParams, event.target.value,
+    );
   });
   $('btn-render-text').addEventListener('click', renderText);
   $('btn-cancel-text-job').addEventListener('click', cancelTextRender);
@@ -5877,7 +5994,10 @@ function bindEvents() {
     // только запоминаем: запись на бэкенд происходит по отпусканию (change).
     if (event.target.dataset.engineParam) {
       updateEngineParamLabel(card, event.target);
-      cfg.engine_params = readEngineParams(card);
+      cfg.engine_params = chosenEngineParams(
+        (voiceById(card.dataset.voiceId) || {}).engine,
+        readEngineParams(card),
+      );
     }
   });
 
@@ -5939,10 +6059,19 @@ function bindEvents() {
     if (role === 'engine') {
       changeVoiceEngine(card, event.target.value);
     }
+    // Смена режима перерисовывает блок ручек: пресет нового режима мог поменять
+    // их значения, и ползунки обязаны показывать то, чем движок читает текст.
+    if (event.target.dataset.engineMode !== undefined) {
+      const engine = (voiceById(voiceId) || {}).engine;
+      const params = applyEngineMode(card.querySelector('[data-role="engine-params"]'), engine, state.preview[voiceId].engine_params, event.target.value);
+      state.preview[voiceId].engine_params = params;
+      saveVoiceEngineParams(voiceId, params);
+      return;
+    }
     if (event.target.dataset.engineParam) {
       // Значения ручек сохраняются у голоса — это его настройки по умолчанию,
       // карточка слота в диалоге может переопределить их на одну генерацию.
-      const params = readEngineParams(card);
+      const params = chosenEngineParams((voiceById(voiceId) || {}).engine, readEngineParams(card));
       state.preview[voiceId].engine_params = params;
       saveVoiceEngineParams(voiceId, params);
     }

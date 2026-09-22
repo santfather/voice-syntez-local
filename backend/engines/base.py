@@ -32,11 +32,37 @@ SAMPLE_RATE = 24_000
 ENGINE_F5 = "f5"
 ENGINE_XTTS = "xtts"
 ENGINE_XTTS_BANANA = "xtts-banana"
+ENGINE_QWEN = "qwen3-tts"
+ENGINE_KOKORO = "kokoro-ru"
 
 STATE_IDLE = "idle"
 STATE_LOADING = "loading"
 STATE_READY = "ready"
 STATE_FAILED = "failed"
+
+# Режимы работы движка. Это **не** режим проверки качества (`config.QA_MODES`):
+# QA отвечает на вопрос «проверять ли результат», а режим — «насколько дорого и
+# качественно синтезировать». Три ступени одинаковы для всех движков, потому что
+# пользователю нужен один и тот же выбор в интерфейсе, а не своя лестница у
+# каждой модели:
+#
+# * `draft` — черновик: дешевле и быстрее, качество вторично (проверить темп,
+#   прикинуть длину, прогнать длинный диалог «на слух»);
+# * `quality` — рабочий режим: значения, на которых движок проверен;
+# * `experimental` — возможности, которые ещё не подтверждены: они включаются
+#   осознанно, и результат нужно слушать, а не принимать на веру.
+ENGINE_MODE_DRAFT = "draft"
+ENGINE_MODE_QUALITY = "quality"
+ENGINE_MODE_EXPERIMENTAL = "experimental"
+ENGINE_MODES: tuple[str, ...] = (
+    ENGINE_MODE_DRAFT,
+    ENGINE_MODE_QUALITY,
+    ENGINE_MODE_EXPERIMENTAL,
+)
+# Значение `mode` в `engine_params` (см. `SynthesisEngine.synthesize`). Живёт в
+# том же словаре, что и числовые ручки: пайплайну не нужен второй канал, чтобы
+# донести выбор до движка.
+ENGINE_MODE_KEY = "mode"
 
 
 class EngineBusyError(RuntimeError):
@@ -107,8 +133,50 @@ class EngineParam:
 
 
 @dataclass(frozen=True)
+class EngineMode:
+    """Режим работы движка: подпись для интерфейса и числовые переопределения.
+
+    `overrides` — значения **уже объявленных** ручек движка (`EngineParam.name`):
+    черновик почти всегда означает «то же самое, но дешевле» (меньше шагов,
+    ниже потолок длины). Пары, а не словарь: `EngineInfo` неизменяем и хешируем,
+    а словарь в неизменяемой структуре — это изменяемое состояние под видом
+    константы.
+
+    Режим, которому мало числовых ручек (например, «только эмбеддинг спикера»
+    вместо полного клонирования), движок разбирает сам по `params["mode"]`:
+    паспорт объявляет **наличие** режима, а не способ его исполнить.
+    """
+
+    id: str
+    label: str
+    hint: str = ""
+    overrides: tuple[tuple[str, float], ...] = ()
+
+    def overrides_dict(self) -> dict[str, float]:
+        return {name: value for name, value in self.overrides}
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "hint": self.hint,
+            # Переопределения отдаются интерфейсу, потому что режим — это ещё и
+            # значения объявленных ручек: без них карточка показывала бы прошлый
+            # режим, а модель считала бы новый.
+            "overrides": self.overrides_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class EngineInfo:
-    """Паспорт движка: имя, назначение и набор его ручек."""
+    """Паспорт движка: имя, назначение, возможности и набор его ручек.
+
+    Возможности, а не догадки вызывающего кода: пайплайн спрашивает паспорт,
+    нужен ли движку референс (`supports_cloning`) и применимы ли к нему
+    интонационные профили (`supports_prosody_profiles`), вместо того чтобы
+    разветвляться на идентификаторах движков. Новый движок описывается здесь
+    одним словарём данных, без второй реализации пайплайна.
+    """
 
     id: str
     label: str
@@ -122,6 +190,27 @@ class EngineInfo:
     # который обязан знать про сид, не импортируя модуль движка (тот тянет torch
     # и веса). Источник истины один — здесь.
     supports_seed: bool = False
+    # Нужен ли движку референс голоса. `False` — движок работает на собственных
+    # встроенных голосах (пресетах), и пайплайн синтезирует без референса:
+    # резолвер профилей не вызывается вовсе, а не «вызывается и падает».
+    supports_cloning: bool = True
+    # Применимы ли к движку интонационные профили (UPDATE 3). У движка без
+    # клонирования профилей нет по определению: профиль — это запись голоса,
+    # которой у пресетного движка не существует.
+    supports_prosody_profiles: bool = True
+    # Языки, объявленные моделью (коды ISO 639-1). Справочно для интерфейса и
+    # валидации: сам проект синтезирует по-русски, но Kokoro-ru русский умеет
+    # только один, а Qwen3-TTS — десять, и это видимая пользователю разница.
+    languages: tuple[str, ...] = ("ru",)
+    # Движок, на который разрешено откатиться, если файлы этого движка не
+    # установлены. Пусто — отката нет, недоступность движка остаётся ошибкой:
+    # молчаливая подмена одного звучания другим допустима только там, где
+    # автор движка её объявил.
+    fallback_engine: str = ""
+    # Объявленные режимы работы. Пусто — у движка их нет, и интерфейс не
+    # показывает переключатель: обещать выбор, который ничего не меняет, нельзя.
+    modes: tuple[EngineMode, ...] = ()
+    default_mode: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -130,9 +219,22 @@ class EngineInfo:
             "description": self.description,
             "supports_accents": self.supports_accents,
             "supports_seed": self.supports_seed,
+            "supports_cloning": self.supports_cloning,
+            "supports_prosody_profiles": self.supports_prosody_profiles,
+            "languages": list(self.languages),
+            "fallback_engine": self.fallback_engine,
+            "default_mode": self.default_mode,
             "note": self.note,
             "params": [param.to_dict() for param in self.params],
+            "modes": [mode.to_dict() for mode in self.modes],
         }
+
+    def mode(self, mode_id: str | None) -> EngineMode | None:
+        """Объявленный режим по id; неизвестный или пустой — `default_mode`."""
+        wanted = str(mode_id or "").strip() or self.default_mode
+        if not wanted:
+            return None
+        return next((item for item in self.modes if item.id == wanted), None)
 
 
 ENGINE_INFOS: dict[str, EngineInfo] = {
@@ -203,6 +305,155 @@ ENGINE_INFOS: dict[str, EngineInfo] = {
             ),
         ),
     ),
+    ENGINE_QWEN: EngineInfo(
+        id=ENGINE_QWEN,
+        label="Qwen3-TTS 1.7B (Base)",
+        description=(
+            "Клонирование голоса по 3 с референса с сохранением его расшифровки. "
+            "Десять языков, разметку ударений не понимает."
+        ),
+        supports_accents=False,
+        supports_seed=True,
+        languages=(
+            # Порядок — как в карточке модели, а не по алфавиту: первым идёт
+            # язык проекта, дальше — остальные объявленные моделью.
+            "ru",
+            "en",
+            "zh",
+            "ja",
+            "ko",
+            "de",
+            "fr",
+            "pt",
+            "es",
+            "it",
+        ),
+        # Откат разрешён только явно и только по недоступности весов: без этого
+        # голос, настроенный на Qwen, падал бы на каждом куске, пока модель не
+        # скачана, вместо того чтобы честно дочитать диалог основным движком.
+        fallback_engine=ENGINE_F5,
+        note=(
+            "Веса ~4.5 ГБ плюс токенизатор ~0.4 ГБ, лицензия Apache-2.0. "
+            "Отдельный пакет `qwen-tts` с версией transformers ниже проектной — "
+            "ставится без зависимостей поверх шима (см. engines/qwen_engine.py). "
+            "MPS официально не заявлен: устройство выбирается пробой, с откатом на CPU."
+        ),
+        params=(
+            EngineParam(
+                name="temperature",
+                label="Температура — стабильность ↔ живость",
+                default=config.DEFAULT_QWEN_TEMPERATURE,
+                minimum=config.QWEN_TEMPERATURE_RANGE[0],
+                maximum=config.QWEN_TEMPERATURE_RANGE[1],
+                step=0.05,
+                hint="ниже — ровнее и предсказуемее, выше — живее и рискованнее",
+            ),
+            EngineParam(
+                name="top_p",
+                label="Отбор ядра (top-p)",
+                default=config.DEFAULT_QWEN_TOP_P,
+                minimum=config.QWEN_TOP_P_RANGE[0],
+                maximum=config.QWEN_TOP_P_RANGE[1],
+                step=0.05,
+                hint="ниже — уже круг вариантов, выше — разнообразнее",
+            ),
+            EngineParam(
+                name="repetition_penalty",
+                label="Штраф за повторы",
+                default=config.DEFAULT_QWEN_REPETITION_PENALTY,
+                minimum=config.QWEN_REPETITION_PENALTY_RANGE[0],
+                maximum=config.QWEN_REPETITION_PENALTY_RANGE[1],
+                step=0.05,
+                hint="лечит заикание и «залипание» на слоге",
+            ),
+            EngineParam(
+                name="max_new_tokens",
+                label="Потолок длины генерации",
+                default=config.DEFAULT_QWEN_MAX_NEW_TOKENS,
+                minimum=config.QWEN_MAX_NEW_TOKENS_RANGE[0],
+                maximum=config.QWEN_MAX_NEW_TOKENS_RANGE[1],
+                step=256,
+                integer=True,
+                hint="страховка от «разговорившейся» модели, а не регулятор длины",
+            ),
+        ),
+        modes=(
+            EngineMode(
+                id=ENGINE_MODE_DRAFT,
+                label="Черновик",
+                hint="ниже потолок длины: быстрее на длинных репликах, качество то же",
+                overrides=(("max_new_tokens", config.QWEN_DRAFT_MAX_NEW_TOKENS),),
+            ),
+            EngineMode(
+                id=ENGINE_MODE_QUALITY,
+                label="Качество",
+                hint="рабочие значения ручек — на них движок проверен",
+            ),
+            EngineMode(
+                id=ENGINE_MODE_EXPERIMENTAL,
+                label="Эксперимент",
+                hint=(
+                    "клонирование только по эмбеддингу спикера, без его расшифровки: "
+                    "работает без ref_text, но качество клонирования ниже"
+                ),
+            ),
+        ),
+        default_mode=ENGINE_MODE_QUALITY,
+    ),
+    ENGINE_KOKORO: EngineInfo(
+        id=ENGINE_KOKORO,
+        label="Kokoro-ru (встроенные голоса)",
+        description=(
+            "Лёгкий пресетный движок: 82 млн параметров, синтез встроенными голосами "
+            "модели — записанный референс не используется."
+        ),
+        supports_accents=False,
+        # Просодия детерминированная: стилевой вектор выбирается по длине
+        # фонемной строки, поэтому одинаковый текст всегда звучит одинаково — и
+        # «запомнить удачный вариант» здесь нечего.
+        supports_seed=False,
+        # Встроенные голоса (sveta/masha/dima) вместо клонирования: референс не
+        # нужен, а ударения расставляет RUAccent внутри произносительного словаря
+        # модели, поэтому `+`-разметка пайплайна ей не требуется.
+        supports_cloning=False,
+        supports_prosody_profiles=False,
+        note=(
+            "Веса ~0.7 ГБ (два чекпоинта), лицензия весов OpenRAIL, работает на CPU "
+            "(RTF ~0.1). Тёмный тембр и фрикативный призвук в ж/ш/х — известные "
+            "ограничения файнтюна (см. docs/known-issues.md)."
+        ),
+        # Откат объявлен по той же причине, что у Qwen: голос, настроенный на
+        # Kokoro, обязан дочитать диалог, пока весов нет на диске, а не падать на
+        # каждой реплике.
+        fallback_engine=ENGINE_F5,
+        modes=(
+            EngineMode(
+                id=ENGINE_MODE_DRAFT,
+                label="Черновик",
+                hint=(
+                    "фонемизация без RUAccent: ударения расставляет espeak — быстрее, "
+                    "но ошибок в ударениях заметно больше"
+                ),
+            ),
+            EngineMode(
+                id=ENGINE_MODE_QUALITY,
+                label="Качество",
+                hint=(
+                    "рабочий путь: RUAccent расставляет ударения, редукция гласных "
+                    "включена"
+                ),
+            ),
+            EngineMode(
+                id=ENGINE_MODE_EXPERIMENTAL,
+                label="Эксперимент",
+                hint=(
+                    "без редукции гласных (разметка первой версии файнтюна): звучание "
+                    "ближе к написанию, на слух не проверялось"
+                ),
+            ),
+        ),
+        default_mode=ENGINE_MODE_QUALITY,
+    ),
 }
 
 
@@ -220,6 +471,37 @@ def engine_info(engine_id: str) -> EngineInfo:
     return ENGINE_INFOS.get(engine_id) or ENGINE_INFOS[ENGINE_F5]
 
 
+def clamp_params(info: EngineInfo, raw: dict | None) -> dict:
+    """Ручки по границам конкретного паспорта (см. `normalize_engine_params`).
+
+    Отдельно от поиска по id, потому что у самого движка паспорт уже есть
+    (`self.info`), и повторный поиск по глобальному словарю — это лишний шанс
+    разойтись: движок с незарегистрированным id получал бы границы F5.
+    """
+    declared = {param.name: param for param in info.params}
+    result: dict[str, Any] = {}
+    for key, value in (raw or {}).items():
+        param = declared.get(key)
+        result[key] = param.clamp(value) if param else value
+    return result
+
+
+def resolve_mode_id(info: EngineInfo, raw: Any) -> str:
+    """Режим по паспорту (см. `normalize_engine_mode`) — без поиска по id."""
+    if not info.modes:
+        return ""
+    chosen = info.mode(raw)
+    if chosen is None:
+        if str(raw or "").strip():
+            logger.warning(
+                "Движок %s: неизвестный режим «%s» — работаю на значениях по умолчанию",
+                info.id,
+                raw,
+            )
+        return ""
+    return chosen.id
+
+
 def normalize_engine_params(engine_id: str, raw: dict | None) -> dict:
     """Приводит словарь ручек к границам, объявленным движком.
 
@@ -229,12 +511,35 @@ def normalize_engine_params(engine_id: str, raw: dict | None) -> dict:
     оказываются числами в допустимых границах — мусор с фронта или из
     `voices.json` не должен доходить до модели.
     """
-    declared = {param.name: param for param in engine_info(engine_id).params}
-    result: dict[str, Any] = {}
-    for key, value in (raw or {}).items():
-        param = declared.get(key)
-        result[key] = param.clamp(value) if param else value
-    return result
+    return clamp_params(engine_info(engine_id), raw)
+
+
+def normalize_engine_mode(engine_id: str, raw: Any) -> str:
+    """Режим работы движка: объявленный id или `""`, если режимов нет.
+
+    Неизвестный режим не подменяется молча на дефолтный: подмена превратила бы
+    «эксперимент» в «качество», и пользователь слушал бы не то, что выбрал.
+    Значение приводится к пустому, а движок тогда работает на объявленных
+    значениях ручек — то есть на дефолте, но без обещания конкретного режима.
+    """
+    return resolve_mode_id(engine_info(engine_id), raw)
+
+
+def requires_reference(engine_id: str) -> bool:
+    """Нужен ли движку референс голоса (см. `EngineInfo.supports_cloning`)."""
+    return engine_info(engine_id).supports_cloning
+
+
+def fallback_engine(engine_id: str) -> str:
+    """Движок отката по недоступности, объявленный паспортом (`""` — нет отката).
+
+    Откат на самого себя и на неизвестный движок не выдаётся: первый не меняет
+    ничего, второй уронил бы синтез вместо того, чтобы его спасти.
+    """
+    target = engine_info(engine_id).fallback_engine
+    if not target or target == engine_id or target not in ENGINE_INFOS:
+        return ""
+    return target
 
 
 class SynthesisEngine(ABC):
@@ -382,8 +687,34 @@ class SynthesisEngine(ABC):
         return {param.name: param.default for param in self.info.params}
 
     def normalize_params(self, raw: dict | None) -> dict:
-        """Приводит словарь ручек к границам этого движка (см. normalize_engine_params)."""
-        return normalize_engine_params(self.id, raw)
+        """Приводит словарь ручек к границам этого движка (см. clamp_params)."""
+        return clamp_params(self.info, raw)
+
+    def resolve_mode(self, params: dict | None = None) -> str:
+        """Действующий режим: явный выбор в `params` или объявленный дефолт.
+
+        `""` — у движка режимов нет либо выбор непонятен; тогда ручки берутся
+        как есть, без пресета.
+        """
+        return resolve_mode_id(self.info, (params or {}).get(ENGINE_MODE_KEY))
+
+    def _merged_params(self, params: dict) -> dict:
+        """Ручки одного синтеза: дефолты → пресет режима → явные значения.
+
+        Порядок не случаен. Режим — это пресет («то же, но дешевле»), поэтому
+        явно заданная ручка обязана его переопределять: иначе выбранное
+        пользователем значение молча вернулось бы к режимному.
+        """
+        merged: dict[str, Any] = dict(self.defaults())
+        mode_id = self.resolve_mode(params)
+        mode = self.info.mode(mode_id) if mode_id else None
+        if mode is not None:
+            merged.update(self.normalize_params(mode.overrides_dict()))
+        merged.update(self.normalize_params(params))
+        if mode_id:
+            # Движок, которому мало числовых ручек, разбирает режим сам.
+            merged[ENGINE_MODE_KEY] = mode_id
+        return merged
 
     def synthesize(
         self,
@@ -405,7 +736,7 @@ class SynthesisEngine(ABC):
         try:
             if not self.is_loaded:
                 self.load()
-            merged = {**self.defaults(), **self.normalize_params(params)}
+            merged = self._merged_params(params)
             waveform, sample_rate = self._synthesize(
                 text, ref_audio_path, ref_text, float(speed), merged
             )

@@ -19,7 +19,15 @@ from conftest import analyze_project
 from backend import config, main
 from backend.audio_pipeline import RenderSettings, SpeakerSettings, render_dialogue
 from backend.dialogue_parser import Replica
-from backend.engines.base import ENGINE_F5, ENGINE_XTTS
+from backend.engines.base import (
+    ENGINE_F5,
+    ENGINE_MODE_DRAFT,
+    ENGINE_MODE_EXPERIMENTAL,
+    ENGINE_MODE_KEY,
+    ENGINE_MODE_QUALITY,
+    ENGINE_QWEN,
+    ENGINE_XTTS,
+)
 from backend.job_queue import JobQueue
 from backend.settings_resolution import (
     COMMON_FIELDS,
@@ -155,7 +163,44 @@ def test_unknown_parameters_are_ignored():
     assert set(resolved) == set(COMMON_FIELDS)
 
 
-# --- 10: прослушивание и диалог считают одинаково ------------------------------
+# --- 10: режим движка идёт той же дорогой, что и ручки -------------------------
+def test_engine_mode_travels_through_layers():
+    """Режим объявлен паспортом и живёт в том же словаре, что ручки движка.
+
+    Проверка начинается с нижнего слоя: без `mode` в `engine_defaults` он не попал
+    бы в объявленные поля, и выбор из интерфейса не доехал бы до модели — ни из
+    голоса, ни из слота, ни из реплики.
+    """
+    assert engine_defaults(ENGINE_QWEN)["engine_params"][ENGINE_MODE_KEY] == ENGINE_MODE_QUALITY
+
+    from_voice = _resolve(
+        {"engine_params": {ENGINE_MODE_KEY: ENGINE_MODE_DRAFT}}, engine=ENGINE_QWEN
+    )
+    assert from_voice[ENGINE_MODE_KEY] == {
+        "value": ENGINE_MODE_DRAFT,
+        "source": SOURCE_VOICE,
+        "inherited": ENGINE_MODE_QUALITY,
+        "engine_param": True,
+    }
+
+    layered = _resolve(
+        {"engine_params": {ENGINE_MODE_KEY: ENGINE_MODE_DRAFT}},
+        {"engine_params": {ENGINE_MODE_KEY: ENGINE_MODE_QUALITY}},
+        {"engine_params": {ENGINE_MODE_KEY: ENGINE_MODE_EXPERIMENTAL}},
+        engine=ENGINE_QWEN,
+    )
+    assert layered[ENGINE_MODE_KEY]["value"] == ENGINE_MODE_EXPERIMENTAL
+    assert layered[ENGINE_MODE_KEY]["source"] == SOURCE_REPLICA
+    assert layered[ENGINE_MODE_KEY]["inherited"] == ENGINE_MODE_QUALITY
+
+
+def test_modes_of_other_engine_are_not_applied():
+    """У движка без объявленных режимов ключа `mode` нет — обещать нечего."""
+    assert ENGINE_MODE_KEY not in engine_defaults(ENGINE_F5)["engine_params"]
+    assert ENGINE_MODE_KEY not in _resolve({"engine_params": {ENGINE_MODE_KEY: ENGINE_MODE_DRAFT}})
+
+
+# --- 11: прослушивание и диалог считают одинаково ------------------------------
 @pytest.fixture
 def preset_voice(fake_store):
     """Голос с пресетом — то, что пользователь подобрал в «Прослушать»."""

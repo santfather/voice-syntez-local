@@ -23,11 +23,12 @@ from . import (
     take_quality,
     warmup_context,
 )
+from . import model_manager
 from . import short_utterance as su
 from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
 from .dialogue_parser import Replica
-from .engines.base import SAMPLE_RATE, SynthesisEngine
+from .engines.base import SAMPLE_RATE, SynthesisEngine, fallback_engine, requires_reference
 from .engines.registry import created_engines, get_engine
 from .engines.worker_protocol import ERROR_AUDIO, text_fingerprint
 from .pronunciation import active_rules
@@ -706,11 +707,46 @@ def _settings_for(replica: Replica, base: SpeakerSettings) -> SpeakerSettings:
 
 
 def _engine_for(voice: Voice) -> SynthesisEngine:
-    """Движок, выбранный для этого голоса."""
+    """Движок, выбранный для этого голоса.
+
+    Единственное место, где работает откат по недоступности. Откат — не подмена
+    «на похожий»: он срабатывает только когда файлов движка нет на диске (модель
+    не скачана) и только если сам движок объявил, на кого откатываться. Иначе
+    диалог падал бы на каждой реплике до первой загрузки весов, а недоступность
+    выглядела бы как поломка синтеза. Каждый такой случай попадает в лог: молча
+    отрендеренный другим голосом диалог — это то, что нельзя не заметить.
+    """
+    engine_id = str(voice.engine or "")
+    fallback_id = fallback_engine(engine_id)
+    if fallback_id and not model_manager.engine_available(engine_id):
+        logger.warning(
+            "Движок «%s» недоступен (файлы модели не установлены) — голос «%s» "
+            "синтезируется движком «%s». Скачайте модель во вкладке «Модели», "
+            "чтобы услышать выбранное звучание.",
+            engine_id,
+            voice.name,
+            fallback_id,
+        )
+        engine_id = fallback_id
     try:
-        return get_engine(voice.engine)
+        return get_engine(engine_id)
     except ValueError as exc:
         raise ValueError(f"У голоса «{voice.name}» неизвестный движок «{voice.engine}»") from exc
+
+
+def _reference_for(voice: Voice, engine: SynthesisEngine, replica: Replica):
+    """Референс под действующую просодию реплики; `None` — движку он не нужен.
+
+    Пресетный движок (см. `EngineInfo.supports_cloning`) говорит встроенным
+    голосом, и референса у такого голоса просто нет. Спрашивать его у резолвера
+    мало того что бессмысленно — резолвер честно упал бы, не найдя записи, и
+    синтез остановился бы на движке, которому ничего не мешало работать.
+    """
+    if not requires_reference(engine.id):
+        return None
+    return reference_resolver.resolve_prosody(
+        voice, engine.id, replica.prosody_effective, profile_id=replica.reference_profile_id
+    )
 
 
 def engine_for_id(engine_id: str) -> SynthesisEngine:
@@ -866,7 +902,7 @@ async def _load_engines(
 
 
 def _engine_params(
-    tuning: SpeakerSettings, render: RenderSettings, seed: int | None
+    tuning: SpeakerSettings, render: RenderSettings, seed: int | None, gender: str = ""
 ) -> dict:
     """Ручки движка для одного куска.
 
@@ -878,6 +914,11 @@ def _engine_params(
     у него есть. `seed` передаётся только движкам, которые его принимают
     (см. `SynthesisEngine.supports_seed`), и то же значение уходит в карточку
     куска — чтобы вариант можно было воспроизвести, а не только принять.
+
+    `gender` — не ручка движка, а вход пресетного синтеза: Kokoro-ru выбирает по
+    полу встроенный голос, а карточку голоса (`Voice`) движок не видит. Ключ не
+    объявлен ни одной ручкой, поэтому `clamp_params` пропускает его как есть:
+    пресетные движки его читают, остальные не замечают.
     """
     return {
         **tuning.engine_params,
@@ -886,6 +927,7 @@ def _engine_params(
         "target_rms": tuning.target_rms,
         "cross_fade_duration": render.cross_fade_duration,
         "seed": seed,
+        "gender": str(gender or ""),
     }
 
 
@@ -1005,7 +1047,7 @@ async def _synthesize_chunk(
         if seed is not None
         else (random.randrange(config.SEED_MAX) if engine.supports_seed else None)
     )
-    params = _engine_params(tuning, settings, seed)
+    params = _engine_params(tuning, settings, seed, voice.gender)
     ref_audio_path = str(reference.audio_path) if reference is not None else str(voice.audio_path)
     ref_text = reference.ref_text if reference is not None else voice.ref_text
     _log_synthesis_input(
@@ -1982,10 +2024,8 @@ async def render_dialogue(
             # EXCLAMATION`) до движка не доезжал — LLM называла интонацию, а
             # синтез получал референс прежней эмоции. Гарантия «только свой голос»
             # структурная — профили лежат внутри голоса.
-            reference = reference_resolver.resolve_prosody(
-                voice, engine.id, replica.prosody_effective, profile_id=replica.reference_profile_id
-            )
-            references[index - 1] = reference.to_dict()
+            reference = _reference_for(voice, engine, replica)
+            references[index - 1] = reference.to_dict() if reference is not None else None
             warmup: warmup_context.WarmupContext | None = None
             if warmup_enabled:
                 warmup = await asyncio.to_thread(
@@ -2018,8 +2058,10 @@ async def render_dialogue(
                     position=f"{index} из {total}",
                     source_text=replica.text or "",
                     final_text=replica.final_text or "",
-                    reference_audio=Path(reference.audio_path).name,
-                    reference_text=reference.ref_text or "",
+                    reference_audio=(
+                        Path(reference.audio_path).name if reference is not None else ""
+                    ),
+                    reference_text="" if reference is None else (reference.ref_text or ""),
                 )
                 replica_trace.emotion_detected = replica.emotion_detected
                 replica_trace.emotion_override = replica.emotion_override
@@ -2033,14 +2075,15 @@ async def render_dialogue(
                 replica_trace.prosody_pace = getattr(replica, "prosody_pace", "")
                 replica_trace.dialogue_act = getattr(replica, "dialogue_act", "")
                 replica_trace.context_dependency = getattr(replica, "context_dependency", "")
-                replica_trace.reference_profile_id = reference.profile_id
-                # Ключ профиля в терминах §55 — то же значение, что эмоция профиля.
-                replica_trace.reference_profile_key = reference.resolved_emotion
-                replica_trace.reference_requested_profile = reference.requested_emotion
-                replica_trace.reference_resolved_profile = reference.resolved_emotion
-                replica_trace.reference_emotion = reference.resolved_emotion
-                replica_trace.reference_fallback_used = reference.fallback_used
-                replica_trace.reference_fallback_reason = reference.fallback_reason
+                if reference is not None:
+                    replica_trace.reference_profile_id = reference.profile_id
+                    # Ключ профиля в терминах §55 — то же значение, что эмоция профиля.
+                    replica_trace.reference_profile_key = reference.resolved_emotion
+                    replica_trace.reference_requested_profile = reference.requested_emotion
+                    replica_trace.reference_resolved_profile = reference.resolved_emotion
+                    replica_trace.reference_emotion = reference.resolved_emotion
+                    replica_trace.reference_fallback_used = reference.fallback_used
+                    replica_trace.reference_fallback_reason = reference.fallback_reason
 
             started = time.monotonic()
             chunk, seed, qa_outcome, short_run = await _synthesize_checked(
@@ -2178,9 +2221,7 @@ async def synthesize_replica(
     resolved = tuning_for(voice, speaker, replica.overrides)
     engine = _engine_for(voice)
     await asyncio.to_thread(engine.load)
-    reference = reference_resolver.resolve_prosody(
-        voice, engine.id, replica.prosody_effective, profile_id=replica.reference_profile_id
-    )
+    reference = _reference_for(voice, engine, replica)
 
     chunk, seed, qa_outcome, short_run = await _synthesize_checked(
         engine,
@@ -2453,17 +2494,17 @@ def _read_audio(path: Path, output_format: str) -> np.ndarray:
 
         data, sample_rate = sf.read(path, dtype="float32", always_2d=True)
     else:
-        from pydub import AudioSegment
+        # Формат декодирует ffmpeg с явным `s16le`, а не pydub: pydub отдаёт сырые
+        # сэмплы в том формате, который выбрал ffmpeg для вывода, и разрядность
+        # приходится угадывать по ширине сэмпла. Для opus — а это любая запись из
+        # браузера (webm/ogg) — ffmpeg выдаёт 32-битный float, и разбор его как
+        # int16 давал вдвое больше сэмплов: девятисекундная реплика превращалась в
+        # девятнадцать секунд шума. Именно поэтому дубли во вкладке записи звучали
+        # иначе, чем браузерное превью той же записи (§24).
+        from .audio_analysis import load_mono
 
-        segment = AudioSegment.from_file(path, format=output_format)
-        sample_rate = segment.frame_rate
-        channels = max(1, int(segment.channels))
-        data = (
-            np.frombuffer(segment.raw_data, dtype=np.int16)
-            .astype(np.float32)
-            .reshape(-1, channels)
-            / 32768.0
-        )
+        audio, _ = load_mono(path, output_format, target_sr=SAMPLE_RATE)
+        return np.ascontiguousarray(audio, dtype=np.float32)
 
     audio = np.asarray(data, dtype=np.float32)
     if audio.ndim == 2 and audio.shape[1] > 1:

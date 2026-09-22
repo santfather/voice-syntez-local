@@ -30,7 +30,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import config
-from .engines.base import ENGINE_F5, ENGINE_XTTS, ENGINE_XTTS_BANANA, engine_info
+from .engines.base import (
+    ENGINE_F5,
+    ENGINE_KOKORO,
+    ENGINE_QWEN,
+    ENGINE_XTTS,
+    ENGINE_XTTS_BANANA,
+    engine_info,
+)
 from .engines.registry import created_engines
 
 logger = logging.getLogger(__name__)
@@ -39,6 +46,15 @@ logger = logging.getLogger(__name__)
 KIND_LOCAL = "local"
 # Модель, живущая в кеше `huggingface_hub` (её качает сама библиотека модели).
 KIND_CACHE = "cache"
+
+# Как скачивается репозиторий:
+#   `files` — по одному объявленному файлу (`hf_hub_download`);
+#   `snapshot` — весь репозиторий по шаблонам (`snapshot_download`).
+# Второй режим нужен там, где состав файлов не сводится к двум именам: веса
+# Qwen3-TTS публикуются шардами, и перечислить их заранее нельзя — «скачать
+# model.safetensors» на таком репозитории просто падает.
+DOWNLOAD_FILES = "files"
+DOWNLOAD_SNAPSHOT = "snapshot"
 
 # Состояния скачивания. `idle` — «ничего не происходило», `interrupted` —
 # процесс упал или был прерван, не доведя дело до конца.
@@ -96,6 +112,8 @@ class ModelSpec:
     approx_size_bytes: int
     engine_id: str | None
     kind: str = KIND_LOCAL
+    # `files` или `snapshot` — см. DOWNLOAD_FILES/DOWNLOAD_SNAPSHOT.
+    download_mode: str = DOWNLOAD_FILES
 
     def to_dict(self) -> dict:
         return {
@@ -107,6 +125,7 @@ class ModelSpec:
             "approx_size_bytes": self.approx_size_bytes,
             "engine_id": self.engine_id,
             "kind": self.kind,
+            "download_mode": self.download_mode,
         }
 
 
@@ -205,6 +224,60 @@ def model_specs() -> tuple[ModelSpec, ...]:
             required_files=("model.pth", "config.json"),
             approx_size_bytes=5_200_000_000,
             engine_id=ENGINE_XTTS_BANANA,
+        ),
+        ModelSpec(
+            id="qwen3-tts-base",
+            label=engine_info(ENGINE_QWEN).label,
+            description=(
+                "Клонирование голоса по 3 с референса с его расшифровкой, 10 языков. "
+                "Веса публикуются шардами, поэтому качаются снапшотом репозитория."
+            ),
+            repo_id=config.QWEN_BASE_REPO_ID,
+            local_dir=config.QWEN_BASE_DIR,
+            # Шаблон, а не имя файла: 1.7B в один safetensors не влезает, и
+            # точный список шардов зависит от ревизии репозитория.
+            required_files=("config.json", "*.safetensors"),
+            approx_size_bytes=4_500_000_000,
+            engine_id=ENGINE_QWEN,
+            download_mode=DOWNLOAD_SNAPSHOT,
+        ),
+        ModelSpec(
+            id="qwen3-tts-tokenizer",
+            label="Qwen3-TTS Tokenizer 12Hz",
+            description=(
+                "Декодер звука для Qwen3-TTS: превращает кодовые кадры модели в waveform. "
+                "Нужен вместе с основанием — по отдельности ни один из них не работает."
+            ),
+            repo_id=config.QWEN_TOKENIZER_REPO_ID,
+            local_dir=config.QWEN_TOKENIZER_DIR,
+            required_files=("config.json", "*.safetensors"),
+            approx_size_bytes=400_000_000,
+            engine_id=ENGINE_QWEN,
+            download_mode=DOWNLOAD_SNAPSHOT,
+        ),
+        ModelSpec(
+            id=ENGINE_KOKORO,
+            label=engine_info(ENGINE_KOKORO).label,
+            description=(
+                "Пресетный движок на встроенных голосах: русский файнтюн Kokoro-82M "
+                "(~82 млн параметров, CPU)."
+            ),
+            repo_id=config.KOKORO_REPO_ID,
+            local_dir=config.KOKORO_DIR,
+            # Набор файлов общий с движком (`config.KOKORO_REQUIRED_FILES`): в
+            # репозитории лежат не только веса, но и голосовые пакеты, словарь
+            # ударений и произносительный словарь — без любого из них движок не
+            # поднимается, и «установлено» обязано значить именно это.
+            required_files=config.KOKORO_REQUIRED_FILES,
+            # Размер с запасом: кроме двух чекпоинтов (~0.65 ГБ) репозиторий несёт
+            # ONNX-экспорты тех же весов под onnxruntime/transformers.js, которые
+            # проект не использует, но снапшот забирает целиком.
+            approx_size_bytes=1_800_000_000,
+            engine_id=ENGINE_KOKORO,
+            # Снапшотом, а не по файлам: набор (словарь espeak-ng, голосовые
+            # пакеты, `ru_g2p.py`) по именам не перечислить, а каталоги
+            # `espeak-data/` и `voices/` нужны целиком.
+            download_mode=DOWNLOAD_SNAPSHOT,
         ),
         ModelSpec(
             id="whisper",
@@ -307,6 +380,53 @@ def missing_files(spec: ModelSpec, path: Path | None = None) -> list[str]:
         return _missing_cache_files(spec)
     root = Path(path) if path is not None else spec.local_dir
     return [pattern for pattern in spec.required_files if _match_required(root, pattern) is None]
+
+
+# Как долго помнить ответ «файлы движка на месте». Файловая проверка дешёвая, но
+# не бесплатная: она идёт на каждую реплику, а реплик в диалоге десятки, и у
+# установленной модели `rglob` по каталогу с шардами на 4.5 ГБ — это обход
+# дерева на каждой реплике. Полминуты — компромисс: скачивание модели видно
+# почти сразу, а горячий цикл рендера не читает диск повторно.
+AVAILABILITY_TTL_SEC = 30.0
+_availability: dict[str, tuple[float, bool]] = {}
+_availability_lock = threading.Lock()
+
+
+def forget_availability(engine_id: str | None = None) -> None:
+    """Сбрасывает память о доступности движка (после скачивания или удаления)."""
+    with _availability_lock:
+        if engine_id is None:
+            _availability.clear()
+        else:
+            _availability.pop(engine_id, None)
+
+
+def engine_available(engine_id: str) -> bool:
+    """Установлены ли файлы движка — без сети и без поднятия модели.
+
+    У движка может быть несколько моделей (у Qwen3-TTS их две: основание и
+    декодер звука), и движок доступен только когда на месте все. Движок без
+    паспорта модели считается доступным: судить о нём менеджер моделей не может,
+    а запрещать синтез по незнанию — хуже, чем разрешить.
+    """
+    specs = [spec for spec in model_specs() if spec.engine_id == engine_id]
+    if not specs:
+        return True
+    now = time.monotonic()
+    with _availability_lock:
+        remembered = _availability.get(engine_id)
+        if remembered is not None and now - remembered[0] < AVAILABILITY_TTL_SEC:
+            return remembered[1]
+    try:
+        available = all(not missing_files(spec) for spec in specs)
+    except (ModelPathError, OSError) as exc:
+        # Неверный путь — это «модель не установлена», а не ошибка синтеза:
+        # пользователь увидит причину в состоянии модели.
+        logger.warning("Не удалось проверить файлы движка %s: %s", engine_id, exc)
+        available = False
+    with _availability_lock:
+        _availability[engine_id] = (now, available)
+    return available
 
 
 def required_paths(spec: ModelSpec, path: Path | None = None) -> list[Path]:
@@ -689,11 +809,22 @@ class ModelManager:
         with _download_lock:
             spec.local_dir.mkdir(parents=True, exist_ok=True)
             reported_at = 0.0
-            for filename in spec.required_files:
-                if _match_required(spec.local_dir, filename) is not None:
-                    continue  # файл уже на месте — докачиваем только недостающее
-                _hf_download(spec.repo_id, filename, spec.local_dir)
-                reported_at = self._update_progress(spec, started_at, reported_at, baseline)
+            if spec.download_mode == DOWNLOAD_SNAPSHOT:
+                # Репозиторий целиком: рядом с весами лежат конфиги токенизатора и
+                # препроцессора, и скачивание «по объявленным шаблонам» оставило бы
+                # модель без половины файлов. Прогресс обновляется по факту, а не
+                # по ходу: `snapshot_download` не отдаёт промежуточных байтов.
+                if missing_files(spec, spec.local_dir):
+                    _hf_snapshot(spec.repo_id, spec.local_dir)
+                self._update_progress(spec, started_at, reported_at, baseline)
+            else:
+                for filename in spec.required_files:
+                    if _match_required(spec.local_dir, filename) is not None:
+                        continue  # файл уже на месте — докачиваем только недостающее
+                    _hf_download(spec.repo_id, filename, spec.local_dir)
+                    reported_at = self._update_progress(
+                        spec, started_at, reported_at, baseline
+                    )
 
             missing = missing_files(spec, spec.local_dir)
             if missing:
@@ -745,6 +876,11 @@ class ModelManager:
     ) -> None:
         forget_dir_size(spec.local_dir)
         downloaded = sum(dir_size(found, follow_symlinks=True) for found in required_paths(spec))
+        if spec.engine_id:
+            # Скачивание меняет ответ на вопрос «доступен ли движок», и ждать
+            # истечения памяти о доступности тут нельзя: пользователь нажал
+            # «скачать» именно чтобы движок заработал.
+            forget_availability(spec.engine_id)
         self._set_download(
             spec.id,
             DownloadState(
@@ -785,6 +921,8 @@ class ModelManager:
         forget_dir_size(path)
         with self._lock:
             self._states.pop(model_id, None)
+        if spec.engine_id:
+            forget_availability(spec.engine_id)
         logger.info("Модель %s удалена (%s байт)", model_id, freed)
         return {"deleted": model_id, "freed_bytes": freed, "state": self.state(spec).to_dict()}
 
@@ -817,6 +955,19 @@ def _hf_download(repo_id: str, filename: str, local_dir: Path) -> Path:
     return Path(hf_hub_download(repo_id, filename, local_dir=str(local_dir)))
 
 
+def _hf_snapshot(repo_id: str, local_dir: Path) -> None:
+    """Вторая (и последняя) точка сети: репозиторий целиком, одной операцией.
+
+    Мокается тестами так же, как `_hf_download`: обе функции — тонкие обёртки
+    над `huggingface_hub`, и вся логика менеджера живёт выше, проверяемая без
+    сети.
+    """
+    from huggingface_hub import snapshot_download
+
+    logger.info("Скачиваю снапшот %s в %s", repo_id, local_dir)
+    snapshot_download(repo_id, local_dir=str(local_dir))
+
+
 _manager: ModelManager | None = None
 _manager_lock = threading.Lock()
 
@@ -840,3 +991,4 @@ def reset_manager() -> None:
         _active_downloads.clear()
     with _size_cache_lock:
         _size_cache.clear()
+    forget_availability()
