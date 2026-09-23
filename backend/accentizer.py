@@ -75,7 +75,15 @@ class Accentizer:
 
     def __init__(self) -> None:
         self._accent = None
+        # Два разных лока, а не один: загрузка модели и её инференс — разные
+        # критические секции. Общий лок держал бы загрузку в очереди за чужим
+        # инференсом, хотя грузить модель и считать ударения можно параллельно.
         self._lock = threading.Lock()
+        # Модель RUAccent — один объект на процесс, и её инференс не потокобезопасен:
+        # два одновременных вызова делят внутреннее состояние и портят результат.
+        # Параллельные запросы (реплика проекта, preview, предложения для словаря)
+        # сериализуются здесь — ровно так же, как `_infer_lock` у движков синтеза.
+        self._infer_lock = threading.Lock()
         self._state = STATE_IDLE
         self._last_error: str | None = None
         self._retry_after = 0.0
@@ -153,9 +161,13 @@ class Accentizer:
         if not self.load():
             return text
         try:
-            if manual:
-                return self._accent_between_manual(text)
-            return self._accent.process_all(text)
+            # Весь инференс — под локом: `_accent_between_manual` зовёт модель по
+            # сегментам, и без общей секции сегменты одной реплики перемешались бы
+            # с сегментами соседнего запроса.
+            with self._infer_lock:
+                if manual:
+                    return self._accent_between_manual(text)
+                return self._accent.process_all(text)
         except Exception as exc:
             self._state = STATE_FAILED
             self._last_error = str(exc)
@@ -205,7 +217,10 @@ class Accentizer:
         result: list[dict] = []
         for sentence in _sentences(text):
             try:
-                entities = model.predict_yo_homographs(sentence)
+                # Тот же лок, что и в `accentuate`: модель одна на процесс, и
+                # параллельный вызов из соседнего запроса испортил бы её состояние.
+                with self._infer_lock:
+                    entities = model.predict_yo_homographs(sentence)
             except Exception as exc:  # noqa: BLE001 — недоступность модели не ошибка
                 logger.warning("Модель ё-омографов не ответила на предложение: %s", exc)
                 continue

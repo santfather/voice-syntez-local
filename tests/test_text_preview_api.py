@@ -371,12 +371,40 @@ def test_preview_rejects_bad_input(voices, fake_accent):
                 ({"project_id": project["id"]}, 400),
                 ({"text": "Привет", "project_id": "нет-проекта", "replica_index": 0}, 404),
                 ({"project_id": project["id"], "replica_index": 99}, 404),
-                ({"text": "x" * (config.MAX_TEXT_CHARS + 1)}, 400),
+                # Свой, более строгий предел preview (F-T4), а не общий лимит рендера.
+                ({"text": "x" * (config.MAX_PREVIEW_CHARS + 1)}, 400),
             ]
             for payload, code in cases:
                 response = await _preview(client, **payload)
                 assert response.status_code == code, (payload, response.text)
                 assert response.json()["detail"]
+
+    _run(scenario)
+
+
+def test_preview_limit_is_stricter_than_rendering(voices, fake_accent):
+    """Preview ограничен строже рендера: 50 000 знаков в синхронный разбор не уходят.
+
+    Стадии preview считает та же функция, что и синтез, но их ждут глазами в
+    интерфейсе, а ударения к тому же уходят в RUAccent — одну модель на процесс.
+    Поэтому у preview свой предел, и текст, который рендер принял бы, preview
+    отклоняет с понятным сообщением (F-T4). Реплика проекта в этот предел
+    укладывается всегда: её длина ограничена лимитом реплики.
+    """
+    async def scenario():
+        async with _client() as client:
+            assert config.MAX_PREVIEW_CHARS < config.MAX_TEXT_CHARS
+
+            over = await _preview(
+                client, text="x" * (config.MAX_PREVIEW_CHARS + 1), voice_id=F5_VOICE
+            )
+            assert over.status_code == 400, over.text
+            assert str(config.MAX_PREVIEW_CHARS) in over.json()["detail"]
+
+            # В пределах своего лимита preview работает как раньше.
+            within = await _preview(client, text="Привет, мир! " * 20, voice_id=F5_VOICE)
+            assert within.status_code == 200, within.text
+            assert within.json()["engine"] == ENGINE_F5
 
     _run(scenario)
 

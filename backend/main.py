@@ -2020,6 +2020,12 @@ def _preview_source(payload: TextPreviewRequest) -> tuple[str, str, EngineInfo]:
     Если пришли и `text`, и реплика, текст берётся из запроса, а голос — из
     реплики: панель может проверить произвольную фразу голосом конкретной строки,
     а карточка реплики просто не присылает `text` и получает и то, и другое.
+
+    Длина ограничена строже, чем у рендера (`MAX_PREVIEW_CHARS`, а не
+    `MAX_TEXT_CHARS`): стадии считает та же синхронная функция, что и синтез, а
+    панель ждёт их глазами — 50 000 знаков здесь не «долгий запрос», а зависший
+    интерфейс. Реплика проекта в этот предел укладывается всегда: её длину
+    ограничивает `MAX_REPLICA_CHARS`.
     """
     if payload.replica_index is not None and not payload.project_id:
         raise HTTPException(status_code=400, detail="Для реплики проекта нужен project_id")
@@ -2044,10 +2050,10 @@ def _preview_source(payload: TextPreviewRequest) -> tuple[str, str, EngineInfo]:
             status_code=400,
             detail="Пустой текст: введите текст или выберите непустую реплику проекта",
         )
-    if len(text) > config.MAX_TEXT_CHARS:
+    if len(text) > config.MAX_PREVIEW_CHARS:
         raise HTTPException(
             status_code=400,
-            detail=f"Текст длиннее {config.MAX_TEXT_CHARS} символов — сократите его",
+            detail=f"Текст длиннее {config.MAX_PREVIEW_CHARS} символов — сократите его",
         )
 
     voices: dict = {}
