@@ -6,10 +6,10 @@ JS-раннера в проекте нет, поэтому тест читает
 переформатирование массива, экранированные кавычки и комментарии между элементами,
 но падает с понятной ошибкой, если структура не нашлась.
 
-Файлов два, потому что запись разнесена по смыслу, а не по удобству теста:
-список фраз и мастер живут в модуле записи (`voice-record.js`), а тестовая фраза
-с плотной «ё» и её кнопка-пример остались в точке входа (`app.js`) — ею пользуется
-панель «Что услышит модель», а не мастер записи.
+Файлов три, потому что код разнесён по смыслу, а не по удобству теста:
+список фраз и мастер записи живут в модуле записи (`voice-record.js`), тестовая
+фраза с плотной «ё» и её кнопка-пример — в модуле панели preview
+(`text-preview.js`), а обработчики событий — в точке входа (`app.js`).
 
 Проверяется не «текст совпадает с документом побайтово», а смысл: первые пять фраз
 не тронуты, новых ровно шесть и в порядке документа, в новых есть «ё» и новые
@@ -30,6 +30,7 @@ from backend.text_normalization import normalize
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 APP_JS = PROJECT_ROOT / "frontend" / "app.js"
 VOICE_RECORD_JS = PROJECT_ROOT / "frontend" / "voice-record.js"
+TEXT_PREVIEW_JS = PROJECT_ROOT / "frontend" / "text-preview.js"
 INDEX_HTML = PROJECT_ROOT / "frontend" / "index.html"
 
 # Первые пять фраз — защита от случайной правки работающего списка: они должны
@@ -341,11 +342,11 @@ def record_phrase_profiles() -> list[tuple[str, str]]:
 
 def yo_stress_test_phrase() -> str:
     """Текст `YO_STRESS_TEST_PHRASE`; ошибка, если объявление пропало."""
-    # Фраза осталась в точке входа: ею пользуется панель preview, а не мастер записи.
-    source = _read_source(APP_JS)
+    # Фраза живёт в панели preview: ею пользуется «Что услышит модель», а не запись.
+    source = _read_source(TEXT_PREVIEW_JS)
     match = _YO_DECL.search(source)
     if not match:
-        _fail("не найдено объявление `const YO_STRESS_TEST_PHRASE = '...';`", APP_JS)
+        _fail("не найдено объявление `const YO_STRESS_TEST_PHRASE = '...';`", TEXT_PREVIEW_JS)
     return _decode_js_string(match.group("value"))
 
 
@@ -521,14 +522,18 @@ def test_yo_stress_phrase_restores_yo_without_mutating_source():
 
 # --- 8. Тестовая фраза не предлагается при записи -----------------------------
 def test_yo_stress_phrase_is_not_offered_for_recording():
-    # Панель записи разнесена по двум файлам: список фраз и его заполнение — в модуле
-    # записи, обработчик выбора фразы (кнопка) — в точке входа. Проверяем оба: фраза
-    # не должна оказаться рядом с разметкой записи ни в одном из них.
+    # Панель записи и панель preview разнесены по разным модулям, их обработчики
+    # живут в точке входа. Проверяем все три файла: фраза не должна оказаться
+    # рядом с разметкой записи ни в одном из них.
     sources = {
-        path.name: path.read_text(encoding="utf-8") for path in (VOICE_RECORD_JS, APP_JS)
+        path.name: path.read_text(encoding="utf-8")
+        for path in (VOICE_RECORD_JS, TEXT_PREVIEW_JS, APP_JS)
     }
-    assert "YO_STRESS_TEST_PHRASE" in sources[APP_JS.name], (
+    assert "YO_STRESS_TEST_PHRASE" in sources[TEXT_PREVIEW_JS.name], (
         "константа должна использоваться, а не быть мёртвой"
+    )
+    assert "YO_STRESS_TEST_PHRASE" not in sources[VOICE_RECORD_JS.name], (
+        "в модуле записи тестовой фразы быть не должно"
     )
 
     record_lines = [
@@ -550,8 +555,11 @@ def test_yo_stress_phrase_is_not_offered_for_recording():
 
 
 def test_yo_stress_phrase_is_wired_into_preview_panel():
-    source = APP_JS.read_text(encoding="utf-8")
+    source = TEXT_PREVIEW_JS.read_text(encoding="utf-8")
     assert 'data-role="yo-example"' in source, "в панели preview должна быть кнопка-пример"
     assert "previewEl(mount, 'text').value = YO_STRESS_TEST_PHRASE" in source, (
         "кнопка-пример обязана подставлять тестовую фразу в поле preview"
     )
+    # Сама панель подключена к точке входа: модуль должен быть импортирован, иначе
+    # кнопка-пример существовала бы только в тексте.
+    assert "} from './text-preview.js';" in APP_JS.read_text(encoding="utf-8")
