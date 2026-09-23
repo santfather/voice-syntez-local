@@ -14,6 +14,7 @@ import threading
 import time
 
 import httpx
+import numpy as np
 import pytest
 from conftest import StubEngine, analyze_project
 
@@ -38,6 +39,7 @@ from backend.job_queue import (
     JobStatus,
     QueueOverloadedError,
 )
+from backend.llm import memory_policy as llm_memory
 
 
 def _payload(count: int = 3, pause_ms: int = 300, qa: QaSettings | None = None) -> JobPayload:
@@ -1052,6 +1054,85 @@ def test_watchdog_interrupt_is_an_error_not_a_cancellation(monkeypatch, stub, fa
             follow_up = queue.submit(_payload(count=2))
             assert await _wait_until(lambda: follow_up.status is JobStatus.DONE), follow_up.error
             assert follow_up.cancel_requested is False
+
+    _run(scenario)
+
+
+def test_job_waiting_for_heavy_slot_is_cancelled_without_starting_engine(
+    monkeypatch, stub, fake_store
+):
+    """Отмена во время ожидания тяжёлого слота заканчивает ожидание сразу.
+
+    Пока слот занят чужим LLM-анализом, рендер стоит в ожидании и синтез ещё не
+    начинался. Отмена в этом состоянии не должна ни потеряться (задача осталась
+    бы висеть «в очереди» до конца шага опроса), ни подождать освобождения слота:
+    «отменить» значит «отменить сейчас». Движок при этом не вызывается ни разу —
+    это и есть доказательство, что синтез не начался.
+    """
+    engine, gate = _gated_engine()
+
+    async def scenario():
+        _use_engine(monkeypatch, engine)
+        async with _queue() as queue:
+            # Слот держит не очередь, а «чужой» анализ: именно так его занимает
+            # LLM-задача, и очередь обязана это увидеть через общий gate.
+            with llm_memory.get_gate().hold(llm_memory.HEAVY_LLM, owner="чужой анализ"):
+                waiting = queue.submit(_single("Под слотом"))
+                assert await _wait_until(lambda: "Ожидание" in waiting.message), waiting.message
+                assert waiting.status is JobStatus.QUEUED
+                assert gate.calls == [], "синтез начался, хотя слот занят"
+
+                assert queue.cancel(waiting.id) is not None
+                assert await _wait_until(lambda: waiting.status is JobStatus.CANCELLED), (
+                    waiting.status
+                )
+            # Слот освободился: очередь не встала из-за отменённого ожидания.
+            assert queue.is_busy() is False
+            following = queue.submit(_single("После отмены"))
+            assert await _wait_until(lambda: following.status is JobStatus.DONE), following.error
+            assert gate.calls == ["После отмены"]
+
+    _run(scenario)
+
+
+def test_empty_engine_audio_fails_job_and_keeps_queue_alive(monkeypatch, stub, fake_store):
+    """Движок вернул пустое аудио: задача падает видимо, пустой файл не записан.
+
+    Модель может ответить «ничем» — обрезанный инференс, пустой тензор. Записать
+    такой выход готовым файлом значит тихо подменить звук пустотой: проверка
+    обязана отказать, причина — остаться в задаче, а очередь — продолжить работу,
+    иначе один плохой ответ клинил бы весь дашборд.
+    """
+    engine = StubEngine()
+    original = engine._synthesize
+    returns_empty = {"on": True}
+
+    def flaky_synthesize(text, ref_audio_path, ref_text, speed, params):
+        if returns_empty["on"]:
+            return np.zeros(0, dtype=np.float32), engine.sample_rate
+        return original(text, ref_audio_path, ref_text, speed, params)
+
+    engine._synthesize = flaky_synthesize
+
+    async def scenario():
+        _use_engine(monkeypatch, engine)
+        async with _queue() as queue:
+            job = queue.submit(_single("Пустой выход"))
+            assert await _wait_until(lambda: _terminated(queue, job)), job.message
+
+            assert job.status is JobStatus.ERROR, job.message
+            assert job.error, "причина отказа не названа"
+            # Пустой файл не считается результатом: в output не должно остаться
+            # ни готового трека, ни его транзитных частей.
+            assert job.output_path is None or not job.output_path.exists()
+            assert not list(config.OUTPUT_DIR.glob("*.wav"))
+            assert queue.current_job_id is None
+            assert queue.is_busy() is False
+
+            returns_empty["on"] = False
+            following = queue.submit(_single("После пустого"))
+            assert await _wait_until(lambda: following.status is JobStatus.DONE), following.error
+            assert following.output_path is not None and following.output_path.exists()
 
     _run(scenario)
 

@@ -15,6 +15,7 @@ MP3 декодируется тем же pydub, что и в приложени�
 
 import asyncio
 import io
+import threading
 import time
 
 import numpy as np
@@ -436,6 +437,39 @@ def test_begin_render_refuses_second_start(workspace):
         recording_pipeline.begin_render("project-x")
     recording_pipeline.abort_render("project-x", "проверка")
     assert recording_pipeline.render_state("project-x").status == "error"
+    recording_pipeline.reset_states()
+
+
+def test_concurrent_begin_render_admits_exactly_one(workspace):
+    """Гонка запусков монтажа: замок пропускает ровно один.
+
+    Проверка «монтаж уже идёт» и объявление запуска стоят под одним замком
+    нарочно. Если бы проверка была отдельно от записи, два потока успели бы
+    прочитать «не идёт» и оба пошли бы писать в один и тот же output-файл —
+    второй монтаж затёр бы первый. Здесь потоки стартуют одновременно с барьера,
+    поэтому окно между проверкой и записью у них гарантированно есть.
+    """
+    recording_pipeline.reset_states()
+    outcomes: list[str] = []
+    start = threading.Barrier(8)
+
+    def attempt() -> None:
+        start.wait()
+        try:
+            recording_pipeline.begin_render("project-race")
+            outcomes.append("started")
+        except recording_pipeline.RenderBusyError:
+            outcomes.append("busy")
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("started") == 1, outcomes
+    assert outcomes.count("busy") == 7, outcomes
+    assert recording_pipeline.render_state("project-race").status == "running"
     recording_pipeline.reset_states()
 
 
