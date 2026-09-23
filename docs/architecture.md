@@ -96,7 +96,7 @@ VOICE_SYNTEZ/
 │   │   ├── repositories/    # projects.py, replicas.py, takes.py, pronunciation.py, crashes.py, llm_analyses.py, jobs.py
 │   │   └── store.py         # фасад: транзакции, каскады, файлы вариантов в одном месте
 │   └── config.py            # пути, дефолты, настройки MPS/потоков
-├── frontend/                # index.html + ES-модули: app.js (точка входа), voices.js, timeline.js, project-io.js, voice-record.js + style.css (без сборки), оформление — по ui-design/
+├── frontend/                # index.html + ES-модули: app.js (точка входа), voices.js, timeline.js, project-io.js, voice-record.js, text-render.js + style.css (без сборки), оформление — по ui-design/
 ├── ui-design/               # референс дизайна (Next.js/v0): палитра и вёрстка, в рантайме не используется
 ├── docs/                    # страницы документации (индекс — README.md внутри этого каталога)
 ├── models/                  # веса F5-TTS, XTTS v2, Qwen3-TTS и Kokoro-ru (в git не попадают)
