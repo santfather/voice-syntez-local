@@ -1,5 +1,34 @@
 'use strict';
 
+// Точка входа фронтенда: `index.html` подключает этот файл как `type="module"`.
+// Он держит общий фундамент (состояние, запросы, хелперы движков) и грузит
+// вкладку «Голоса» из voices.js. Связь двусторонняя: карточки голосов зовут
+// перерисовку соседних вкладок через `loadVoices`, а события карточек — отсюда.
+import {
+  cancelJob,
+  setPreviewStatus,
+  renderVoiceCards,
+  addVoiceReference,
+  updateVoiceReference,
+  deleteVoiceReference,
+  benchmarkState,
+  changeVoiceEngine,
+  saveVoiceEngineParams,
+  previewVoice,
+  cancelPreview,
+  saveVoicePreset,
+  toggleBenchmark,
+  runBenchmark,
+  playBenchmarkTake,
+  selectBenchmarkEngine,
+  stopBenchmarkPoll,
+  createVoice,
+  recognizeRefText,
+  updateNewVoiceEngineNote,
+} from './voices.js';
+import { renderTimeline, refreshTimeline, bindTimelineEvents } from './timeline.js';
+import { updateExportButtons, downloadExport, bindExportEvents } from './project-io.js';
+
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -226,7 +255,10 @@ async function api(url, options) {
   let response;
   try {
     response = await fetch(url, options);
-  } catch (_) {
+  } catch (error) {
+    // Отмена запроса вызывающим — не сбой связи: пробрасываем её как есть, иначе
+    // «переключил вкладку» выглядело бы как «сервер упал».
+    if (isAbort(error)) throw error;
     // fetch отклоняется только на сетевом сбое: сервер не запущен или упал.
     // Без этой ветки пользователь видел невнятное «Failed to fetch».
     throw new Error('Бэкенд недоступен: сервер не отвечает. Запустите ./run.sh и обновите страницу.');
@@ -247,6 +279,26 @@ async function api(url, options) {
     throw error;
   }
   return response.status === 204 ? null : response.json();
+}
+
+// --- отмена устаревших запросов (F-W1) ----------------------------------------
+// У каждого вида запроса «в полёте» остаётся только последний. Без этого быстрое
+// переключение вкладок давало «догоняющие» ответы: медленный ответ по прежнему
+// проекту приходил после быстрого по новому и перетирал уже показанное состояние.
+// Замена контроллера в словаре сама чистит предыдущий — держать больше одного на
+// вид и не нужно.
+const inflight = new Map();
+
+function staleSignal(kind) {
+  const previous = inflight.get(kind);
+  if (previous) previous.abort();
+  const controller = new AbortController();
+  inflight.set(kind, controller);
+  return controller.signal;
+}
+
+function isAbort(error) {
+  return Boolean(error) && error.name === 'AbortError';
 }
 
 function showAlert(el, message, kind = 'error') {
@@ -460,12 +512,6 @@ function renderDictionaryEngineOptions() {
   select.value = current;
 }
 
-function updateNewVoiceEngineNote() {
-  const info = engineInfo($('new-voice-engine').value);
-  $('new-voice-engine-note').textContent = info
-    ? `${info.description}${info.note ? ` ${info.note}` : ''}`
-    : '';
-}
 
 function defaultConfig() {
   // Голос не подставляем: одинаковый голос на все слоты — это ровно та ошибка,
@@ -489,27 +535,6 @@ const fmtPitch = (value) => `${value.toFixed(1)} пт`;
 const fmtRms = (value) => value.toFixed(2);
 const fmtPause = (value) => (value === null ? 'общая' : `${value} мс`);
 
-function voiceTags(voice) {
-  const label = voice.gender === 'male' ? 'муж.' : voice.gender === 'female' ? 'жен.' : '—';
-  const tags = [`<span class="tag">${label}</span>`];
-  if (voice.f0_hz) {
-    tags.push(`<span class="tag" title="Измеренная высота тона референса">~${Math.round(voice.f0_hz)} Гц</span>`);
-  }
-  if (voice.is_demo) {
-    const source = voice.demo_source ? `: ${esc(voice.demo_source)}` : '';
-    tags.push(`<span class="tag warn" title="Копия демо-файла F5-TTS${source} — не пользовательская запись">demo</span>`);
-  }
-  if (voice.gender_warning) {
-    tags.push(`<span class="tag warn" title="${esc(voice.gender_warning)}">⚠ проверьте пол</span>`);
-  }
-  if (voice.ref_text_warning) {
-    tags.push(`<span class="tag warn" title="${esc(voice.ref_text_warning)}">⚠ расшифровка</span>`);
-  }
-  if (voice.band_warning) {
-    tags.push(`<span class="tag warn" title="${esc(voice.band_warning)}">⚠ узкая полоса</span>`);
-  }
-  return tags.join('');
-}
 
 // Монограмма в карточке: первые буквы первых двух слов имени (Марго → МА).
 // Служебные символы выкидываются, иначе у имени вида «[demo] REF_EN» в квадрат
@@ -1242,7 +1267,7 @@ function renderDictionary() {
     return;
   }
   box.innerHTML = state.dictionary.map((entry) => `
-    <div class="card dict-rule${entry.enabled ? '' : ' off'}" data-entry-id="${entry.id}">
+    <div class="card dict-rule${entry.enabled ? '' : ' off'}" data-entry-id="${esc(entry.id)}">
       <div class="row between">
         <div class="dict-pair">
           <b>${esc(entry.source)}</b><span class="dict-arrow">→</span><span>${esc(entry.target)}</span>
@@ -1855,746 +1880,6 @@ async function loadVoices() {
   updateGenerateButton();
 }
 
-function previewState(voiceId) {
-  if (!state.preview[voiceId]) {
-    const voice = voiceById(voiceId);
-    // Прослушивание начинается с пресета голоса: это те же настройки, что
-    // достанутся новому диалогу, поэтому подобранное здесь можно сохранить
-    // обратно в голос и получить их по умолчанию.
-    const preset = (voice && voice.preset) || {};
-    state.preview[voiceId] = {
-      speed: preset.speed ?? PARAM_DEFAULTS.speed,
-      cfg_strength: preset.cfg_strength ?? PARAM_DEFAULTS.cfg_strength,
-      nfe_step: preset.nfe_step ?? PARAM_DEFAULTS.nfe_step,
-      // Ручки движка начинаются с сохранённых у голоса — тех же, что уйдут в диалог.
-      engine_params: voice ? { ...voice.engine_params } : {},
-      text: PREVIEW_TEXT,
-    };
-  }
-  return state.preview[voiceId];
-}
-
-// Что сохранено у голоса. Показываем списком, а не подписью «настройки заданы»:
-// пользователь должен видеть, что именно получит новый диалог.
-function presetText(voice) {
-  const preset = voice.preset || {};
-  const parts = [];
-  if (preset.speed !== undefined) parts.push(`скорость ${Number(preset.speed).toFixed(2)}x`);
-  if (preset.cfg_strength !== undefined) parts.push(`CFG ${Number(preset.cfg_strength).toFixed(1)}`);
-  if (preset.nfe_step !== undefined) parts.push(`NFE ${Math.round(preset.nfe_step)}`);
-  return parts.length ? `настройки голоса: ${parts.join(' · ')}` : 'настройки голоса: по умолчанию движка';
-}
-
-// Настройки, подобранные в «Прослушать», становятся пресетом голоса: с них
-// начинается и следующий диалог, и это же значение наследуют слоты и реплики.
-async function saveVoicePreset(voiceId) {
-  const cfg = state.preview[voiceId];
-  if (!cfg) return;
-  showAlert($('voice-error'), '');
-  try {
-    await api(`/api/voices/${voiceId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        preset: { speed: cfg.speed, cfg_strength: cfg.cfg_strength, nfe_step: cfg.nfe_step },
-      }),
-    });
-    await loadVoices();
-    showAlert($('voice-error'), 'Настройки сохранены у голоса: новый диалог начнётся с них', 'info');
-  } catch (error) {
-    showAlert($('voice-error'), error.message);
-  }
-}
-
-function previewCard(voiceId) {
-  return document.querySelector(`#voice-cards [data-voice-id="${voiceId}"]`);
-}
-
-function renderVoiceCards() {
-  const box = $('voice-cards');
-  if (!state.voices.length) {
-    box.innerHTML = '<div class="muted" style="padding:6px 0">Голосов пока нет — загрузите референс-аудио справа.</div>';
-    return;
-  }
-  box.innerHTML = state.voices.map((voice) => {
-    const cfg = previewState(voice.id);
-    const isF5 = voice.engine === ENGINE_F5;
-    // Движок читается по монограмме и тегу справа, поэтому подпись движка в
-    // подзаголовке короткая — расшифровка «ударения/не поддерживаются» ушла в
-    // подсказку тега (engineNote).
-    const tags = voiceTags(voice)
-      + (voice.ref_text || !usesReference(voice.engine)
-        ? ''
-        : '<span class="tag warn" title="Без референс-текста синтез невозможен">нет текста</span>');
-    const cloning = cloningNote(voice.engine);
-    return `
-      <div class="card" data-voice-id="${esc(voice.id)}">
-        <div class="voice-top">
-          <span class="avatar${isF5 ? '' : ' violet'}">${esc(initials(voice.name))}</span>
-          <div class="voice-name">
-            <h3>${esc(voice.name)}</h3>
-            <p data-role="engine-note" title="${esc(engineNote(voice.engine))}">${esc(engineLabel(voice.engine))}</p>
-          </div>
-          <span class="engine-tag${isF5 ? '' : ' violet'}" title="${esc(engineNote(voice.engine))}">${esc(voice.engine.toUpperCase())}</span>
-        </div>
-        <div class="tag-row">
-          ${tags}
-          <button class="tiny ghost danger" data-role="delete" style="margin-left:auto">удалить</button>
-        </div>
-        ${voice.ref_text ? `<div class="ref-text">в референсе: «${esc(voice.ref_text)}»</div>` : ''}
-
-        <label class="field">
-          <span>Движок синтеза</span>
-          <select data-role="engine">${engineOptionsHtml(voice.engine)}</select>
-          ${cloning ? `<span class="muted" data-role="cloning-note">${esc(cloning)}</span>` : ''}
-        </label>
-
-        <div class="grid-2">
-          <label class="field">
-            <span class="slider-head">Скорость речи <b data-role="speed-label">${cfg.speed.toFixed(2)}x</b></span>
-            <input type="range" data-role="speed" min="0.5" max="2" step="0.05" value="${cfg.speed}" />
-          </label>
-          <label class="field" data-role="f5-params" ${isF5 ? '' : 'hidden'}>
-            <span class="slider-head">CFG strength <b data-role="cfg-label">${cfg.cfg_strength.toFixed(1)}</b></span>
-            <input type="range" data-role="cfg" min="1" max="4" step="0.1" value="${cfg.cfg_strength}" />
-          </label>
-        </div>
-
-        <label class="field" data-role="f5-params" ${isF5 ? '' : 'hidden'}>
-          <span>NFE steps — быстрее ↔ качественнее</span>
-          <select data-role="nfe">
-            ${nfeOptions(cfg.nfe_step)}
-          </select>
-        </label>
-
-        <div data-role="engine-params">${engineParamsHtml(voice.engine, cfg.engine_params)}</div>
-
-        <label class="field">
-          <span>Фраза для прослушивания</span>
-          <input type="text" data-role="preview-text" value="${esc(cfg.text)}" />
-        </label>
-
-        <div class="test-row">
-          <button class="tiny primary" data-role="preview">Прослушать</button>
-          <button class="tiny" data-role="save-preset"
-                  title="Записать подобранные настройки в голос — новый диалог начнётся с них">сохранить настройки</button>
-          <button class="tiny ghost danger" data-role="preview-cancel" hidden>Отменить</button>
-          <span class="muted preview-status" data-role="preview-status"></span>
-        </div>
-        <p class="muted preset-state" data-role="preset-state">${esc(presetText(voice))}</p>
-        ${voiceReferencesHtml(voice)}
-        <button class="tiny ghost compare-button" data-role="compare">⇄ Сравнить движки</button>
-        <div class="benchmark-panel" data-role="benchmark" hidden></div>
-        <audio data-role="player" controls hidden></audio>
-      </div>`;
-  }).join('');
-  // Открытые панели сравнения пересобираются: список голосов перечитывается после
-  // правок (например, после выбора движка), и терять результаты на этом нельзя.
-  Object.keys(state.benchmark).forEach((voiceId) => {
-    if (state.benchmark[voiceId].open) renderBenchmarkPanel(voiceId);
-  });
-}
-
-// Референс-профили голоса (UPDATE 3 §16–§19). Один голос — один `voice_id`, но
-// несколько референсов: нейтральный (загруженный при создании) и интонационные.
-// Показываем интонацию, подпись и качество; добавление и удаление — здесь же,
-// потому что «где записать восторг» и «где выбрать голос» — одно место.
-//
-// Список — ровно записываемые профили `PROFILE_KEYS` (§10). Семантических SURPRISE
-// и FEAR здесь нет: под них нет фразы записи, и бэкенд отвергает такой профиль —
-// подставить их в этот список значило бы предлагать выбор, который кончается
-// ошибкой 400. Ручной выбор SURPRISE у реплики остаётся возможным и честно
-// показывается откатом на нейтральный референс (§17).
-const REFERENCE_EMOTIONS = [
-  'NEUTRAL', 'CALM', 'QUESTION', 'NEUTRAL_QUESTION', 'EXCLAMATION', 'DELIGHT',
-  'SAD_SYMPATHETIC', 'IRONIC', 'STRICT', 'ENUMERATION', 'EXCITED',
-];
-
-function voiceReferencesHtml(voice) {
-  const profiles = voice.reference_profiles || [];
-  const rows = profiles.map((profile) => {
-    const quality = profile.quality_status === 'warning'
-      ? `<span class="tag warn" title="${esc(profile.quality_note || 'расшифровка не совпала с записью')}">проверить</span>`
-      : '';
-    const emotion = EMOTION_LABELS[profile.emotion] || profile.emotion;
-    const isBase = profile.id === `${voice.id}-neutral`;
-    const removable = isBase
-      ? '<span class="muted">основной</span>'
-      : `<button class="tiny ghost danger" data-role="reference-delete" data-profile="${esc(profile.id)}">удалить</button>`;
-    // §35: подтверждение открывает профилю автоматический выбор по интонации.
-    // У нейтрального референса флага нет: он и есть сам голос, автоматика берёт
-    // его всегда — подтверждать там нечего. Пока флаг снят, профиль остаётся
-    // рабочим при ручном выборе: сначала benchmark, потом доверие.
-    const auto = profile.emotion === 'NEUTRAL'
-      ? ''
-      : `<label class="muted" title="Разрешить автоматический подбор этого профиля по интонации реплики. Ставьте после прослушивания; без флага профиль доступен только вручную.">
-           <input type="checkbox" data-role="reference-auto" data-profile="${esc(profile.id)}" ${profile.enabled_for_auto ? 'checked' : ''} /> авто
-         </label>`;
-    return `
-      <div class="row between" style="margin-top:6px">
-        <span class="muted">${esc(emotion)} · ${esc(profile.label || '')} ${quality}</span>
-        <span class="row">${auto}${removable}</span>
-      </div>`;
-  }).join('');
-  const options = REFERENCE_EMOTIONS
-    .map((value) => `<option value="${value}">${esc(EMOTION_LABELS[value] || value)}</option>`)
-    .join('');
-  return `
-    <details class="advanced">
-      <summary>Референсы эмоций (${profiles.length})</summary>
-      ${rows || '<div class="muted" style="margin-top:6px">Отдельных эмоциональных записей пока нет.</div>'}
-      <div class="row" style="margin-top:8px">
-        <select data-role="reference-emotion">${options}</select>
-        <button class="tiny" data-role="reference-add">Загрузить запись</button>
-        <input type="file" accept="audio/*" hidden data-role="reference-file" />
-      </div>
-      <span class="muted">
-        Своя запись для эмоции даёт модели нужную интонацию: вопрос, восторг,
-        удивление, испуг. Без неё эмоция озвучивается нейтральным референсом того же
-        голоса — синтез не блокируется, но интонация будет нейтральной. Референс
-        другого голоса не используется никогда. Галочка «авто» разрешает брать
-        профиль автоматически по интонации реплики — ставьте её после того, как
-        послушали запись: без неё профиль выбирается только вручную.
-      </span>
-    </details>`;
-}
-
-async function addVoiceReference(voiceId, emotion, file) {
-  if (!file) return;
-  const form = new FormData();
-  form.append('file', file);
-  form.append('emotion', emotion);
-  form.append('verify_ref_text', 'false');
-  const result = await api(`/api/voices/${voiceId}/references`, { method: 'POST', body: form });
-  return result;
-}
-
-async function deleteVoiceReference(voiceId, profileId) {
-  return api(`/api/voices/${voiceId}/references/${profileId}`, { method: 'DELETE' });
-}
-
-async function updateVoiceReference(voiceId, profileId, changes) {
-  return api(`/api/voices/${voiceId}/references/${profileId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(changes),
-  });
-}
-
-function setPreviewStatus(card, message, isError = false) {
-  const el = card.querySelector('[data-role="preview-status"]');
-  el.textContent = message;
-  el.classList.toggle('err', isError);
-}
-
-// Отменяемость показывается у задачи, которая ещё ждёт или уже синтезируется:
-// у завершённой отменять нечего, и кнопка только сбивала бы с толку.
-async function cancelJob(jobId) {
-  return api(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
-}
-
-function setCancelButton(button, jobId, visible) {
-  if (!button) return;
-  button.hidden = !visible;
-  button.dataset.jobId = visible ? jobId : '';
-  button.disabled = false;
-  button.textContent = 'Отменить';
-}
-
-async function previewVoice(card) {
-  const voiceId = card.dataset.voiceId;
-  const cfg = state.preview[voiceId];
-  const text = card.querySelector('[data-role="preview-text"]').value.trim();
-  showAlert($('voice-error'), '');
-
-  if (!text) { setPreviewStatus(card, 'введите фразу для прослушивания'); return; }
-  if (!state.modelReady) { setPreviewStatus(card, 'модель ещё загружается'); return; }
-  if (state.previewJob) { setPreviewStatus(card, 'дождитесь окончания текущей генерации'); return; }
-
-  setPreviewStatus(card, 'ставлю в очередь…');
-  // Движок голоса может подниматься прямо сейчас — следим за его состоянием в шапке.
-  watchEngines();
-  try {
-    const job = await api('/api/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        voice_id: voiceId,
-        text,
-        speed: cfg.speed,
-        cfg_strength: cfg.cfg_strength,
-        nfe_step: cfg.nfe_step,
-        engine_params: cfg.engine_params,
-      }),
-    });
-    state.previewJob = { jobId: job.job_id, voiceId };
-    setCancelButton(card.querySelector('[data-role="preview-cancel"]'), job.job_id, true);
-    state.previewTimer = setInterval(pollPreview, 1500);
-  } catch (error) {
-    // Ошибку показываем у самой кнопки: иначе сетевой сбой читается как «кнопка не работает»
-    setCancelButton(card.querySelector('[data-role="preview-cancel"]'), '', false);
-    setPreviewStatus(card, error.message, true);
-  }
-}
-
-// Отмена прослушивания: эндпоинт сразу переводит ожидающую задачу в `cancelled`,
-// а идущую просит остановиться на безопасной точке. Опрос не бросаем: статус
-// `cancelled` придёт ответом на ближайший же запрос, и его покажет pollPreview.
-async function cancelPreview(card) {
-  const active = state.previewJob;
-  if (!active) return;
-  const button = card.querySelector('[data-role="preview-cancel"]');
-  if (button) { button.disabled = true; button.textContent = 'Отменяю…'; }
-  try {
-    await cancelJob(active.jobId);
-    setPreviewStatus(card, 'отменяю…');
-  } catch (error) {
-    if (button) { button.disabled = false; button.textContent = 'Отменить'; }
-    setPreviewStatus(card, error.message, true);
-  }
-}
-
-async function pollPreview() {
-  const active = state.previewJob;
-  if (!active) return;
-  const card = previewCard(active.voiceId);
-  if (!card) {  // карточку перерисовали или голос удалили — следить больше не за чем
-    clearInterval(state.previewTimer);
-    state.previewTimer = null;
-    state.previewJob = null;
-    return;
-  }
-  try {
-    const job = await api(`/api/jobs/${active.jobId}`);
-    const button = card.querySelector('[data-role="preview-cancel"]');
-    if (job.status === 'queued') {
-      setPreviewStatus(card, 'в очереди…');
-      setCancelButton(button, active.jobId, true);
-      return;
-    }
-    if (job.status === 'processing') {
-      setPreviewStatus(card, job.cancel_requested ? 'останавливаю…' : 'генерирую…');
-      setCancelButton(button, active.jobId, true);
-      return;
-    }
-    clearInterval(state.previewTimer);
-    state.previewTimer = null;
-    state.previewJob = null;
-    setCancelButton(button, '', false);
-    if (job.status === 'cancelled') {
-      setPreviewStatus(card, 'отменено');
-      return;
-    }
-    if (job.status === 'error') {
-      setPreviewStatus(card, job.error || 'Не удалось синтезировать голос', true);
-      return;
-    }
-    setPreviewStatus(card, `${job.duration_sec} с`);
-    const player = card.querySelector('[data-role="player"]');
-    player.src = `${job.audio_url}?t=${Date.now()}`;
-    player.hidden = false;
-    player.play().catch(() => { /* автоплей может быть заблокирован — плеер виден */ });
-  } catch (error) {
-    clearInterval(state.previewTimer);
-    state.previewTimer = null;
-    state.previewJob = null;
-    setPreviewStatus(card, error.message, true);
-  }
-}
-
-// Смена движка у готового голоса: выбор сохраняется на бэкенде, запись референса
-// не трогается. Ручки прошлого движка к новому не относятся, поэтому бэкенд их
-// сбрасывает (voices_store.update) — перечитываем голоса, чтобы карточка показала
-// набор настроек нового движка.
-async function changeVoiceEngine(card, engineId) {
-  const voiceId = card.dataset.voiceId;
-  showAlert($('voice-error'), '');
-  try {
-    const voice = await api(`/api/voices/${voiceId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ engine: engineId }),
-    });
-    delete state.preview[voiceId];
-    await loadVoices();
-    showAlert($('voice-error'), `Голос «${voice.name}» переведён на ${engineLabel(voice.engine)}`, 'info');
-  } catch (error) {
-    // Селект уже показывает новый движок, которого на бэкенде нет — возвращаем как было.
-    showAlert($('voice-error'), error.message);
-    renderVoiceCards();
-  }
-}
-
-// Ручки движка сохраняются у голоса и работают его настройками по умолчанию:
-// карточка слота в диалоге может их переопределить на одну генерацию.
-async function saveVoiceEngineParams(voiceId, params) {
-  try {
-    await api(`/api/voices/${voiceId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ engine_params: params }),
-    });
-  } catch (error) {
-    showAlert($('voice-error'), error.message);
-  }
-}
-
-// --- сравнение движков --------------------------------------------------------
-// Одна фраза и один reference, разные модели: система показывает время синтеза и
-// WER как справку и ничего не ранжирует — движок выбирает человек кнопкой.
-function benchmarkState(voiceId) {
-  if (!state.benchmark[voiceId]) {
-    state.benchmark[voiceId] = {
-      open: false,
-      text: BENCHMARK_TEXT,
-      engines: [],   // пусто — «все объявленные»; заполняется при открытии панели
-      qa: 'off',
-      runId: null,
-      data: null,
-      busy: false,
-      error: '',
-      timer: null,
-    };
-  }
-  return state.benchmark[voiceId];
-}
-
-function stopBenchmarkPoll(voiceId) {
-  const cfg = state.benchmark[voiceId];
-  if (cfg && cfg.timer) {
-    clearInterval(cfg.timer);
-    cfg.timer = null;
-  }
-}
-
-function benchmarkSeconds(value) {
-  return value === null || value === undefined ? '—' : `${Number(value).toFixed(1)} сек`;
-}
-
-function benchmarkWer(result) {
-  const wer = result.qa ? result.qa.wer : null;
-  return wer === null || wer === undefined ? 'WER: —' : `WER: ${Number(wer).toFixed(2)}`;
-}
-
-function benchmarkRowHtml(voice, result) {
-  const label = esc(result.engine_label || result.engine);
-  if (result.status === 'done') {
-    const chosen = Boolean(voice) && voice.engine === result.engine;
-    return `
-      <div class="benchmark-row">
-        <b class="benchmark-engine">${label}</b>
-        <button class="tiny" data-role="benchmark-play" data-engine="${esc(result.engine)}"
-                data-url="${esc(result.audio_url)}">Play</button>
-        <span class="muted">Render: ${benchmarkSeconds(result.render_sec)}</span>
-        <span class="muted">${benchmarkWer(result)}</span>
-        <button class="tiny${chosen ? '' : ' primary'}" data-role="benchmark-select"
-                data-engine="${esc(result.engine)}" ${chosen ? 'disabled' : ''}>
-          ${chosen ? 'движок голоса' : 'Выбрать этот движок'}
-        </button>
-      </div>`;
-  }
-  // Ошибка движка — строка с её текстом, а не сломанная панель: сравнение
-  // продолжается, и остальные строки остаются на месте.
-  const note = result.error || 'движок не ответил';
-  const kind = result.status === 'skipped' ? 'warn' : 'err';
-  const prefix = result.status === 'skipped' ? 'пропущен' : 'ошибка';
-  return `
-    <div class="benchmark-row">
-      <b class="benchmark-engine">${label}</b>
-      <span class="muted ${kind}">${prefix}: ${esc(note)}</span>
-    </div>`;
-}
-
-function benchmarkResultsHtml(voiceId) {
-  const cfg = benchmarkState(voiceId);
-  const voice = voiceById(voiceId);
-  if (cfg.error && !cfg.busy) return `<div class="alert error show">${esc(cfg.error)}</div>`;
-  if (!cfg.data) {
-    return cfg.busy
-      ? '<p class="muted">Ставлю сравнение в очередь…</p>'
-      : '<p class="muted">Отметьте движки, впишите фразу и нажмите «Сравнить».</p>';
-  }
-  if (!cfg.data.results.length) {
-    return `<p class="muted">${cfg.busy ? 'Синтезирую первый движок…' : 'Ни один движок ещё не ответил.'}</p>`;
-  }
-  return `<div class="benchmark-rows">${cfg.data.results
-    .map((result) => benchmarkRowHtml(voice, result)).join('')}</div>`;
-}
-
-function benchmarkPanelHtml(voiceId) {
-  const cfg = benchmarkState(voiceId);
-  const boxes = Object.values(state.engines).map((info) => `
-    <label class="toggle benchmark-engine-toggle">
-      <input type="checkbox" data-role="benchmark-engine" data-engine="${esc(info.id)}"
-             ${cfg.engines.includes(info.id) ? 'checked' : ''} />
-      ${esc(info.label)}
-    </label>`).join('');
-  const total = Math.max(cfg.engines.length, 1);
-  const done = cfg.data ? cfg.data.results.length : 0;
-  const percent = Math.min(100, Math.round((done / total) * 100));
-  const status = cfg.busy
-    ? `обработано ${done} из ${cfg.engines.length}`
-    : 'фраза и reference общие — отличаются только движки';
-  return `
-    <div class="benchmark-head">СРАВНИТЬ ДВИЖКИ</div>
-    <label class="field">
-      <span>Тестовая фраза</span>
-      <input type="text" data-role="benchmark-text" value="${esc(cfg.text)}" />
-    </label>
-    <div class="benchmark-engines">${boxes}</div>
-    <label class="field">
-      <span>Проверка качества</span>
-      <select data-role="benchmark-qa">
-        <option value="off"${cfg.qa === 'off' ? ' selected' : ''}>выключена</option>
-        <option value="smart"${cfg.qa === 'smart' ? ' selected' : ''}>Smart — по подозрительным</option>
-        <option value="strict"${cfg.qa === 'strict' ? ' selected' : ''}>Strict — каждый движок</option>
-      </select>
-    </label>
-    <div class="test-row">
-      <button class="tiny primary" data-role="benchmark-run" ${cfg.busy ? 'disabled' : ''}>
-        ${cfg.busy ? 'сравниваю…' : 'Сравнить'}
-      </button>
-      <span class="muted benchmark-status">${status}</span>
-    </div>
-    <div class="progress"><div style="width:${percent}%"></div></div>
-    <div data-role="benchmark-results">${benchmarkResultsHtml(voiceId)}</div>
-    <p class="hint muted">
-      WER и время — справка, а не приговор: система не выбирает лучший движок сама.
-      Прослушайте takes и нажмите «Выбрать этот движок» — reference и настройки голоса
-      при этом не меняются.
-    </p>
-    <audio data-role="benchmark-player" controls hidden></audio>`;
-}
-
-function renderBenchmarkPanel(voiceId) {
-  const card = previewCard(voiceId);
-  if (!card) return;
-  const box = card.querySelector('[data-role="benchmark"]');
-  if (!box) return;
-  const cfg = benchmarkState(voiceId);
-  if (!cfg.open) {
-    box.innerHTML = '';
-    box.hidden = true;
-    delete box.dataset.ready;
-    return;
-  }
-  if (!box.dataset.ready) {
-    box.innerHTML = benchmarkPanelHtml(voiceId);
-    box.dataset.ready = '1';
-  }
-  box.hidden = false;
-  syncBenchmarkPanel(voiceId);
-}
-
-// Обновление хода сравнения без пересборки панели: опрос статуса не должен
-// пересоздавать плеер и сбрасывать прослушивание и правки в форме.
-function syncBenchmarkPanel(voiceId) {
-  const card = previewCard(voiceId);
-  const box = card ? card.querySelector('[data-role="benchmark"]') : null;
-  if (!box) return;
-  const cfg = benchmarkState(voiceId);
-  const button = box.querySelector('[data-role="benchmark-run"]');
-  if (button) {
-    button.disabled = cfg.busy;
-    button.textContent = cfg.busy ? 'сравниваю…' : 'Сравнить';
-  }
-  const done = cfg.data ? cfg.data.results.length : 0;
-  const percent = Math.min(100, Math.round((done / Math.max(cfg.engines.length, 1)) * 100));
-  const bar = box.querySelector('.progress > div');
-  if (bar) bar.style.width = `${percent}%`;
-  const status = box.querySelector('.benchmark-status');
-  if (status) {
-    status.textContent = cfg.busy
-      ? `обработано ${done} из ${cfg.engines.length}`
-      : 'фраза и reference общие — отличаются только движки';
-  }
-  const results = box.querySelector('[data-role="benchmark-results"]');
-  if (results) results.innerHTML = benchmarkResultsHtml(voiceId);
-}
-
-function toggleBenchmark(voiceId) {
-  const cfg = benchmarkState(voiceId);
-  cfg.open = !cfg.open;
-  // По умолчанию сравниваем на всём, что установлено: отмечать руками каждый
-  // движок в самом частом сценарии — лишний шаг.
-  if (cfg.open && !cfg.engines.length) cfg.engines = Object.keys(state.engines);
-  renderBenchmarkPanel(voiceId);
-}
-
-async function runBenchmark(voiceId) {
-  const cfg = benchmarkState(voiceId);
-  const text = cfg.text.trim();
-  if (!cfg.engines.length) { cfg.error = 'Отметьте хотя бы один движок'; renderBenchmarkPanel(voiceId); return; }
-  if (!text) { cfg.error = 'Введите фразу для сравнения'; renderBenchmarkPanel(voiceId); return; }
-
-  cfg.error = '';
-  cfg.busy = true;
-  cfg.data = null;
-  renderBenchmarkPanel(voiceId);
-  // Движок сравнения поднимается впервые и может грузиться десятки секунд —
-  // состояние моделей видно в шапке.
-  watchEngines();
-  try {
-    const started = await api(`/api/voices/${voiceId}/benchmark`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, engines: cfg.engines, qa: cfg.qa, auto_accent: true }),
-    });
-    cfg.runId = started.benchmark_id;
-    stopBenchmarkPoll(voiceId);
-    cfg.timer = setInterval(() => pollBenchmark(voiceId), 1500);
-  } catch (error) {
-    cfg.busy = false;
-    cfg.error = error.message;
-    renderBenchmarkPanel(voiceId);
-  }
-}
-
-async function pollBenchmark(voiceId) {
-  const cfg = state.benchmark[voiceId];
-  if (!cfg || !cfg.runId) return;
-  if (!previewCard(voiceId)) {  // карточку перерисовали или голос удалили
-    stopBenchmarkPoll(voiceId);
-    return;
-  }
-  try {
-    const data = await api(`/api/benchmarks/${cfg.runId}`);
-    cfg.data = data;
-    if (data.status === 'done' || data.status === 'error') {
-      stopBenchmarkPoll(voiceId);
-      cfg.busy = false;
-      if (data.status === 'error') cfg.error = data.error || 'Сравнение не удалось';
-    }
-    renderBenchmarkPanel(voiceId);
-  } catch (error) {
-    stopBenchmarkPoll(voiceId);
-    cfg.busy = false;
-    cfg.error = error.message;
-    renderBenchmarkPanel(voiceId);
-  }
-}
-
-function playBenchmarkTake(voiceId, url) {
-  const card = previewCard(voiceId);
-  if (!card || !url) return;
-  const player = card.querySelector('[data-role="benchmark-player"]');
-  player.src = `${url}?t=${Date.now()}`;
-  player.hidden = false;
-  player.play().catch(() => { /* автоплей может быть заблокирован — плеер виден */ });
-}
-
-async function selectBenchmarkEngine(voiceId, engine) {
-  const cfg = benchmarkState(voiceId);
-  if (!cfg.runId) return;
-  try {
-    const voice = await api(`/api/benchmarks/${cfg.runId}/select`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ engine }),
-    });
-    // Карточка перечитывается: движок голоса изменился, и это видно в её теге.
-    // Панель сравнения остаётся открытой — результаты ещё нужны для прослушивания.
-    await loadVoices();
-    renderBenchmarkPanel(voiceId);
-    showAlert(
-      $('voice-error'),
-      `Голос «${voice.name}» переведён на ${engineLabel(voice.engine)}: reference и настройки не тронуты`,
-      'info',
-    );
-  } catch (error) {
-    cfg.error = error.message;
-    renderBenchmarkPanel(voiceId);
-  }
-}
-
-async function recognizeRefText() {
-  const file = $('new-voice-file').files[0];
-  const status = $('recognize-status');
-  const button = $('btn-recognize-voice');
-  showAlert($('voice-error'), '');
-  if (!file) { status.textContent = 'сначала выберите аудиофайл'; return; }
-
-  const form = new FormData();
-  form.append('file', file);
-  status.textContent = 'распознаю речь… это занимает до минуты';
-  button.disabled = true;
-  try {
-    const result = await api('/api/voices/transcribe', { method: 'POST', body: form });
-    $('new-voice-ref-text').value = result.ref_text;
-    const trimmed = result.full_sec - result.effective_sec;
-    const used = `использовано ${result.effective_sec.toFixed(1)} с из ${result.full_sec.toFixed(1)} с`;
-    status.textContent = trimmed > 0.5
-      ? `распознано: ${used} — в модель уйдёт только начало записи`
-      : `распознано: ${used}`;
-  } catch (error) {
-    status.textContent = '';
-    showAlert($('voice-error'), error.message);
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function createVoice() {
-  const file = $('new-voice-file').files[0];
-  const status = $('new-voice-status');
-  const refText = $('new-voice-ref-text').value.trim();
-  const verify = $('new-voice-verify').checked;
-  const denoise = $('new-voice-denoise').checked;
-  showAlert($('voice-error'), '');
-  if (!file) { status.textContent = 'выберите аудиофайл или запишите голос'; return; }
-
-  const form = new FormData();
-  form.append('name', $('new-voice-name').value.trim() || 'Новый голос');
-  form.append('gender', $('new-voice-gender').value);
-  // Движок сохраняется вместе с голосом: все диалоги этим голосом пойдут через него.
-  form.append('engine', $('new-voice-engine').value);
-  form.append('ref_text', refText);
-  // Без сверки бэкенд берёт расшифровку как есть: для записанного голоса текст
-  // прочитан с экрана, и распознавание здесь было бы лишними десятками секунд.
-  form.append('verify_ref_text', verify ? '1' : '0');
-  // Очистка референса — опциональная зависимость: бэкенд чистит запись до всех
-  // проверок, чтобы F0, полоса и расшифровка считались по той же записи, что уйдёт в модель.
-  form.append('denoise', denoise ? '1' : '0');
-  form.append('file', file);
-
-  const cleaning = denoise ? 'чищу запись от шума, ' : '';
-  if (!verify) status.textContent = `${cleaning}сохраняю голос…`;
-  else if (refText) status.textContent = `${cleaning}сверяю расшифровку с записью и сохраняю…`;
-  else status.textContent = `${cleaning}распознаю речь и сохраняю… это занимает до минуты`;
-  try {
-    const voice = await api('/api/voices', { method: 'POST', body: form });
-    status.textContent = 'голос сохранён';
-    $('new-voice-file').value = '';
-    $('new-voice-name').value = '';
-    $('new-voice-ref-text').value = '';
-    $('recognize-status').textContent = '';
-    // Очистка — разовая операция при сохранении, а не свойство голоса: снимаем галочку.
-    $('new-voice-denoise').checked = false;
-    resetDropZone();
-    resetRecording();
-    // Форма обнуляется вместе с выбором движка: подсказка по полу снова в силе.
-    state.engineTouched = false;
-    $('new-voice-engine').value = suggestedEngine($('new-voice-gender').value);
-    updateNewVoiceEngineNote();
-    await loadVoices();
-    const notes = [];
-    if (voice.gender_warning) notes.push(voice.gender_warning);
-    if (voice.ref_text_warning) notes.push(voice.ref_text_warning);
-    if (voice.band_warning) notes.push(voice.band_warning);
-    if (voice.is_demo) notes.push(`Загружена копия демо-файла F5-TTS (${voice.demo_source}) — это не пользовательская запись.`);
-    if (notes.length) showAlert($('voice-error'), notes.join('\n'), 'info');
-  } catch (error) {
-    status.textContent = '';
-    showAlert($('voice-error'), error.message);
-  }
-}
-
-function resetDropZone() {
-  const drop = $('new-voice-drop');
-  drop.textContent = DROP_HINT;
-  drop.classList.remove('has-file', 'over');
-}
-
 // --- запись голоса с микрофона -------------------------------------------------
 function recordFormat() {
   if (typeof MediaRecorder === 'undefined') return null;
@@ -3194,9 +2479,12 @@ async function refreshAnalysis() {
     updateAnalysisBar();
     return null;
   }
+  const signal = staleSignal('analysis');
   try {
-    state.analysis = await api(`/api/projects/${state.project.id}/analysis`);
+    state.analysis = await api(`/api/projects/${state.project.id}/analysis`, { signal });
   } catch (error) {
+    // Отменённый запрос уступил место новому: состояние и панель обновит он.
+    if (isAbort(error)) return null;
     // Состояние — вспомогательная информация: не смогли прочитать, покажем
     // «не подготовлен» и не будем мешать работать с карточками.
     state.analysis = null;
@@ -3224,12 +2512,16 @@ const LLM_LABELS = {
 async function refreshLlmAnalysis() {
   const panel = $('llm-panel');
   if (!panel) return null;
+  // Один сигнал на весь вызов: оба запроса ниже — часть одного обновления панели,
+  // и отменять их друг другом нельзя.
+  const signal = staleSignal('llm');
   if (!state.llmStatus) {
     try {
-      state.llmStatus = await api('/api/llm/status');
+      state.llmStatus = await api('/api/llm/status', { signal });
       state.llmStatusSettings = state.llmStatus.settings || null;
       renderLlmPanel(state.llmStatus);
     } catch (error) {
+      if (isAbort(error)) return null;
       state.llmStatus = null;
     }
   }
@@ -3239,8 +2531,10 @@ async function refreshLlmAnalysis() {
     return null;
   }
   try {
-    state.llm = await api(`/api/projects/${state.project.id}/linguistic-analysis`);
+    state.llm = await api(`/api/projects/${state.project.id}/linguistic-analysis`, { signal });
   } catch (error) {
+    // Отменённый запрос уступил место новому — он и обновит панель.
+    if (isAbort(error)) return null;
     // Состояние анализа — вспомогательная информация: не смогли прочитать, панель
     // просто не показываем, работа с репликами не блокируется.
     state.llm = null;
@@ -3558,12 +2852,15 @@ async function loadSavedProject() {
   let projectId = null;
   try { projectId = localStorage.getItem(PROJECT_KEY); } catch (_) { /* приватный режим */ }
   if (!projectId) return;
+  const signal = staleSignal('project');
   try {
-    const project = await api(`/api/projects/${projectId}`);
+    const project = await api(`/api/projects/${projectId}`, { signal });
     if (!project.source_text) return;
     $('dialogue').value = project.source_text;
     applyProject(project);
-  } catch (_) {
+  } catch (error) {
+    // Отменённый запрос уступил место новому — проект запомнен, гасить его нельзя.
+    if (isAbort(error)) return;
     // Проект могли удалить: начинаем с чистого листа, а не с ошибки на загрузке.
     rememberProject(null);
   }
@@ -3942,207 +3239,6 @@ function updateGenerateButton() {
   updateExportButtons();
 }
 
-// --- таймлайн проекта ----------------------------------------------------------
-// Таймлайн не считает время сам: start/end/длительность приходят из `/timeline`,
-// где они посчитаны по реальным длительностям активных take'ов. Своя арифметика
-// на клиенте (по символам или по числу реплик) разошлась бы с файлом на первом же
-// рендере — а обещать пользователю место звука в файле нужно точно.
-const TIMELINE_MIN_PPS = 6;    // пикселей на секунду, когда трек длинный
-const TIMELINE_MAX_PPS = 240;  // …и когда он совсем короткий
-const TIMELINE_MIN_BLOCK = 6;  // минимум для сегмента: по нему всё равно надо кликнуть
-
-function fmtClock(seconds) {
-  const total = Math.max(Math.floor(Number(seconds) || 0), 0);
-  const minutes = Math.floor(total / 60);
-  return `${String(minutes).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
-}
-
-// Дорожки таймлайна: по строке на спикера, сегменты — подряд по start_sec.
-// Реплика без готового звука остаётся пустым штрихованным блоком: её надо видеть,
-// чтобы понять, что именно ещё не сгенерировано.
-function timelineLanes(data) {
-  const lanes = new Map();
-  const order = [];
-  (data.speakers || []).forEach((speaker) => {
-    lanes.set(speaker.key, { key: speaker.key, label: speaker.label || speaker.key, voice: speaker.voice_name || '', segments: [] });
-    order.push(speaker.key);
-  });
-  (data.replicas || []).forEach((segment) => {
-    if (!lanes.has(segment.speaker)) {
-      lanes.set(segment.speaker, { key: segment.speaker, label: segment.speaker_label || segment.speaker, voice: '', segments: [] });
-      order.push(segment.speaker);
-    }
-    const takes = segment.takes || [];
-    const note = segment.has_audio
-      ? ''
-      : takes.length
-        ? 'файл take потерян'
-        : 'нет take';
-    lanes.get(segment.speaker).segments.push({
-      index: segment.index,
-      start: Number(segment.start_sec) || 0,
-      duration: Number(segment.duration_sec) || 0,
-      hasAudio: Boolean(segment.has_audio),
-      note,
-      takes: takes.length,
-      activeTake: segment.take_id,
-      title: timelineSegmentTitle(segment, note),
-    });
-  });
-  return order.map((key) => lanes.get(key));
-}
-
-function timelineSegmentTitle(segment, note) {
-  const lines = [
-    `Replica ${segment.index + 1} · ${segment.speaker_label || segment.speaker}`,
-    `${fmtClock(segment.start_sec)} — ${fmtClock(segment.end_sec)} (${Number(segment.duration_sec).toFixed(2)} с)`,
-    `пауза ${segment.pause_ms} мс`,
-    `take: ${segment.take_id === null || segment.take_id === undefined
-      ? 'нет' : `${segment.take_label || 'вариант'} (#${segment.take_id})`}`,
-    note ? `статус: ${note}` : 'статус: готово',
-  ];
-  return lines.join('\n');
-}
-
-// Подписи оси: шаг выбирается так, чтобы на дорожке было 6–12 отметок. Своих
-// значений не выдумываем — берём круглые секунды/минуты.
-const TIMELINE_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
-
-function timelineTicks(duration) {
-  if (!(duration > 0)) return [];
-  const step = TIMELINE_STEPS.find((value) => duration / value <= 12)
-    || Math.ceil(duration / 10);
-  const ticks = [];
-  for (let at = 0; at <= duration + 1e-6; at += step) ticks.push(at);
-  return ticks;
-}
-
-function renderTimeline() {
-  const box = $('timeline-body');
-  const label = $('timeline-duration');
-  const refresh = $('timeline-refresh');
-  if (!box) return;
-  refresh.disabled = state.timelineBusy;
-  showAlert($('timeline-error'), state.timelineError || '');
-
-  const data = state.timeline;
-  if (state.timelineBusy && !data) {
-    label.textContent = '…';
-    box.innerHTML = '<span class="muted">читаю длительности…</span>';
-    return;
-  }
-  if (!data) {
-    label.textContent = '—';
-    box.innerHTML = '<span class="muted">Разберите текст — таймлайн покажет, где какая реплика звучит.</span>';
-    return;
-  }
-  const duration = Number(data.duration_sec) || 0;
-  const lanes = timelineLanes(data);
-  const hasSegments = (data.replicas || []).length > 0;
-  label.textContent = duration > 0
-    ? `${fmtClock(duration)} · ${duration.toFixed(1)} с`
-    : (hasSegments ? 'звука ещё нет · 00:00' : '—');
-
-  if (!lanes.length || !hasSegments) {
-    box.innerHTML = '<span class="muted">Реплик нет: вставьте диалог в Source / Advanced и нажмите «Применить и разобрать».</span>';
-    return;
-  }
-
-  // Масштаб общий для всех дорожек: сегменты соседних спикеров должны стоять
-  // друг под другом. Короткий трек растягивается на читаемую ширину, длинный
-  // сжимается — дорожка прокручивается по горизонтали.
-  const pxPerSec = Math.min(
-    Math.max(duration > 0 ? 900 / duration : TIMELINE_MAX_PPS, TIMELINE_MIN_PPS),
-    TIMELINE_MAX_PPS,
-  );
-  const width = Math.max(Math.ceil(duration * pxPerSec), 240);
-  const ticks = timelineTicks(duration);
-
-  const axis = `<div class="timeline-axis" style="width:${width}px">${ticks
-    .map((at) => `<span class="timeline-tick" style="left:${(at * pxPerSec).toFixed(1)}px">${fmtClock(at)}</span>`)
-    .join('')}</div>`;
-
-  const rows = lanes.map((lane, laneIndex) => {
-    const blocks = lane.segments.map((segment) => {
-      const left = Math.max(segment.start * pxPerSec, 0);
-      const blockWidth = Math.max(segment.duration * pxPerSec, TIMELINE_MIN_BLOCK);
-      const classes = `timeline-block${segment.hasAudio ? '' : ' no-audio'}${laneIndex % 2 ? ' alt' : ''}`;
-      const inner = blockWidth >= 34
-        ? `<b>${segment.index + 1}</b>${segment.note ? `<i>${esc(segment.note)}</i>` : ''}`
-        : `<b>${segment.index + 1}</b>`;
-      return `<button class="${classes}" data-index="${segment.index}" data-audio="${segment.hasAudio ? '1' : '0'}"
-        style="left:${left.toFixed(1)}px;width:${blockWidth.toFixed(1)}px"
-        title="${esc(segment.title)}">${inner}</button>`;
-    }).join('');
-    const empty = lane.segments.length
-      ? ''
-      : '<span class="muted timeline-lane-empty">реплик нет</span>';
-    return `<div class="timeline-lane" data-speaker="${esc(lane.key)}">
-        <span class="timeline-name" title="${esc(`${lane.label}${lane.voice ? ` · ${lane.voice}` : ''}`)}">${esc(lane.label)}</span>
-        <div class="timeline-track" style="width:${width}px">${blocks}${empty}</div>
-      </div>`;
-  }).join('');
-
-  box.innerHTML = `${axis}${rows}`;
-}
-
-// Открывает инспектор сегмента, не создавая второй редактор: прокручиваем к
-// карточке этой реплики, подсвечиваем её и ставим фокус на главное действие —
-// прослушать готовое звучание или сгенерировать его, если звука ещё нет.
-function openReplicaInspector(index) {
-  const card = document.querySelector(`#replica-cards .replica-card[data-index="${index}"]`);
-  if (!card) {
-    showAlert($('timeline-error'), 'Карточка этой реплики не найдена — обновите проект.');
-    return;
-  }
-  showAlert($('timeline-error'), '');
-  card.classList.add('inspected');
-  if (typeof card.scrollIntoView === 'function') {
-    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }
-  const target = card.querySelector('[data-role="play"]')
-    || card.querySelector('[data-role="regen"]');
-  if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
-}
-
-async function refreshTimeline() {
-  if (!state.project) {
-    state.timeline = null;
-    state.timelineError = null;
-    renderTimeline();
-    return;
-  }
-  state.timelineBusy = true;
-  state.timelineError = null;
-  renderTimeline();
-  const requested = state.project.id;
-  try {
-    const data = await api(`/api/projects/${requested}/timeline`);
-    // Проект могли сменить, пока запрос был в полёте: чужой таймлайн показывать
-    // нельзя — сегменты вели бы к карточкам другого диалога.
-    if (!state.project || state.project.id !== requested) return;
-    state.timeline = data;
-    applyTimeline(data);
-  } catch (error) {
-    state.timelineError = error.message;
-  } finally {
-    state.timelineBusy = false;
-    renderTimeline();
-  }
-}
-
-function bindTimelineEvents() {
-  const body = $('timeline-body');
-  if (body) {
-    body.addEventListener('click', (event) => {
-      const block = event.target.closest('.timeline-block');
-      if (block) openReplicaInspector(parseInt(block.dataset.index, 10));
-    });
-  }
-  const refresh = $('timeline-refresh');
-  if (refresh) refresh.addEventListener('click', refreshTimeline);
-}
-
 // --- карточки реплик (Visual editor) ------------------------------------------
 // Карточка — основное место работы с диалогом: у каждой реплики видно, каким
 // голосом и движком она читается, что в ней можно поправить и какие звучания у
@@ -4224,7 +3320,7 @@ function takesHtml(replica) {
     const playing = state.takeKey === `${replica.index}:${take.id}`;
     return `
       <div class="take-block">
-        <div class="variant-row" data-take="${take.id}">
+        <div class="variant-row" data-take="${esc(take.id)}">
           <button class="tiny" data-role="take-play">${playing ? 'стоп' : 'слушать'}</button>
           <span class="variant-label">${esc(take.label || 'вариант')}${take.active ? ' · активно' : ''}</span>
           <span class="muted">${Number(take.duration_sec || 0).toFixed(1)} с · ${esc(seedText(take.seed))}</span>
@@ -4947,153 +4043,6 @@ async function cancelRender() {
   }
 }
 
-// --- экспорт и импорт проекта ---------------------------------------------------
-// Экспорт — обычное скачивание файла, а не задача очереди: ни один из этих
-// вариантов не синтезирует, файл собирается из уже готовых take'ов и уходит
-// ответом. Поэтому здесь нет опроса статуса — только загрузка и ошибка.
-const EXPORT_URLS = {
-  archive: (id) => `/api/projects/${id}/export`,
-  wav: (id) => `/api/projects/${id}/export/audio?format=wav`,
-  mp3: (id) => `/api/projects/${id}/export/audio?format=mp3`,
-  replicas: (id) => `/api/projects/${id}/export/replicas`,
-  stems: (id) => `/api/projects/${id}/export/stems`,
-  transcript: (id) => `/api/projects/${id}/export/transcript`,
-  srt: (id) => `/api/projects/${id}/export/subtitles?format=srt`,
-  vtt: (id) => `/api/projects/${id}/export/subtitles?format=vtt`,
-};
-
-const EXPORT_FALLBACK_NAMES = {
-  archive: 'project.ttsproject',
-  wav: 'dialogue.wav',
-  mp3: 'dialogue.mp3',
-  replicas: 'replicas.zip',
-  stems: 'stems.zip',
-  transcript: 'transcript.json',
-  srt: 'subtitles.srt',
-  vtt: 'subtitles.vtt',
-};
-
-function updateExportButtons() {
-  const ready = Boolean(state.project && (state.project.replicas || []).length);
-  const button = $('btn-export-project');
-  if (button) {
-    button.disabled = !ready || state.exportBusy === true;
-    button.title = ready ? '' : 'Сначала разберите текст на реплики';
-  }
-  // Диагностика возможна и на проекте без take'ов: тогда в архиве не будет аудио,
-  // но текст, настройки и журнал останутся — а именно их чаще всего и не хватает.
-  const diagnosticsButton = $('btn-diagnostics');
-  if (diagnosticsButton) {
-    diagnosticsButton.disabled = !state.project;
-    diagnosticsButton.title = state.project ? '' : 'Сначала создайте проект';
-  }
-}
-
-// Имя файла берём из Content-Disposition: бэкенд уже сделал его безопасным и
-// осмысленным (имя проекта), и второй способ его собирать разошёлся бы с первым.
-function downloadName(response, fallback) {
-  const header = response.headers.get('Content-Disposition') || '';
-  const utf = header.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf) {
-    try { return decodeURIComponent(utf[1]); } catch (_) { /* оставим запасное имя */ }
-  }
-  const plain = header.match(/filename="?([^";]+)"?/i);
-  return plain ? plain[1] : fallback;
-}
-
-async function downloadExport(url, fallbackName) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    let detail = `Ошибка ${response.status}`;
-    try {
-      const body = await response.json();
-      if (body.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
-    } catch (_) { /* тело не JSON — оставляем текст статуса */ }
-    throw new Error(detail);
-  }
-  const blob = await response.blob();
-  const href = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = href;
-  link.download = downloadName(response, fallbackName);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  // Ссылку освобождаем после клика: до этого браузер ещё читает blob.
-  setTimeout(() => URL.revokeObjectURL(href), 10000);
-}
-
-async function exportProject() {
-  if (!state.project) {
-    showAlert($('export-error'), 'Проект ещё не создан — вставьте текст и разберите его.');
-    return;
-  }
-  const kind = $('export-kind').value;
-  const build = EXPORT_URLS[kind];
-  if (!build) return;
-  showAlert($('export-error'), '');
-  state.exportBusy = true;
-  updateExportButtons();
-  $('export-status').textContent = 'готовлю файл…';
-  try {
-    await downloadExport(build(state.project.id), EXPORT_FALLBACK_NAMES[kind]);
-    $('export-status').textContent = 'файл скачан';
-  } catch (error) {
-    $('export-status').textContent = '—';
-    showAlert($('export-error'), error.message);
-  } finally {
-    state.exportBusy = false;
-    updateExportButtons();
-  }
-}
-
-async function importProject(file) {
-  if (!file) return;
-  showAlert($('export-error'), '');
-  state.exportBusy = true;
-  updateExportButtons();
-  $('export-status').textContent = `загружаю ${file.name}…`;
-  try {
-    const form = new FormData();
-    form.append('file', file);
-    const project = await api('/api/projects/import', { method: 'POST', body: form });
-    // Импорт мог создать голоса — список перечитываем, иначе карточки реплик
-    // покажут «не выбран» у голоса, который уже есть на этой машине.
-    await loadVoices();
-    rememberProject(project.id);
-    $('dialogue').value = project.source_text || '';
-    state.sourceDirty = false;
-    applyProject(project);
-    $('export-status').textContent = `открыт проект «${project.name}»`;
-  } catch (error) {
-    $('export-status').textContent = '—';
-    showAlert($('export-error'), `Импорт не выполнен: ${error.message}`);
-  } finally {
-    state.exportBusy = false;
-    updateExportButtons();
-  }
-}
-
-function bindExportEvents() {
-  const exportButton = $('btn-export-project');
-  if (exportButton) exportButton.addEventListener('click', exportProject);
-  const diagnosticsButton = $('btn-diagnostics');
-  if (diagnosticsButton) diagnosticsButton.addEventListener('click', exportDiagnostics);
-  const importButton = $('btn-import-project');
-  const importInput = $('import-file');
-  if (importButton && importInput) {
-    importButton.addEventListener('click', () => importInput.click());
-    importInput.addEventListener('change', async () => {
-      const file = importInput.files && importInput.files[0];
-      // Поле очищаем до загрузки: повторный выбор того же файла иначе не поднял бы
-      // событие change, и импорт «не сработал бы» второй раз.
-      importInput.value = '';
-      await importProject(file);
-    });
-  }
-  updateExportButtons();
-}
-
 // --- диагностика качества озвучки ----------------------------------------------
 // Архив диагностики собирается на сервере, а не в браузере: только там есть
 // настройки рендера, план коротких реплик и готовое аудио. Браузер просит собрать
@@ -5181,10 +4130,13 @@ async function deleteDiagnostics(name) {
 
 async function loadDiagnostics() {
   if (!state.project || !$('diagnostics-list')) return;
+  const signal = staleSignal('diagnostics');
   try {
-    const data = await api(`/api/projects/${state.project.id}/diagnostics`);
+    const data = await api(`/api/projects/${state.project.id}/diagnostics`, { signal });
     renderDiagnosticsList(data.archives || []);
-  } catch (_) {
+  } catch (error) {
+    // Отменённый запрос уступил место новому: список покажет он.
+    if (isAbort(error)) return;
     // Список архивов вторичен: без него кнопка «Собрать» всё равно работает.
   }
 }
@@ -7537,10 +6489,21 @@ async function init() {
   // Таймер создаём до первого опроса: если всё уже готово, refreshStatus его снимет.
   state.statusTimer = setInterval(refreshStatus, 4000);
   await refreshStatus();
+  // Каждый шаг — в своём try (F-W2): раньше один общий catch гасил все три сразу,
+  // и падение загрузки движков оставляло пользователя без голосов и без проекта,
+  // хотя ни то, ни другое от движков не зависит.
   try {
     // Паспорта движков — до голосов: и карточки, и форма рисуют по ним набор настроек.
     await loadEngines();
+  } catch (error) {
+    showAlert($('voice-error'), error.message);
+  }
+  try {
     await loadVoices();
+  } catch (error) {
+    showAlert($('voice-error'), error.message);
+  }
+  try {
     // Прошлый проект открывается сам: реплики, голоса и варианты живут в базе,
     // а не в разовой задаче, поэтому перезагрузка страницы их не теряет.
     await loadSavedProject();
@@ -7551,5 +6514,41 @@ async function init() {
   }
   updateGenerateButton();
 }
+
+// Общий фундамент, который берут вынесенные модули: вкладка «Голоса» (voices.js),
+// таймлайн (timeline.js) и экспорт/импорт проекта (project-io.js). Списки совпадают
+// с их `import`: модули связаны двусторонне, но значения читаются только внутри
+// функций — на этапе оценки модуля цикл безопасен.
+export {
+  state,
+  $,
+  esc,
+  api,
+  showAlert,
+  voiceById,
+  PARAM_DEFAULTS,
+  PREVIEW_TEXT,
+  BENCHMARK_TEXT,
+  DROP_HINT,
+  ENGINE_F5,
+  EMOTION_LABELS,
+  usesReference,
+  cloningNote,
+  engineNote,
+  engineLabel,
+  engineOptionsHtml,
+  nfeOptions,
+  engineParamsHtml,
+  initials,
+  suggestedEngine,
+  engineInfo,
+  loadVoices,
+  watchEngines,
+  resetRecording,
+  applyTimeline,
+  rememberProject,
+  applyProject,
+  exportDiagnostics,
+};
 
 init();

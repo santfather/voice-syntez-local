@@ -161,7 +161,7 @@
             </p>
           </details>
 
-          <label class="field" style="margin-top: 12px">
+          <label class="field" style="margin-top: 12px" id="new-voice-ref-text-block">
             <span>Что сказано в референсе (точная расшифровка)</span>
             <div class="row">
               <input type="text" id="new-voice-ref-text" placeholder="Текст, который произнесён в записи" style="flex: 1 1 160px" />
@@ -169,7 +169,7 @@
             </div>
             <span class="muted" id="recognize-status"></span>
           </label>
-          <label class="toggle">
+          <label class="toggle" id="new-voice-verify-block">
             <input type="checkbox" id="new-voice-verify" checked />
             сверять расшифровку с записью через Whisper (медленно, но ловит рассинхрон)
           </label>
@@ -181,7 +181,7 @@
             <button class="primary" id="btn-save-voice">Сохранить голос</button>
             <span class="muted" id="new-voice-status"></span>
           </div>
-          <p class="hint muted">
+          <p class="hint muted" id="new-voice-ref-hint">
             Расшифровка должна совпадать с записью дословно — если она от другой записи,
             синтез выйдет невнятным. Поэтому при сохранении расшифровка сверяется с
             записью, а пустое поле заполняется автоматически (нужны десятки секунд).
@@ -1388,6 +1388,6 @@
 </footer>
 
 </div>
-<script src="/static/app.js"></script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>
