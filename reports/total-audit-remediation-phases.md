@@ -349,6 +349,23 @@ python -m pytest
   Единственное «голое» присваивание — `element.innerHTML = saved.value`
   ([app.js:989](file:///Users/vladislavkovalenko/Projects/VOICE_SYNTEZ/frontend/app.js#L989)):
   это возврат снятого при загрузке статического шаблона `#text-drop`, а не данных с сервера.
+- **F-W5** (Minor) — нет `aria-*` и CSP. Рекомендация: базовые aria-атрибуты и CSP-мета.
+
+  **Статус: закрыто (этот коммит).** В `frontend/index.html` добавлен `<meta http-equiv=
+  "Content-Security-Policy">`: `default-src 'self'`, `script-src 'self'` (инлайна нет — единственный
+  скрипт это модуль `/static/app.js`), `style-src` с `'unsafe-inline'` (разметка собирается
+  строками и пользуется атрибутом `style`), `media-src`/`img-src` с `blob:` и `data:` (записи и
+  предпросмотр живут в blob-URL), `object-src 'none'`, `base-uri 'self'`, `form-action 'none'`.
+  Навигация вкладок получила `role="tablist"`/`role="tab"` с `aria-selected` и `aria-controls`,
+  панели — `role="tabpanel"` и `aria-labelledby`, а `switchTab` синхронизирует `aria-selected` при
+  переключении. Две группы переключателей (`.view-switch` диалога и `#rec-order` записи), которые
+  разметка выдавала за `role="tab"` без `aria-selected` и без панелей, переведены в честные
+  кнопки-тумблеры (`role="group"` + `aria-pressed`); состояние синхронизируют `switchDialogueView`
+  и `renderRecordingOrderSwitch`. Попутно сужен селектор подписки: обработчик представления
+  диалога больше не навешивается на кнопки «Порядок записи» — раньше клик по ним звал
+  `switchDialogueView(undefined)` и скрывал обе панели редактора. Живой прогон: CSP-нарушений нет,
+  все модули 200, при переключении вкладок и представлений ровно один `aria-selected`/`aria-pressed`
+  равен `true`.
 - SECURITY Major — нет лимита размера тела JSON (`main.py:1019`) и нет лимита размера/числа
   записей при импорте архива (`project_export.py:574-599`, zip-bomb). Лимит `Content-Length`
   на входе, `max_entries`/`max_uncompressed` при распаковке.

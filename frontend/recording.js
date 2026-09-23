@@ -572,7 +572,11 @@ function renderRecordingOrderSwitch() {
   const project = state.recording.project;
   const order = (project && project.recording_order) || 'dialogue';
   document.querySelectorAll('#rec-order button').forEach((button) => {
-    button.classList.toggle('active', button.dataset.order === order);
+    const isActive = button.dataset.order === order;
+    button.classList.toggle('active', isActive);
+    // Кнопки-тумблеры (aria-pressed), выбран может быть ровно один порядок —
+    // состояние обязано совпадать с классом, иначе скринридер соврёт.
+    button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
   });
 }
 

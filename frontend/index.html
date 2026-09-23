@@ -3,6 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- CSP (аудит §9.3 п.22): дашборд локальный и всё нужное берёт у себя же.
+     `script-src 'self'` — единственный скрипт это модуль /static/app.js, инлайна нет.
+     `style-src` требует 'unsafe-inline': интерфейс собирает разметку строками и
+     пользуется атрибутом style (`style="width:…"`), который без этого запрещён.
+     `media-src blob:` — записанные и импортированные звуки живут в blob-URL
+     (MediaRecorder, чтение файла), `img-src data:` — иконки-инлайны, если появятся.
+     `connect-src 'self'` — все запросы идут на тот же origin. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'" />
 <title>TTS-студия — озвучка диалогов</title>
 <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -44,21 +52,21 @@
   </div>
 </header>
 
-<nav class="tabs">
-  <button class="tab active" data-tab="voices"><span>01</span>Голоса</button>
-  <button class="tab" data-tab="dialogue"><span>02</span>Озвучка диалога</button>
-  <button class="tab" data-tab="text"><span>03</span>Сплошной текст</button>
+<nav class="tabs" role="tablist" aria-label="Разделы студии">
+  <button class="tab active" data-tab="voices" id="tabbtn-voices" role="tab" aria-selected="true" aria-controls="tab-voices"><span aria-hidden="true">01</span>Голоса</button>
+  <button class="tab" data-tab="dialogue" id="tabbtn-dialogue" role="tab" aria-selected="false" aria-controls="tab-dialogue"><span aria-hidden="true">02</span>Озвучка диалога</button>
+  <button class="tab" data-tab="text" id="tabbtn-text" role="tab" aria-selected="false" aria-controls="tab-text"><span aria-hidden="true">03</span>Сплошной текст</button>
   <!-- Новая вкладка вставлена по номеру из ТЗ фазы 2 («04 · Сам себе звукорежиссер»).
        Номера соседних кнопок не трогаем: их разметка принадлежит существующим
        вкладкам, а переключение идёт по data-tab, а не по видимому числу. -->
-  <button class="tab" data-tab="recording"><span>04</span>Сам себе звукорежиссер</button>
-  <button class="tab" data-tab="dictionary"><span>05</span>Словарь</button>
-  <button class="tab" data-tab="models"><span>06</span>Модели</button>
+  <button class="tab" data-tab="recording" id="tabbtn-recording" role="tab" aria-selected="false" aria-controls="tab-recording"><span aria-hidden="true">04</span>Сам себе звукорежиссер</button>
+  <button class="tab" data-tab="dictionary" id="tabbtn-dictionary" role="tab" aria-selected="false" aria-controls="tab-dictionary"><span aria-hidden="true">05</span>Словарь</button>
+  <button class="tab" data-tab="models" id="tabbtn-models" role="tab" aria-selected="false" aria-controls="tab-models"><span aria-hidden="true">06</span>Модели</button>
 </nav>
 </div>
 
 <!-- Вкладка 1: голоса -->
-<main class="tab-panel" id="tab-voices">
+<main class="tab-panel" id="tab-voices" role="tabpanel" aria-labelledby="tabbtn-voices">
 <div class="workspace">
   <section class="section-heading">
     <div>
@@ -198,7 +206,7 @@
 </main>
 
 <!-- Вкладка 2: озвучка диалога -->
-<main class="tab-panel" id="tab-dialogue" hidden>
+<main class="tab-panel" id="tab-dialogue" role="tabpanel" aria-labelledby="tabbtn-dialogue" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>
@@ -282,9 +290,9 @@
             <div class="alert error" id="timeline-error"></div>
           </div>
 
-          <div class="view-switch" role="tablist">
-            <button class="tiny ghost active" data-view="visual" role="tab">Visual editor</button>
-            <button class="tiny ghost" data-view="source" role="tab">Source / Advanced</button>
+          <div class="view-switch" role="group" aria-label="Представление диалога">
+            <button class="tiny ghost active" data-view="visual" aria-pressed="true">Visual editor</button>
+            <button class="tiny ghost" data-view="source" aria-pressed="false">Source / Advanced</button>
           </div>
 
           <div id="visual-view">
@@ -629,7 +637,7 @@
 </main>
 
 <!-- Вкладка 3: сплошной текст -->
-<main class="tab-panel" id="tab-text" hidden>
+<main class="tab-panel" id="tab-text" role="tabpanel" aria-labelledby="tabbtn-text" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>
@@ -940,7 +948,7 @@
      микрофон, а не модель. Проект записи живёт в backend (`recordings/`), поэтому
      разметка вкладки переживает перезагрузку страницы; локально во фронтенде
      остаются только открытая реплика и несохранённые ползунки обработки. -->
-<main class="tab-panel" id="tab-recording" hidden>
+<main class="tab-panel" id="tab-recording" role="tabpanel" aria-labelledby="tabbtn-recording" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>
@@ -1028,9 +1036,9 @@
           </div>
         </div>
         <div class="panel-body">
-          <div class="view-switch" id="rec-order" role="tablist">
-            <button class="tiny ghost active" data-order="dialogue" role="tab">По диалогу</button>
-            <button class="tiny ghost" data-order="roles" role="tab">По ролям</button>
+          <div class="view-switch" id="rec-order" role="group" aria-label="Порядок записи">
+            <button class="tiny ghost active" data-order="dialogue" aria-pressed="true">По диалогу</button>
+            <button class="tiny ghost" data-order="roles" aria-pressed="false">По ролям</button>
           </div>
 
           <div class="card" id="rec-replica-card">
@@ -1168,7 +1176,7 @@
 </main>
 
 <!-- Вкладка 4: словарь произношения -->
-<main class="tab-panel" id="tab-dictionary" hidden>
+<main class="tab-panel" id="tab-dictionary" role="tabpanel" aria-labelledby="tabbtn-dictionary" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>
@@ -1286,7 +1294,7 @@
 </main>
 
 <!-- Вкладка 5: менеджер моделей -->
-<main class="tab-panel" id="tab-models" hidden>
+<main class="tab-panel" id="tab-models" role="tabpanel" aria-labelledby="tabbtn-models" hidden>
 <div class="workspace">
   <section class="section-heading">
     <div>

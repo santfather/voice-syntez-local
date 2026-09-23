@@ -479,7 +479,11 @@ function initials(name) {
 // --- вкладки ------------------------------------------------------------------
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach((tab) => {
-    tab.classList.toggle('active', tab.dataset.tab === name);
+    const isActive = tab.dataset.tab === name;
+    tab.classList.toggle('active', isActive);
+    // aria-selected — не украшение разметки, а состояние: разметка объявляет
+    // role="tab", и скринридер узнаёт о переключении только отсюда.
+    tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
   });
   $('tab-voices').hidden = name !== 'voices';
   $('tab-dialogue').hidden = name !== 'dialogue';
@@ -1289,9 +1293,15 @@ function voiceName(voiceId) {
 }
 
 // Два представления одного диалога: карточки реплик и исходный текст с маркерами.
+// Переключатели — кнопки-тумблеры (aria-pressed), а не вкладки: панелей с
+// aria-controls у них нет, и выдавать их за role="tab" нельзя.
+// Селектор только по [data-view]: у похожей группы «Порядок записи» своя пара
+// кнопок, и трогать их отсюда нечем.
 function switchDialogueView(view) {
-  document.querySelectorAll('.view-switch button').forEach((button) => {
-    button.classList.toggle('active', button.dataset.view === view);
+  document.querySelectorAll('.view-switch button[data-view]').forEach((button) => {
+    const isActive = button.dataset.view === view;
+    button.classList.toggle('active', isActive);
+    button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
   });
   $('visual-view').hidden = view !== 'visual';
   $('source-view').hidden = view !== 'source';
@@ -3414,7 +3424,9 @@ function bindEvents() {
   });
 
   // Два представления одного диалога: карточки реплик и исходный текст с маркерами.
-  document.querySelectorAll('.view-switch button').forEach((button) => {
+  // Только [data-view]: у группы «Порядок записи» на вкладке записи свои кнопки и
+  // свой обработчик, и подписка на них отсюда скрывала бы обе панели диалога.
+  document.querySelectorAll('.view-switch button[data-view]').forEach((button) => {
     button.addEventListener('click', () => switchDialogueView(button.dataset.view));
   });
   // Разбор — только по команде: правка текста меняет состав реплик, и молча
