@@ -646,6 +646,7 @@ class VoicesStore:
         engine: str = "",
         denoise: bool = False,
     ) -> Voice:
+        """Заводит голос: движку без клонирования — без записи, иначе с референсом."""
         if not name.strip():
             raise ValueError("Не задано имя голоса")
 
@@ -995,6 +996,7 @@ class VoicesStore:
         return changed
 
     def delete(self, voice_id: str) -> bool:
+        """Удаляет голос вместе с его файлом; неизвестный id — `False`."""
         with self._lock:
             voices = self._read()
             keep = [v for v in voices if v.id != voice_id]

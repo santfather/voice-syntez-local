@@ -105,6 +105,7 @@ class CaseRun:
     options: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        """Плоское представление прогона одного кейса для отчёта."""
         return {
             "case_id": self.case_id,
             "category": self.category,
@@ -121,6 +122,7 @@ class CaseRun:
 
     @classmethod
     def from_dict(cls, raw: dict) -> CaseRun:
+        """Собирает прогон кейса из записи, сохранённой в JSON."""
         return cls(
             case_id=str(raw.get("case_id") or ""),
             category=str(raw.get("category") or ""),

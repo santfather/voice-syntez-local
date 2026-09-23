@@ -135,6 +135,11 @@ class AnalysisCache:
     def lookup(
         self, project_id: str, replica_index: int, key: AnalysisKey
     ) -> CacheLookup:
+        """Отдаёт кешированный разбор, только если ключ совпал целиком.
+
+        Любое расхождение или негодный статус — промах с причиной в `reason`, а
+        не частично применённый разбор.
+        """
         row = self._repo.get(project_id, replica_index)
         if row is None:
             return CacheLookup(reason="нет сохранённого разбора")
@@ -157,6 +162,7 @@ class AnalysisCache:
 
     # -- запись -----------------------------------------------------------------
     def save(self, project_id: str, replica_index: int, analysis: ReplicaAnalysis) -> dict:
+        """Сохраняет разбор вместе с ключом, по которому его потом найдут."""
         key = key_for(analysis)
         return self._repo.upsert(
             analysis_id=uuid.uuid4().hex,

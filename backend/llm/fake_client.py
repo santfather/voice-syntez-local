@@ -156,6 +156,7 @@ class FakeOllamaClient:
         on_token: Callable[[str], None] | None = None,
         think: bool | None = None,
     ) -> ChatResult:
+        """Заглушка чата для тестов: пишет вызов и отдаёт заранее заданный ответ."""
         self.calls.append(
             {
                 "model": model,

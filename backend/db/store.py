@@ -124,6 +124,7 @@ class ProjectsStore:
         mode: str = config.PROJECT_MODE_DIALOGUE,
         render_settings: dict | None = None,
     ) -> dict:
+        """Проверяет имя и режим, создаёт проект и возвращает его целиком."""
         name = name.strip()
         if not name:
             raise ValueError("Не задано имя проекта")

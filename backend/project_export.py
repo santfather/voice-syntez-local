@@ -393,6 +393,11 @@ def build_final_track(project: dict) -> tuple[np.ndarray, list[timeline.ReplicaT
 
 
 def export_final_audio(project: dict, output_format: str) -> Path:
+    """Собирает финальный трек проекта и пишет его файлом в заданном формате.
+
+    Пустое звучание — ошибка, а не пустой файл: рендер трека без активных take'ов
+    означал бы успешный экспорт тишины.
+    """
     if output_format not in ("wav", "mp3"):
         raise ProjectExportError(
             f"Неизвестный формат экспорта: {output_format or '(пусто)'}. Доступны: wav, mp3"

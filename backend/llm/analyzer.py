@@ -111,6 +111,7 @@ class AnalyzerSettings:
     required_for_render: bool = False
 
     def to_dict(self) -> dict:
+        """Плоское представление настроек анализатора для экрана настроек."""
         return {
             "enabled": self.enabled,
             "primary_model": self.primary_model,
@@ -453,6 +454,7 @@ class ReplicaAnalysis:
         return self.status == STATUS_NEEDS_REVIEW
 
     def to_dict(self) -> dict:
+        """Плоское представление разбора реплики: пункты, отброшенное и провенанс."""
         return {
             "replica_id": self.replica_id,
             "status": self.status,
@@ -715,6 +717,7 @@ class LinguisticAnalyzer:
         model_digest = self._model_digest(model)
 
         def failed(replica_id: int, error: str) -> ReplicaAnalysis:
+            """Разбор-ошибка для реплики окна с уже посчитанным digest модели."""
             # digest читается один раз на окно, а не на каждую реплику: паспорт
             # модели — это её свойство, а не свойство разбора.
             return self._failure(

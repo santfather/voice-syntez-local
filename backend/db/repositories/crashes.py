@@ -92,6 +92,7 @@ class WorkerCrashesRepository:
         memory_percent: float | None = None,
         created_at: str | None = None,
     ) -> dict:
+        """Записывает падение воркера и отдаёт сохранённую строку целиком."""
         cursor = self._conn.execute(
             "INSERT INTO worker_crashes (created_at, job_id, project_id, replica_id,"
             " replica_index, engine, error_type, message, pid, exit_code, signal,"
@@ -124,6 +125,7 @@ class WorkerCrashesRepository:
         return row_to_crash(row)
 
     def list_recent(self, limit: int = 20, project_id: str | None = None) -> list[dict]:
+        """Свежие падения, не больше двухсот; проект сужает выборку."""
         limit = max(1, min(int(limit), 200))
         if project_id:
             rows = self._conn.execute(

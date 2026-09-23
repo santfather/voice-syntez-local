@@ -111,6 +111,7 @@ def expand_units(text: str) -> str:
     """Согласует число с известной единицей; неизвестное слово не трогает."""
 
     def replace(match: re.Match) -> str:
+        """Подставляет единицу, согласованную с числом; неизвестное слово не трогает."""
         raw, token, dot = match.group(1), match.group(2), match.group(3)
         alias = token.lower()
         entry = _UNIT_BY_ALIAS.get(alias)
@@ -132,6 +133,7 @@ def expand_ranges(text: str) -> str:
     """Диапазоны — «от … до …»; год читается порядковым, единица — как обычно."""
 
     def replace(match: re.Match) -> str:
+        """Разворачивает диапазон в «от … до …»; годы идут порядковыми."""
         left = number_value(match.group(1))
         right = number_value(match.group(2))
         token = match.group(3)

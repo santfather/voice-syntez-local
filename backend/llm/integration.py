@@ -403,6 +403,7 @@ class ProjectAnalysisOutcome:
         ]
 
     def to_dict(self) -> dict:
+        """Плоское представление итога анализа проекта для отчёта."""
         return {
             "status": self.status,
             "model_tag": self.model_tag,

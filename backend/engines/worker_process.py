@@ -197,6 +197,11 @@ def _parse_args(argv: list[str]) -> tuple[str, int, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Главный цикл воркера: приём запросов к движку и ответы по каналу.
+
+    Выход по EOF — штатное закрытие родителем; воркер обязан уйти, иначе на
+    машине остался бы процесс с моделью в памяти и без хозяина.
+    """
     engine_id, request_fd, response_fd = _parse_args(list(sys.argv[1:] if argv is None else argv))
     _configure_logging(engine_id)
     # Порядок важен: `config` выставляет лимиты потоков в переменных окружения, и

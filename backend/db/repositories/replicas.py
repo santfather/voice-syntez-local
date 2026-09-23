@@ -30,6 +30,12 @@ def _pace_or_empty(value: object) -> str:
 
 
 def row_to_replica(row: sqlite3.Row) -> dict:
+    """Собирает реплику из строки БД для API и хранилища.
+
+    Действующие эмоция и просодия вычисляются здесь, а не читаются: правило
+    `override → detected` одно на всё приложение, и колонка-дубликат однажды
+    разошлась бы с ним.
+    """
     return {
         "id": row["id"],
         "project_id": row["project_id"],

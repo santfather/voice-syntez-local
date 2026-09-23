@@ -173,6 +173,7 @@ class ResolvedReference:
     candidates_tried: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
+        """Плоское представление выбранного референса под именами полей §24."""
         return {
             "voice_id": self.voice_id,
             "requested_emotion": self.requested_emotion,

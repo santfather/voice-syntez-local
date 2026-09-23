@@ -127,6 +127,7 @@ class Replica:
         return voice_label(self.voice)
 
     def to_dict(self) -> dict:
+        """Плоское представление реплики для API и диагностики."""
         return {
             "voice": self.voice,
             "label": self.label,

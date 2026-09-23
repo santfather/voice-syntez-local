@@ -216,6 +216,7 @@ class RecordingProject:
         ]
 
     def readiness(self) -> dict:
+        """Готовность к рендеру: сколько реплик записано и всем ли ролям хватает дублей."""
         total = len(self.replicas)
         done = total - len(self.missing_replicas())
         roles_ready = 0
@@ -239,6 +240,7 @@ class RecordingProject:
 
     # -- сериализация ----------------------------------------------------------
     def to_dict(self) -> dict:
+        """Плоское представление проекта записи для хранения в JSON."""
         return {
             "id": self.id,
             "name": self.name,
@@ -258,6 +260,7 @@ class RecordingProject:
 
     @classmethod
     def from_dict(cls, raw: dict) -> RecordingProject:
+        """Собирает проект записи из сохранённого словаря, заполняя пропуски."""
         return cls(
             id=str(raw.get("id") or uuid.uuid4().hex[:12]),
             name=str(raw.get("name") or "Запись"),
@@ -354,6 +357,7 @@ class RecordingStore:
             return self._read_index()
 
     def create_project(self, name: str, dialogue_text: str = "") -> RecordingProject:
+        """Создаёт проект записи с его каталогами и кладёт в индекс."""
         name = name.strip()
         if not name:
             raise ValueError("Не задано имя проекта записи")
@@ -412,6 +416,7 @@ class RecordingStore:
         status: str | None = None,
         last_error: str | None = None,
     ) -> RecordingProject:
+        """Меняет переданные поля проекта; порядок записи ограничен двумя значениями."""
         with self._lock:
             project = self.require_project(project_id)
             if name is not None:
@@ -483,6 +488,7 @@ class RecordingStore:
         pitch_semitones: float = 0.0,
         denoise: bool = False,
     ) -> RecordedVoiceProfile:
+        """Добавляет записываемый голос; пустое имя заменяется порядковым."""
         with self._lock:
             project = self.require_project(project_id)
             profile = RecordedVoiceProfile(
@@ -506,6 +512,7 @@ class RecordingStore:
         pitch_semitones: float | None = None,
         denoise: bool | None = None,
     ) -> RecordedVoiceProfile:
+        """Меняет переданные поля голоса; отсутствующий профиль — ошибка."""
         with self._lock:
             project = self.require_project(project_id)
             profile = project.profile(profile_id)
@@ -591,6 +598,7 @@ class RecordingStore:
         return project.takes_for(int(index))
 
     def select_take(self, project_id: str, index: int, take_id: str) -> RecordingProject:
+        """Делает дубль активным для реплики; отсутствующий дубль — ошибка."""
         with self._lock:
             project = self.require_project(project_id)
             take = next(

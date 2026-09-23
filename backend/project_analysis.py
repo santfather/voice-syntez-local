@@ -85,6 +85,11 @@ class ReplicaPreparation:
         return bool(self.pronunciation_candidates)
 
     def to_dict(self) -> dict:
+        """Плоское представление подготовки реплики для API.
+
+        `analysis_status` несёт итог: без него провалившаяся реплика записалась
+        бы как `done` и проект считался бы готовым к синтезу.
+        """
         return {
             "index": self.index,
             "source_text": self.source_text,

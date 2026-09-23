@@ -231,6 +231,11 @@ class SpeakerSettings:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SpeakerSettings":
+        """Собирает настройки спикера из тела запроса.
+
+        В `overrides` попадают только ключи, присланные явно: значения,
+        досчитанные из дефолтов, не должны молча перекрывать пресет голоса.
+        """
         raw_pause = data.get("pause_override_ms")
         raw_params = data.get("engine_params")
         settings = cls(
@@ -1238,6 +1243,7 @@ async def _transcribe_chunk(chunk: np.ndarray) -> str:
     """
 
     def run() -> str:
+        """Расшифровывает кусок синхронно — через временный файл для воркера."""
         # Префикс — часть контракта с очисткой кеша: `cache_cleanup` узнаёт свои
         # остатки по явному имени (`voice-syntez-`), а не по маске «похоже на
         # временный файл». Процесс может упасть между созданием и удалением, и
@@ -1302,6 +1308,7 @@ class ShortRun:
         return self.settings.enabled
 
     def to_dict(self) -> dict:
+        """Плоское представление прогона: план плюс стадия, вердикт и границы."""
         payload = self.plan.to_dict()
         # Стадия планировщика (§25): «что сделали» рядом с «что просили»
         # (`short_utterance_strategy`). Откат виден как FALLBACK_DIRECT, а не как

@@ -63,6 +63,7 @@ class RunMetadata:
     options: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        """Паспорт прогона для отчёта: версии, машина и параметры модели."""
         payload = {
             "benchmark_version": self.benchmark_version,
             "dataset_version": self.dataset_version,

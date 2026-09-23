@@ -107,6 +107,7 @@ class PronunciationRepository:
         enabled: bool = True,
         note: str = "",
     ) -> dict:
+        """Заводит правило словаря; в проектный словарь подставляется его id."""
         now = _now()
         columns = "source, target, case_sensitive, whole_word, enabled, note, created_at, updated_at"
         values: tuple = (

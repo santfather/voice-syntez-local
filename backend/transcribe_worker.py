@@ -61,6 +61,12 @@ def asr_generate_kwargs(language: str | None = None) -> dict:
 
 
 def main() -> int:
+    """Точка входа воркера распознавания: печатает JSON-результат в stdout.
+
+    Режет запись ровно так же, как её режет синтез (12 секунд плюс обрезка
+    тишины), если не запрошена расшифровка файла целиком: расшифровка обязана
+    описывать тот же фрагмент, который уйдёт в модель.
+    """
     words = WORDS_FLAG in sys.argv
     full = words or FULL_FLAG in sys.argv
     paths = [arg for arg in sys.argv[1:] if arg not in (FULL_FLAG, WORDS_FLAG)]

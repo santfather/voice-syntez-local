@@ -81,6 +81,7 @@ class BenchmarkResult:
     seed: int | None = None
 
     def to_dict(self, run_id: str) -> dict:
+        """Плоское представление итога движка; `run_id` нужен для ссылки на аудио."""
         return {
             "engine": self.engine,
             "engine_label": self.engine_label,

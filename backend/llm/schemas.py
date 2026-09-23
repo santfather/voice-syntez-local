@@ -888,6 +888,7 @@ class DatasetCase:
         }
 
     def to_dict(self) -> dict:
+        """Плоское представление кейса датасета для отчёта."""
         return {
             "id": self.id,
             "category": self.category,
@@ -904,6 +905,7 @@ class DatasetCase:
 
     @classmethod
     def from_dict(cls, raw: dict) -> DatasetCase:
+        """Собирает кейс датасета из записи JSONL."""
         return cls(
             id=str(raw.get("id") or ""),
             category=str(raw.get("category") or ""),

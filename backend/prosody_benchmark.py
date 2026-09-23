@@ -453,6 +453,7 @@ class CellResult:
     metrics: CellMetrics | None = None
 
     def to_dict(self) -> dict:
+        """Плоское представление ячейки матрицы: вход, результат и метрики."""
         return {
             "case_id": self.case_id,
             "category": self.category,
@@ -490,6 +491,7 @@ class ProsodyBenchmarkRun:
     cells: list[CellResult] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        """Плоское представление прогона матрицы вместе со всеми ячейками."""
         return {
             "benchmark_id": self.id,
             "voice_id": self.voice_id,
@@ -519,6 +521,7 @@ def make_run(
     seed: int = DEFAULT_SEED,
     speed: float | None = None,
 ) -> ProsodyBenchmarkRun:
+    """Заводит прогон матрицы по голосу, движку и списку профилей."""
     return ProsodyBenchmarkRun(
         id=make_run_id(),
         voice_id=voice.id,

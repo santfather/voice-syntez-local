@@ -247,6 +247,7 @@ class Job:
         return min(self.current_replica / self.total_replicas, 1.0)
 
     def to_dict(self) -> dict:
+        """Плоское представление задачи для опроса статуса интерфейсом."""
         return {
             "job_id": self.id,
             "status": self.status.value,
@@ -404,6 +405,7 @@ class JobQueue:
 
     # -- API -------------------------------------------------------------------
     def submit(self, payload: JobPayload, priority: int = PRIORITY_RENDER) -> Job:
+        """Ставит новую задачу рендера в очередь и возвращает её."""
         self._ensure_capacity(priority)
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -2155,6 +2157,11 @@ class JobQueue:
         def on_chunk_timing(
             index: int, seconds: float, audio_sec: float, qa_outcome: QaOutcome | None
         ) -> None:
+            """Факт по куску — в статистику ETA и в остаток задачи.
+
+            Остаток считается от `index + 1`: выполненная работа обязана
+            уменьшать оценку, а не подтверждать прежнюю.
+            """
             if not 0 <= index < len(plan):
                 return
             step = plan[index]

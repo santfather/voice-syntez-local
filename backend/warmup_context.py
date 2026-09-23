@@ -119,6 +119,7 @@ class WarmupContext:
         return f"{self.prefix_text.rstrip()} {self.target_text.lstrip()}"
 
     def to_dict(self, *, include_prefix: bool = True) -> dict:
+        """Плоское представление разогрева; технический префикс — по запросу."""
         payload = {
             "warmup_used": bool(self.prefix_text),
             "warmup_boundary_sec": self.boundary_sec,

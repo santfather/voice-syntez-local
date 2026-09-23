@@ -295,6 +295,7 @@ class ShortUtteranceContext:
     prosody: str = ""
 
     def to_dict(self) -> dict:
+        """Плоское представление контекста короткой реплики для диагностики."""
         return {
             "target_index": self.target_index,
             "target_text": self.target_text,
@@ -815,6 +816,7 @@ class ShortVerdict:
         return (-len(self.reasons), -(self.wer if self.wer is not None else 1.0))
 
     def to_dict(self) -> dict:
+        """Плоское представление вердикта: причины и слова расхождения."""
         return {
             "ok": self.ok,
             "reasons": list(self.reasons),

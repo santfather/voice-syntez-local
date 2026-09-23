@@ -11,6 +11,11 @@ def _now() -> str:
 
 
 def row_to_take(row: sqlite3.Row) -> dict:
+    """Собирает вариант из строки БД; пустые `qa`/`quality` — это `None`.
+
+    «Метрик нет» и «метрики пусты» должны различаться, поэтому пустая колонка
+    не превращается в пустой объект.
+    """
     return {
         "id": row["id"],
         "replica_id": row["replica_id"],
@@ -44,6 +49,7 @@ class TakesRepository:
         qa: dict | None = None,
         quality: dict | None = None,
     ) -> dict:
+        """Записывает готовое аудио варианта и отдаёт сохранённую строку."""
         cursor = self._conn.execute(
             "INSERT INTO takes (replica_id, label, audio_path, seed, engine, parameters,"
             " duration_sec, qa, quality, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

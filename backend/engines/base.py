@@ -281,6 +281,7 @@ class EngineInfo:
     default_mode: str = ""
 
     def to_dict(self) -> dict:
+        """Паспорт движка для интерфейса: возможности, режимы и параметры."""
         return {
             "id": self.id,
             "label": self.label,

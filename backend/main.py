@@ -611,6 +611,11 @@ def _warmup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Жизненный цикл приложения: подъём ресурсов, прогрев и корректное выключение.
+
+    Порядок шагов обязателен: журнал — первым, а состояния «идёт» приходится
+    сбрасывать, потому что очередь живёт в памяти и не переживает перезапуск.
+    """
     # Первым делом журнал: всё, что происходит дальше (замок, миграции, прогрев),
     # должно попадать и в файл, а не только в консоль (F-F1).
     _configure_file_logging()
@@ -958,6 +963,11 @@ async def llm_models() -> dict:
 
 @app.get("/api/status")
 async def status() -> dict:
+    """Состояние движков, акцентуатора и очереди для дашборда.
+
+    Читается из памяти, без ожидания моделей: статус обязан отвечать, даже
+    когда воркер мёртв или модель ещё грузится.
+    """
     accentizer = Accentizer.instance()
     engines = created_engines()
     f5 = engines.get(ENGINE_F5)
@@ -1404,6 +1414,11 @@ async def create_voice(
     denoise: bool = Form(False),
     file: UploadFile | None = File(None),
 ) -> dict:
+    """Создаёт голос из загруженной записи и отдаёт его карточку.
+
+    Файл необязателен: движку со встроенными голосами запись не нужна, и это
+    решает `create`; размер проверяется до чтения в память.
+    """
     # Файл необязателен: движку со встроенными голосами запись не нужна вовсе
     # (см. `EngineInfo.builtin_voices`). Кому она нужна — скажет `create`: он же
     # выбирает движок по полу, когда он не задан.
@@ -2170,6 +2185,11 @@ async def preview(payload: PreviewRequest) -> dict:
 
 @app.post("/api/generate", status_code=202)
 async def generate(payload: GenerateRequest) -> dict:
+    """Принимает диалог, проверяет назначение голосов и ставит задачу рендера.
+
+    Голос обязателен каждому спикеру: иначе задача встала бы в очередь и упала
+    уже в воркере, без понятной пользователю причины.
+    """
     try:
         parsed = parse_dialogue(payload.dialogue_text, config.chunk_chars(payload.chunk_strategy))
     except ValueError as exc:
@@ -2888,6 +2908,7 @@ async def get_project(project_id: str) -> dict:
 
 @app.patch("/api/projects/{project_id}")
 async def update_project(project_id: str, payload: ProjectUpdateRequest) -> dict:
+    """Частично обновляет проект: спикеры и настройки — одним запросом."""
     fields = payload.model_dump(exclude_unset=True, exclude={"speakers"})
     speakers = (
         None
@@ -3855,6 +3876,11 @@ async def cancel_job(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str) -> dict:
+    """Статус задачи для опроса интерфейсом.
+
+    Готовый файл дополняется списком реплик с их звучанием (сид, QA, качество,
+    варианты) — один раз, вместе с результатом.
+    """
     queue = get_queue()
     job = queue.get(job_id)
     if job is None:
@@ -4480,6 +4506,7 @@ async def recording_output_audio(project_id: str, download: bool = False) -> Fil
 
 @app.get("/api/jobs/{job_id}/audio")
 async def job_audio(job_id: str, download: bool = False) -> FileResponse:
+    """Отдаёт готовый файл задачи; 409, пока файл ещё не готов."""
     job = get_queue().get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задача не найдена")

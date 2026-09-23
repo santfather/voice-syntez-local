@@ -53,6 +53,11 @@ def _shim_torchaudio_backend() -> None:
 
 
 def main() -> int:
+    """Точка входа воркера: снимает шум с файла DeepFilterNet'ом.
+
+    Аргументы — входное аудио и выходной WAV; код возврата 2 — неверное число
+    аргументов.
+    """
     if len(sys.argv) != 3:
         _log("usage: python -m backend.denoise_worker <input audio> <output wav>")
         return 2

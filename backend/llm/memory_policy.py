@@ -138,6 +138,7 @@ class MemoryDecision:
     must_abort_running: bool = False
 
     def to_dict(self) -> dict:
+        """Плоское представление решения о памяти для отчёта."""
         return {
             "level": self.level,
             "reason": self.reason,

@@ -62,6 +62,7 @@ class ProjectsRepository:
         mode: str = config.PROJECT_MODE_DIALOGUE,
         render_settings: dict | None = None,
     ) -> dict:
+        """Заводит проект черновиком с новым id и отдаёт его целиком."""
         project_id = uuid.uuid4().hex[:12]
         now = _now()
         self._conn.execute(

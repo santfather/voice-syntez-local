@@ -163,6 +163,11 @@ class ResourceGuard:
         self._last_breach_at = 0.0
 
     async def run(self) -> None:
+        """Фоновый цикл охраны памяти.
+
+        Прерывает текущую задачу только при **устойчивом** превышении: одиночный
+        замер мог бы оборвать валидную работу, а не спасти от утечки.
+        """
         while True:
             await asyncio.sleep(CHECK_INTERVAL_SEC)
             state = memory_monitor.get_state()

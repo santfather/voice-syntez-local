@@ -91,6 +91,7 @@ class XTTSEngine(SynthesisEngine):
 
     # -- загрузка --------------------------------------------------------------
     def load(self) -> None:
+        """Поднимает веса один раз под замком; повторный вызов — no-op."""
         with self._load_lock:
             if self._model is not None:
                 return
