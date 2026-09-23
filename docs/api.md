@@ -140,7 +140,7 @@
 | `GET` | `/healthz` | Живость сервиса для внешнего сторожа: `{"status": "ok", "database": "ok", "engines": {…}, "request_id": "…"}`, если база открывается и `PRAGMA quick_check` её не ругает, а среди созданных движков нет упавших (`failed`); иначе — 503 и `status: "degraded"` с причиной. Модель не ждёт и движки не поднимает: `idle` у неподнятого движка — норма. Краткая версия `/api/status`; в схему OpenAPI не входит |
 | `GET` | `/api/status` | Готовность каждого движка и акцентуатора, устройство, размер очереди, RSS, CPU, `memory_state` (NORMAL/WARNING/CRITICAL с причиной), `workers[]` (состояние процессов синтеза) и `mps_memory` (счётчики MPS или `null`). Модель не ждёт |
 | `POST` | `/api/parse` | Разобрать диалог → реплики + список спикеров (400 при слишком длинном куске) |
-| `POST` | `/api/text/preview` | Что услышит модель: стадии `original → normalized → yo → dictionary → accentized → final`, сработавшие правила, движок и состояние RUAccent — без синтеза, загрузки движка и записи в базу |
+| `POST` | `/api/text/preview` | Что услышит модель: стадии `original → normalized → yo → dictionary → accentized → final`, сработавшие правила, движок и состояние RUAccent — без синтеза, загрузки движка и записи в базу. Текст ограничен `TTS_MAX_PREVIEW_CHARS` (по умолчанию 2000), а не общим `TTS_MAX_TEXT_CHARS`: стадии считаются синхронно и панель ждёт их глазами |
 | `POST` | `/api/preview` | Прослушать голос: синтез одной фразы → `job_id` (приоритет 0) |
 | `POST` | `/api/generate` | Поставить задачу по диалогу → `job_id` (приоритет 2; `background: true` — приоритет 3) |
 | `POST` | `/api/render-text` | Поставить задачу по сплошному тексту (один голос) → `job_id` (приоритет 2; `background: true` — приоритет 3) |
