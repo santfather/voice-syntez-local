@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field, fields
@@ -13,8 +14,10 @@ from .denoise import clean_bytes as clean_reference_bytes
 from .engines.base import (
     ENGINE_F5,
     ENGINE_INFOS,
+    builtin_voices,
     default_engine_for_gender,
     normalize_engine_params,
+    requires_reference,
 )
 from .settings_resolution import COMMON_FIELDS, INT_FIELDS
 
@@ -23,6 +26,12 @@ logger = logging.getLogger(__name__)
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aiff", ".aif", ".webm"}
 MAX_AUDIO_BYTES = 50 * 1024 * 1024
 DEMO_PREFIX = "[demo]"
+
+# Имя файла референса: `<voice_id><suffix>` у основного и
+# `<voice_id>-<profile_id><suffix>` у интонационного профиля — оба id это
+# `uuid.uuid4().hex[:12]`. По этому шаблону восстанавливается привязка
+# «файл → голос», когда `voices.json` пропал (F-F2).
+_REFERENCE_FILE_RE = re.compile(r"^(?P<voice>[0-9a-f]{12})(?:-(?P<profile>[0-9a-f]{12}))?$")
 
 
 def _with_demo_prefix(name: str) -> str:
@@ -349,7 +358,11 @@ class Voice:
 
     def to_dict(self) -> dict:
         data = asdict(self)
-        data["has_audio"] = self.audio_path.exists()
+        # Наличие референса — это имя файла, а не существование пути: у голоса
+        # пресетного движка `audio_file` пуст, и `VOICES_DIR / ""` — сам каталог
+        # `voices/`, который существует всегда. Без проверки имени интерфейс
+        # показывал бы «референс есть» у голоса, у которого его нет.
+        data["has_audio"] = bool(self.audio_file) and self.audio_path.exists()
         # Профили отдаются уже с проекцией старого референса: интерфейсу не нужно
         # знать, был голос записан до появления эмоций или после.
         data["reference_profiles"] = [item.to_dict() for item in self.reference_profiles()]
@@ -365,14 +378,31 @@ class VoicesStore:
         self._lock = threading.Lock()
 
     # -- внутреннее ------------------------------------------------------------
-    def _read(self) -> list[Voice]:
+    def _payload(self) -> dict:
+        """Содержимое voices.json как словарь; отсутствующий или битый файл — пустой.
+
+        Отдельно от `_read`, потому что в файле лежит не только список голосов:
+        рядом живёт отметка о заведённых встроенных голосах движков, и она не
+        должна теряться при каждой записи списка.
+        """
         if not config.VOICES_JSON.exists():
-            return []
+            return {}
         try:
             payload = json.loads(config.VOICES_JSON.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("voices.json повреждён, читаю как пустой: %s", exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _read_seeded(self) -> list[str]:
+        """Движки, встроенные голоса которых уже заведены (см. `ensure_builtin_voices`)."""
+        seeded = self._payload().get("builtin_seeded")
+        if not isinstance(seeded, list):
             return []
+        return [item for item in seeded if isinstance(item, str)]
+
+    def _read(self) -> list[Voice]:
+        payload = self._payload()
         voices: list[Voice] = []
         for item in payload.get("voices", []):
             if not isinstance(item, dict):
@@ -407,9 +437,20 @@ class VoicesStore:
                 logger.warning("Пропускаю некорректную запись в voices.json: %s", exc)
         return voices
 
-    def _write(self, voices: list[Voice]) -> None:
+    def _write(self, voices: list[Voice], seeded: list[str] | None = None) -> None:
+        """Записывает список голосов, сохраняя отметку о встроенных голосах движков.
+
+        `seeded=None` — «не трогать отметку»: её меняет только
+        `ensure_builtin_voices`, а остальные записи (создание голоса, правка
+        движка, профили) должны её сохранить, иначе встроенные голоса вернулись бы
+        после первого же удаления.
+        """
+        data: dict = {"voices": [asdict(v) for v in voices]}
+        marker = sorted({*(self._read_seeded() if seeded is None else seeded)})
+        if marker:
+            data["builtin_seeded"] = marker
         config.VOICES_JSON.write_text(
-            json.dumps({"voices": [asdict(v) for v in voices]}, ensure_ascii=False, indent=2),
+            json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -451,6 +492,32 @@ class VoicesStore:
             return result.ref_text, None
         return declared, transcribe.check_ref_text_match(declared, result.ref_text)
 
+    def _create_builtin_voice(self, name: str, gender: str, engine: str) -> Voice:
+        """Карточка голоса для движка, который говорит своими встроенными голосами.
+
+        Референса у неё нет и быть не должно: движок выбирает встроенный голос по
+        полу (`EngineInfo.builtin_voices`), а запись он игнорирует. Пустой
+        `audio_file` и есть признак «запись не нужна» — по нему интерфейс не
+        показывает панель референсов, а пайплайн не ищет аудио. Имя и пол остаются
+        пользовательскими: карточка — то, как он называет голос движка.
+        """
+        with self._lock:
+            voices = self._read()
+            voice = Voice(
+                id=uuid.uuid4().hex[:12],
+                name=name,
+                gender=gender,
+                ref_text="",
+                audio_file="",
+                engine=engine,
+            )
+            voices.append(voice)
+            self._write(voices)
+        logger.info(
+            "Добавлен голос без референса «%s» (%s), движок %s", voice.name, voice.id, engine
+        )
+        return voice
+
     # -- публичное API ---------------------------------------------------------
     def list(self) -> list[Voice]:
         with self._lock:
@@ -458,6 +525,115 @@ class VoicesStore:
 
     def get(self, voice_id: str) -> Voice | None:
         return next((v for v in self.list() if v.id == voice_id), None)
+
+    def recover_from_files(self) -> int:
+        """Пересобирает `voices.json` сканированием каталога `voices/` (F-F2).
+
+        Файл может пропасть — удалён руками или не пережил сбой, — а записи в
+        каталоге останутся. Пустой список голосов выглядел бы как «ничего не
+        записано», и пользователь заново писал бы то, что уже лежит на диске,
+        поэтому библиотека собирается обратно по именам файлов.
+
+        Восстанавливается только закодированное в имени: какой файл какому голосу
+        принадлежит и какие профили у него есть. Имя, пол, расшифровку и движок по
+        файлу не прочитать — берутся значения по умолчанию, а метки (F0, полоса)
+        досчитает `inspect_existing` при следующем запуске.
+
+        Существующий файл не трогается: это спасение потерянного, а не миграция.
+        Возвращает число восстановленных голосов.
+        """
+        if config.VOICES_JSON.exists() or not config.VOICES_DIR.is_dir():
+            return 0
+        main: dict[str, str] = {}
+        profiles: dict[str, list[tuple[str, str]]] = {}
+        for path in sorted(config.VOICES_DIR.iterdir()):
+            if path.is_dir() or path.suffix.lower() not in ALLOWED_AUDIO_SUFFIXES:
+                continue
+            match = _REFERENCE_FILE_RE.match(path.stem)
+            if match is None:
+                continue
+            voice_id = match.group("voice")
+            profile_id = match.group("profile")
+            if profile_id is None:
+                main.setdefault(voice_id, path.name)
+            else:
+                profiles.setdefault(voice_id, []).append((profile_id, path.name))
+
+        voices: list[Voice] = []
+        for voice_id in sorted({*main, *profiles}):
+            voices.append(
+                Voice(
+                    id=voice_id,
+                    name=f"Восстановленный голос {voice_id}",
+                    gender="other",
+                    ref_text="",
+                    audio_file=main.get(voice_id, ""),
+                    profiles=[
+                        ReferenceProfile(
+                            id=profile_id,
+                            voice_id=voice_id,
+                            emotion=emotions.EMOTION_NEUTRAL,
+                            label="Восстановлен из файла",
+                            audio_file=file_name,
+                        )
+                        for profile_id, file_name in profiles.get(voice_id, [])
+                    ],
+                )
+            )
+        if not voices:
+            return 0
+        with self._lock:
+            self._write(voices)
+        logger.warning(
+            "voices.json отсутствовал — восстановлено голосов по файлам: %s", len(voices)
+        )
+        return len(voices)
+
+    # Аннотация `list` здесь строкой: в теле класса это имя уже занято методом
+    # списка голосов, и по значению она взяла бы его.
+    def ensure_builtin_voices(self, engine_ids: "list[str]") -> int:
+        """Заводит карточки встроенных голосов для движков, у которых есть веса.
+
+        Вызывается при старте и после скачивания модели: пока файлов движка нет,
+        голосам не с чем работать, а как только они появились — карточки должны
+        быть видны среди остальных, без записи референса и без подкладывания аудио
+        (см. `EngineInfo.builtin_voices`).
+
+        Идемпотентно **по движку**: отметка `builtin_seeded` в `voices.json`
+        помнит, для каких движков карточки уже заводились, поэтому удалённый
+        пользователем встроенный голос не возвращается при следующем запуске —
+        иначе удалить его было бы нельзя вовсе. Повторный запуск с тем же списком
+        движков не создаёт ничего.
+
+        Список движков передаёт вызывающий: «какие веса лежат на диске» — знание
+        `model_manager`, а не хранилища голосов.
+        """
+        created = 0
+        with self._lock:
+            voices = self._read()
+            seeded = self._read_seeded()
+            for engine_id in engine_ids:
+                presets = builtin_voices(engine_id)
+                if not presets or engine_id in seeded:
+                    continue
+                for preset in presets:
+                    voices.append(
+                        Voice(
+                            id=uuid.uuid4().hex[:12],
+                            name=preset.label,
+                            gender=preset.gender,
+                            ref_text="",
+                            audio_file="",
+                            engine=engine_id,
+                        )
+                    )
+                    created += 1
+                seeded.append(engine_id)
+            if created:
+                self._write(voices, seeded)
+        if created:
+            logger.info("Завёл встроенные голоса движков: %s", created)
+        return created
 
     def create(
         self,
@@ -470,6 +646,23 @@ class VoicesStore:
         engine: str = "",
         denoise: bool = False,
     ) -> Voice:
+        if not name.strip():
+            raise ValueError("Не задано имя голоса")
+
+        gender = gender if gender in ("male", "female", "other") else "other"
+        engine = check_engine(engine) if engine else default_engine_for_gender(gender)
+        # Движку без клонирования запись не нужна: он говорит своим встроенным
+        # голосом, и карточка отличается от заведённой приложением только именем и
+        # полом. Проверять здесь аудио значило бы требовать то, что движок
+        # игнорирует (см. EngineInfo.builtin_voices).
+        if not requires_reference(engine):
+            return self._create_builtin_voice(name.strip(), gender, engine)
+
+        if not audio_filename:
+            # Файла нет вовсе. Движкам со встроенными голосами запись не нужна, и
+            # они ушли веткой выше (см. `requires_reference`), поэтому здесь её
+            # отсутствие — ошибка запроса, а не повод завести голос без референса.
+            raise ValueError("Нужна запись голоса: этот движок синтезирует по референсу")
         suffix = Path(audio_filename).suffix.lower()
         if suffix not in ALLOWED_AUDIO_SUFFIXES:
             raise ValueError(f"Неподдерживаемый формат аудио: {suffix or '(нет расширения)'}")
@@ -477,11 +670,7 @@ class VoicesStore:
             raise ValueError("Пустой файл аудио")
         if len(audio_bytes) > MAX_AUDIO_BYTES:
             raise ValueError(f"Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ")
-        if not name.strip():
-            raise ValueError("Не задано имя голоса")
 
-        gender = gender if gender in ("male", "female", "other") else "other"
-        engine = check_engine(engine) if engine else default_engine_for_gender(gender)
         if denoise:
             # Чистим до всех проверок и до записи файла: и F0, и полоса, и расшифровка
             # должны считаться по той записи, которая реально уйдёт в модель.
@@ -782,7 +971,10 @@ class VoicesStore:
             voices = self._read()
             changed = 0
             for voice in voices:
-                if voice.f0_hz is not None or not voice.audio_path.exists():
+                # У голоса без референса проверять нечего: `audio_path` у него —
+                # сам каталог `voices/`, и чтение его байтов каждый запуск
+                # заканчивалось бы предупреждением в логе.
+                if voice.f0_hz is not None or not voice.audio_file or not voice.audio_path.exists():
                     continue
                 try:
                     audio_bytes = voice.audio_path.read_bytes()
@@ -809,10 +1001,13 @@ class VoicesStore:
             if len(keep) == len(voices):
                 return False
             removed = next(v for v in voices if v.id == voice_id)
-            try:
-                removed.audio_path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("Не удалось удалить файл голоса %s: %s", removed.audio_file, exc)
+            # У голоса без референса имя файла пусто, и `VOICES_DIR / ""` — сам
+            # каталог `voices/`: удалять там нечего.
+            if removed.audio_file:
+                try:
+                    removed.audio_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Не удалось удалить файл голоса %s: %s", removed.audio_file, exc)
             self._write(keep)
         logger.info("Удалён голос %s", voice_id)
         return True

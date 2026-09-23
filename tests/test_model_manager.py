@@ -6,8 +6,11 @@
 берётся из реестра движков, а движки в тестах не создаются.
 """
 
+import logging
+import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -24,6 +27,7 @@ from backend.model_manager import (
     KIND_CACHE,
     KIND_LOCAL,
     ModelBusyError,
+    ModelIntegrityError,
     ModelNotDownloadableError,
     ModelPathError,
     engine_available,
@@ -412,6 +416,83 @@ def test_interrupted_download_is_not_installed_and_can_resume(models_dir, monkey
     assert finished["missing_files"] == []
     # Первый (уже лежащий) файл повторно не качался — докачивалось недостающее.
     assert {call[1] for call in good.calls} == {config.HF_VOCAB_PATH}
+
+
+# --- 5b. проверка целостности скачанного (Фаза 3, F-E4) ------------------------
+def _hf_module(monkeypatch, *, size: int = 2048, reported: int | None = None,
+               api_error: Exception | None = None, write_file: bool = True):
+    """Заглушка `huggingface_hub`: пишет файл и отвечает про его размер.
+
+    Подменяется сам модуль, а не `_hf_download`: проверка целостности живёт
+    внутри этой функции (тесты менеджера её как раз подменяют), и отдельная
+    подмена модуля — единственный способ увидеть её работу без сети.
+    """
+    module = types.ModuleType("huggingface_hub")
+
+    def hf_hub_download(repo_id, filename, local_dir):
+        target = Path(local_dir) / filename
+        if not write_file:
+            return str(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x" * size)
+        return str(target)
+
+    class _Api:
+        def get_paths_info(self, repo_id, paths, expand=False):
+            if api_error is not None:
+                raise api_error
+            return [types.SimpleNamespace(size=reported if reported is not None else size)]
+
+    module.hf_hub_download = hf_hub_download
+    module.HfApi = _Api
+    monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+
+
+def test_downloaded_file_matches_hub_size(models_dir, monkeypatch):
+    _hf_module(monkeypatch, size=2048)
+    path = model_manager._hf_download("owner/repo", "model.pth", models_dir)
+    assert path.is_file()
+
+
+def test_truncated_download_is_reported_as_integrity_error(models_dir, monkeypatch):
+    """Обрыв на середине файла: размер не сошёлся — это ошибка, а не битые веса."""
+    _hf_module(monkeypatch, size=2048, reported=4096)
+    with pytest.raises(ModelIntegrityError, match="скачан не полностью"):
+        model_manager._hf_download("owner/repo", "model.pth", models_dir)
+
+
+def test_empty_downloaded_file_is_rejected(models_dir, monkeypatch):
+    _hf_module(monkeypatch, size=0)
+    with pytest.raises(ModelIntegrityError, match="пустым"):
+        model_manager._hf_download("owner/repo", "model.pth", models_dir)
+
+
+def test_file_missing_after_download_is_rejected(models_dir, monkeypatch):
+    """Библиотека отчиталась успехом, файла нет — молчать об этом нельзя."""
+    _hf_module(monkeypatch, write_file=False)
+    with pytest.raises(ModelIntegrityError, match="не найден после скачивания"):
+        model_manager._hf_download("owner/repo", "model.pth", models_dir)
+
+
+def test_integrity_check_skips_when_hub_metadata_is_unavailable(models_dir, monkeypatch, caplog):
+    """Размер узнать не удалось — скачивание не объявляется повреждённым."""
+    _hf_module(monkeypatch, size=2048, api_error=RuntimeError("нет сети до API"))
+    with caplog.at_level(logging.WARNING, logger="backend.model_manager"):
+        path = model_manager._hf_download("owner/repo", "model.pth", models_dir)
+
+    assert path.is_file()
+    assert "Не удалось узнать размер" in caplog.text
+
+
+def test_integrity_failure_reaches_download_state(models_dir, monkeypatch):
+    """Проверка — часть скачивания: пользователь видит ошибку, а не падение при загрузке."""
+    _hf_module(monkeypatch, size=2048, reported=4096)
+
+    get_manager().download(F5_ID)
+    assert wait_until(lambda: state(F5_ID)["download"]["state"] == DOWNLOAD_ERROR)
+    error = state(F5_ID)["download"]["error"]
+    assert "Не удалось скачать" in error
+    assert "скачан не полностью" in error
 
 
 # --- 6. повторный download не повреждает установленную модель ------------------

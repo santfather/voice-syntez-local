@@ -195,6 +195,68 @@ def test_doctor_never_loads_models(monkeypatch):
     assert report["checks"]
 
 
+# --- 3b. давление памяти в doctor (Фаза 3, §3.4) --------------------------------
+def _sysctl(monkeypatch, stdout: str, *, returncode: int = 0, error: Exception | None = None):
+    """Подменяет вызов sysctl: команда настоящая не запускается."""
+
+    def fake_run(args, **_kwargs):
+        assert args[:2] == ["sysctl", "-n"], args
+        if error is not None:
+            raise error
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+
+
+def test_doctor_reports_memory_pressure_by_level(monkeypatch):
+    """Давление памяти ядра читается без `sudo` — в отличие от `powermetrics`."""
+    _sysctl(monkeypatch, "1\n")
+    item, data = doctor._vm_pressure_check()
+    assert item["status"] == doctor.OK
+    assert data == {"level": 1, "level_name": "норма"}
+
+    _sysctl(monkeypatch, "2\n")
+    item, data = doctor._vm_pressure_check()
+    assert item["status"] == doctor.WARN
+    assert "почти занята" in item["detail"]
+    assert item["hint"], "у предупреждения должна быть подсказка, что делать"
+    assert data == {"level": 2, "level_name": "предупреждение"}
+
+    _sysctl(monkeypatch, "4\n")
+    item, _ = doctor._vm_pressure_check()
+    assert item["status"] == doctor.WARN
+    assert "критично" in item["detail"]
+
+
+def test_doctor_survives_unreadable_memory_pressure(monkeypatch):
+    """Остальные проверки сохраняют смысл, если счётчик недоступен или ответ чужой."""
+    _sysctl(monkeypatch, "", error=OSError("sysctl не найден"))
+    item, data = doctor._vm_pressure_check()
+    assert item["status"] == doctor.WARN
+    assert data["level"] is None
+
+    _sysctl(monkeypatch, "не число\n")
+    item, data = doctor._vm_pressure_check()
+    assert item["status"] == doctor.WARN
+    assert data["level"] is None
+
+
+def test_doctor_skips_memory_pressure_outside_macos(monkeypatch):
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    item, data = doctor._vm_pressure_check()
+    assert item["status"] == doctor.OK
+    assert "неприменима" in item["detail"]
+    assert data == {"level": None, "level_name": None}
+
+
+def test_collect_includes_memory_pressure(monkeypatch):
+    """Проверка попала в общий отчёт: имя в списке и число в JSON."""
+    _sysctl(monkeypatch, "1\n")
+    report = doctor.collect()
+    assert any(item["name"] == "давление памяти" for item in report["checks"])
+    assert report["vm_pressure"]["level"] == 1
+
+
 # --- 4. smoke: --help и --dry-run без сервера ----------------------------------
 def _closed_port() -> int:
     """Свободный порт, на котором заведомо никто не слушает."""
@@ -357,6 +419,33 @@ def test_run_sh_is_still_valid_and_unchanged_in_behavior():
     text = script.read_text(encoding="utf-8")
     assert "source venv/bin/activate" in text
     assert "uvicorn backend.main:app" in text
+
+
+# --- 9. run.sh пишет свой вывод в журнал (F-L2) --------------------------------
+def test_run_sh_logs_its_failure_to_the_journal(tmp_path):
+    """Падение до старта Python обязано остаться в журнале, а не только в окне.
+
+    Проверяется на самом раннем выходе run.sh — чужом pidfile: он не требует ни
+    venv, ни зависимостей, но проходит через ту же настройку журнала.
+    """
+    shutil.copy2(PROJECT_ROOT / "run.sh", tmp_path / "run.sh")
+    pidfile = tmp_path / "busy.pid"
+    pidfile.write_text(f"{os.getpid()}\n", encoding="utf-8")  # живой PID: место занято
+
+    result = subprocess.run(
+        ["bash", str(tmp_path / "run.sh")],
+        cwd="/",
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "TTS_PIDFILE": str(pidfile)},
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "уже запущено" in result.stderr, "сообщение остаётся ошибкой, а не уезжает в stdout"
+    journal = tmp_path / "logs" / "voice_syntez.log"
+    assert journal.exists(), "журнал заводится даже без запуска сервера"
+    assert "уже запущено" in journal.read_text(encoding="utf-8")
 
 
 # --- помощники лаунчера: версия Python, порт, замок ----------------------------

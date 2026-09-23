@@ -37,7 +37,7 @@ import numpy as np
 from . import audio_pipeline, config, timeline
 from .audio_pipeline import RenderSettings
 from .db.store import get_projects_store
-from .engines.base import ENGINE_INFOS, SAMPLE_RATE
+from .engines.base import ENGINE_INFOS, SAMPLE_RATE, requires_reference
 from .voices_store import ALLOWED_AUDIO_SUFFIXES
 from .voices_store import get_store as get_voices_store
 
@@ -166,15 +166,19 @@ def _voice_catalog(project: dict, archive: zipfile.ZipFile) -> tuple[dict[str, s
                     "preset": dict(voice.preset or {}),
                 }
             )
-            reference = voice.audio_path
-            name = _reference_name(reference, len(entries) + 1) if reference.is_file() else None
-            if name is None:
-                logger.warning(
-                    "Референс голоса «%s» потерян — архив поедет без него", voice.name
-                )
-            else:
-                archive.write(reference, name)
-                entry["reference"] = name
+            # Голос встроенного движка референса не имеет вовсе (см.
+            # `EngineInfo.builtin_voices`): это не потерянный файл, и в архив ему
+            # ехать нечем — предупреждать здесь не о чем.
+            if voice.audio_file:
+                reference = voice.audio_path
+                name = _reference_name(reference, len(entries) + 1) if reference.is_file() else None
+                if name is None:
+                    logger.warning(
+                        "Референс голоса «%s» потерян — архив поедет без него", voice.name
+                    )
+                else:
+                    archive.write(reference, name)
+                    entry["reference"] = name
         keys[voice_id] = key
         entries.append(entry)
     return keys, entries
@@ -567,17 +571,40 @@ def export_subtitles(project: dict, file_format: str) -> Path:
 
 
 # --- импорт --------------------------------------------------------------------
+def _mb(value: int) -> int:
+    """Размер в мегабайтах — для текста отказа, где байты ничего не говорят."""
+    return value // (1024 * 1024)
+
+
 def _validate_entries(archive: zipfile.ZipFile, work: Path) -> None:
-    """Проверяет каждую запись до распаковки: путь, тип, место назначения.
+    """Проверяет каждую запись до распаковки: путь, тип, место назначения, размер.
 
     Символические ссылки отклоняются отдельно: ZIP умеет хранить их как обычную
     запись с флагом, и распаковка такой ссылки создала бы файл вне каталога уже
     на следующем шаге.
+
+    Число записей и их суммарный размер ограничены здесь, до `_extract`: сжатый
+    «архив-бомба» весит мегабайты, а разворачивается в гигабайты, поэтому предел
+    на сжатый файл от него не спасает. Обе величины берутся из заголовков ZIP, без
+    распаковки, так что отклонение происходит до записи файлов на диск.
     """
-    names = archive.namelist()
-    if not names:
+    infos = archive.infolist()
+    if not infos:
         raise ProjectExportError("Архив пуст")
-    for info in archive.infolist():
+    if len(infos) > config.ARCHIVE_MAX_ENTRIES:
+        raise ProjectExportError(
+            f"В архиве слишком много записей: {len(infos)} "
+            f"(предел {config.ARCHIVE_MAX_ENTRIES})"
+        )
+    total_uncompressed = 0
+    for info in infos:
+        total_uncompressed += info.file_size
+        if total_uncompressed > config.ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+            raise ProjectExportError(
+                "Распакованный архив больше "
+                f"{_mb(config.ARCHIVE_MAX_UNCOMPRESSED_BYTES)} МБ — файл повреждён "
+                "или это не архив проекта"
+            )
         name = info.filename
         if not name or name.startswith("/") or "\\" in name or (len(name) > 1 and name[1] == ":"):
             raise ProjectExportError(f"Недопустимый путь в архиве: {name}")
@@ -636,29 +663,37 @@ def _create_voice(store, entry: dict, work: Path):
 
     Голос без референса или без его расшифровки создать нельзя — синтез по такому
     голосу всё равно не пойдёт, поэтому он пропускается с предупреждением, а
-    проект остаётся импортированным (спикер просто без голоса).
+    проект остаётся импортированным (спикер просто без голоса). Исключение —
+    движок со встроенными голосами: референса у его голоса нет по устройству, и
+    голос восстанавливается по имени, полу и движку (`EngineInfo.builtin_voices`).
     """
     name = str(entry.get("name") or "").strip()
     ref_text = str(entry.get("ref_text") or "").strip()
     reference = _inside(work, entry.get("reference"))
-    if not name or not ref_text or reference is None or not reference.is_file():
-        logger.warning(
-            "Импорт: голос «%s» пропущен — нет референса или его расшифровки", name or entry.get("key")
-        )
-        return None
     engine = str(entry.get("engine") or "")
     if engine not in ENGINE_INFOS:
         engine = ""
-    suffix = reference.suffix.lower()
-    if suffix not in ALLOWED_AUDIO_SUFFIXES:
-        suffix = ".wav"
+    builtin = bool(engine) and not requires_reference(engine)
+    if not builtin and (not name or not ref_text or reference is None or not reference.is_file()):
+        logger.warning(
+            "Импорт: голос «%s» пропущен — нет референса или его расшифровки",
+            name or entry.get("key"),
+        )
+        return None
+    suffix = ".wav"
+    audio_bytes = b""
+    if not builtin:
+        suffix = reference.suffix.lower()
+        if suffix not in ALLOWED_AUDIO_SUFFIXES:
+            suffix = ".wav"
+        audio_bytes = reference.read_bytes()
     try:
         voice = store.create(
             name=name,
             gender=str(entry.get("gender") or "other"),
             ref_text=ref_text,
-            audio_filename=f"import{suffix}",
-            audio_bytes=reference.read_bytes(),
+            audio_filename="" if builtin else f"import{suffix}",
+            audio_bytes=audio_bytes,
             verify_ref_text=False,
             engine=engine,
         )
@@ -829,6 +864,14 @@ def import_archive(data: bytes) -> dict:
     """Разворачивает `.ttsproject` в новый проект и возвращает его карточку."""
     if not data:
         raise ProjectExportError("Пустой файл архива")
+    # Предел на сжатый файл — здесь, а не только на входе запроса: `import_archive`
+    # зовётся и в обход FastAPI (тесты, скрипты), и проверка обязана быть в самом
+    # формате, а не в транспорте.
+    if len(data) > config.MAX_ARCHIVE_BYTES:
+        raise ProjectExportError(
+            f"Архив больше {_mb(config.MAX_ARCHIVE_BYTES)} МБ — "
+            "это не архив проекта или файл повреждён"
+        )
     stream = io.BytesIO(data)
     if not zipfile.is_zipfile(stream):
         raise ProjectExportError(

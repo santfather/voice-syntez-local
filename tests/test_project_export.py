@@ -23,7 +23,7 @@ import soundfile as sf
 from conftest import analyze_project, sine
 
 from backend import config, main, project_export
-from backend.engines.base import ENGINE_F5, SAMPLE_RATE
+from backend.engines.base import ENGINE_F5, ENGINE_KOKORO, SAMPLE_RATE
 from backend.job_queue import JobQueue
 from backend.voices_store import get_store as get_voices_store
 
@@ -249,6 +249,51 @@ def test_export_import_round_trip_restores_project(stub, monkeypatch):
 
 
 # --- 3. голоса на «новой машине» ----------------------------------------------
+def test_builtin_voice_travels_without_a_reference(stub, monkeypatch):
+    """Голос встроенного движка едет в архив без референса и восстанавливается.
+
+    Отсутствие записи у такого голоса — не потерянный файл, а устройство движка
+    (`EngineInfo.builtin_voices`): импорт обязан завести карточку по имени, полу и
+    движку, а не пропустить её как голос без референса.
+    """
+
+    async def scenario():
+        async with _client(monkeypatch) as client:
+            voice = get_voices_store().create(
+                name="Света",
+                gender="female",
+                ref_text="",
+                audio_filename="",
+                audio_bytes=b"",
+                engine=ENGINE_KOKORO,
+            )
+            project = await _create_project(client)
+            await _assign(client, project["id"], voice.id)
+
+            data = await _export_archive(client, project["id"])
+            entries = _manifest(data)["voices"]
+            assert [entry["name"] for entry in entries] == ["Света"]
+            assert entries[0]["reference"] is None
+            # Референсов в архиве нет вовсе: переносить нечего, и пустой каталог не
+            # создаётся — иначе «нет записи» выглядело бы как потерянная.
+            assert [name for name in _zip_names(data) if name.startswith("references/")] == []
+
+            # «Новая машина»: голоса здесь нет — ни записи, ни референса.
+            assert get_voices_store().delete(voice.id) is True
+
+            response = await _import(client, data)
+            assert response.status_code == 201, response.text
+            created = get_voices_store().list()
+            assert [item.name for item in created] == ["Света"]
+            assert [item.engine for item in created] == [ENGINE_KOKORO]
+            assert created[0].audio_file == ""
+            assert [item["voice_id"] for item in response.json()["speakers"]] == [
+                created[0].id, created[0].id
+            ]
+
+    _run(scenario)
+
+
 def test_voice_is_recreated_on_new_machine_and_reused_again(stub, monkeypatch):
     """Голос сопоставляется по имени: на новой машине создаётся, на своей — нет."""
     async def scenario():

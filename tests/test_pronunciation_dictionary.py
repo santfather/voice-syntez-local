@@ -20,9 +20,11 @@ from backend.dialogue_parser import Replica
 from backend.engines.base import STATE_READY, EngineInfo
 from backend.pronunciation import get_store
 from backend.text_normalization import normalize, normalize_report
+from backend.text_normalization import pronunciation as pronunciation_module
 from backend.text_normalization.pronunciation import (
     PronunciationRule,
     apply_pronunciation,
+    get_compiled_dictionary,
 )
 
 
@@ -258,6 +260,33 @@ def test_active_rules_cache_is_invalidated_by_writes():
 
     store.delete(entry["id"])
     assert store.active_rules() == []
+
+
+def test_compiled_dictionary_is_reused_until_the_dictionary_changes(monkeypatch):
+    """Регулярки компилируются раз на версию словаря, а не на каждую реплику."""
+    calls: list[int] = []
+    original = pronunciation_module._compile_dictionary
+
+    def counting(entries):
+        calls.append(len(entries))
+        return original(entries)
+
+    monkeypatch.setattr(pronunciation_module, "_compile_dictionary", counting)
+    pronunciation_module._compiled_cache.clear()  # кеш модуля живёт весь процесс
+
+    store = get_store()
+    store.create(source="SQL", target="эскьюэль")
+
+    first = get_compiled_dictionary(store.active_rules())
+    second = get_compiled_dictionary(store.active_rules())
+    assert first is second
+    assert len(calls) == 1
+
+    # Правка словаря — другая версия: старый кеш не годится, правила собираются заново.
+    store.create(source="OpenAI", target="оупен эй-ай")
+    changed = get_compiled_dictionary(store.active_rules())
+    assert len(calls) == 2
+    assert [rule.source for rule in changed.rules] == ["OpenAI", "SQL"]
 
 
 def test_repeated_create_updates_instead_of_duplicating():

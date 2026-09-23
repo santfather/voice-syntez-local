@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import random
+import shutil
 import tempfile
 import time
 import uuid
@@ -17,8 +18,10 @@ import numpy as np
 
 from . import (
     config,
+    engine_lifecycle,
     qa_screening,
     reference_resolver,
+    resource_guard,
     synthesis_trace,
     take_quality,
     warmup_context,
@@ -630,6 +633,12 @@ def _resolve_voice(label: str, settings: SpeakerSettings) -> Voice:
     voice = get_store().get(settings.voice_id)
     if voice is None:
         raise ValueError(f"Голос {settings.voice_id} для «{label}» не найден")
+    # Движку без клонирования референс не нужен вовсе (см.
+    # `EngineInfo.builtin_voices`): он говорит встроенным голосом, и требовать у
+    # его голоса запись с расшифровкой значило бы запрещать ровно то, ради чего
+    # этот движок и выбран.
+    if not requires_reference(voice.engine):
+        return voice
     if not voice.audio_path.exists():
         raise ValueError(f"Файл референса для голоса «{voice.name}» потерян ({voice.audio_file})")
     if not voice.ref_text.strip():
@@ -718,7 +727,11 @@ def _engine_for(voice: Voice) -> SynthesisEngine:
     """
     engine_id = str(voice.engine or "")
     fallback_id = fallback_engine(engine_id)
-    if fallback_id and not model_manager.engine_available(engine_id):
+    # Откат возможен только туда, где есть чем говорить: движку-клону нужен
+    # референс, а у голоса встроенного движка его нет. Иначе недоступность весов
+    # превратилась бы в «файл референса потерян» — ошибку про то, чего у голоса
+    # никогда не было, вместо «скачайте модель».
+    if fallback_id and voice.audio_file and not model_manager.engine_available(engine_id):
         logger.warning(
             "Движок «%s» недоступен (файлы модели не установлены) — голос «%s» "
             "синтезируется движком «%s». Скачайте модель во вкладке «Модели», "
@@ -940,7 +953,6 @@ def _pause_samples(speaker: SpeakerSettings, render: RenderSettings) -> int:
 def _log_synthesis_input(
     *,
     engine: SynthesisEngine,
-    voice: Voice,
     text: str,
     source_text: str | None,
     tuning: SpeakerSettings,
@@ -979,7 +991,9 @@ def _log_synthesis_input(
         source_text is not None,
         count_words(text),
         classify_utterance(text).kind,
-        Path(ref_audio_path).name if ref_audio_path else voice.audio_path.name,
+        # Пустой `ref_audio_path` — голос встроенного движка: референса у него нет
+        # вовсе, и в логе это «нет», а не имя каталога `voices/`.
+        Path(ref_audio_path).name if ref_audio_path else "нет",
         _text_fingerprint_text(ref_text or ""),
         tuning.speed,
         seed,
@@ -1005,6 +1019,45 @@ def _synthesize_in_thread(
         return engine.synthesize(**kwargs), None
     except Exception as exc:  # noqa: BLE001 — исключение не глотаем, а переносим наверх
         return None, exc
+
+
+async def _relieve_mps_pressure(
+    engine: SynthesisEngine, failure: BaseException, position: str
+) -> bool:
+    """Сообщает о нехватке памяти Metal и выгружает чужие тёплые движки.
+
+    Три числа из сообщения torch (`mps allocated` / `other allocations` / `max
+    allowed`) пишутся полями, а не тонут в тексте исключения: по ним видно, кто
+    занял память — сам движок или соседний (§11.4 аудита). В изолированном режиме
+    текст приходит из воркера уже чужим классом исключения, поэтому и разбор, и
+    распознавание идут по тексту (см. `resource_guard.is_mps_oom`).
+
+    Возвращает `True`, если что-то освободилось и повтор осмыслен. Пустая уборка
+    означает, что повтор даст тот же отказ, — тогда повтор не делается.
+    """
+    numbers = resource_guard.mps_oom_numbers(failure)
+    logger.error(
+        "tts.mps.oom engine=%s position=%s allocated=%s other=%s max_allowed=%s: %s",
+        engine.id,
+        position,
+        numbers["allocated"] if numbers else "неизвестно",
+        numbers["other"] if numbers else "неизвестно",
+        numbers["max_allowed"] if numbers else "неизвестно",
+        failure,
+    )
+    freed = await asyncio.to_thread(engine_lifecycle.free_warm_engines, engine.id)
+    if not freed:
+        logger.warning(
+            "tts.mps.oom engine=%s: свободных тёплых движков нет, повтор отменён", engine.id
+        )
+        return False
+    logger.info(
+        "tts.mps.oom engine=%s: выгружено (%s), повтор реплики %s",
+        engine.id,
+        ", ".join(freed),
+        position,
+    )
+    return True
 
 
 async def _synthesize_chunk(
@@ -1048,11 +1101,17 @@ async def _synthesize_chunk(
         else (random.randrange(config.SEED_MAX) if engine.supports_seed else None)
     )
     params = _engine_params(tuning, settings, seed, voice.gender)
-    ref_audio_path = str(reference.audio_path) if reference is not None else str(voice.audio_path)
-    ref_text = reference.ref_text if reference is not None else voice.ref_text
+    # У голоса встроенного движка референса нет, и в движок уходят пустые строки,
+    # а не путь к каталогу `voices/` (им при пустом `audio_file` становится сам
+    # каталог): движок их игнорирует, но в логе иначе стояло бы имя каталога.
+    if reference is not None:
+        ref_audio_path = str(reference.audio_path)
+        ref_text = reference.ref_text
+    else:
+        ref_audio_path = str(voice.audio_path) if voice.audio_file else ""
+        ref_text = voice.ref_text
     _log_synthesis_input(
         engine=engine,
-        voice=voice,
         text=text,
         source_text=source_text,
         tuning=tuning,
@@ -1066,45 +1125,61 @@ async def _synthesize_chunk(
         ref_text=ref_text,
     )
     started = time.monotonic()
-    try:
-        outcome, failure = await asyncio.wait_for(
-            asyncio.to_thread(
-                _synthesize_in_thread,
-                engine,
-                text=text,
-                ref_audio_path=ref_audio_path,
-                ref_text=ref_text,
-                speed=tuning.speed,
-                **params,
-            ),
-            timeout=config.CHUNK_TIMEOUT_SEC,
-        )
-    except asyncio.TimeoutError as exc:
-        # Зависший инференс нельзя прервать снаружи, если модель живёт в отдельном
-        # процессе: поток остался бы в нативном вызове, воркер — занятым навсегда,
-        # и следующая реплика встала бы за ним в очередь. Поэтому таймаут не
-        # только сообщается наверх, но и убивает процесс движка. Хук
-        # необязательный (`abort_current` есть только у изолированного движка):
-        # движки в процессе бэкенда о нём не знают и знать не должны.
-        abort = getattr(engine, "abort_current", None)
-        if callable(abort):
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(abort, f"таймаут {config.CHUNK_TIMEOUT_SEC:.0f} с"),
-                    timeout=ABORT_TIMEOUT_SEC,
-                )
-            except Exception as abort_exc:  # noqa: BLE001 — исход всё равно таймаут
-                logger.error("Не удалось прервать зависший синтез %s: %s", engine.id, abort_exc)
-        logger.warning(
-            "Таймаут синтеза: реплика %s не готова за %.0f c (движок %s, голос %s, %s)",
-            position, config.CHUNK_TIMEOUT_SEC, engine.id, tuning.voice_id,
-            _text_fingerprint_text(text),
-        )
-        raise ChunkTimeoutError(
-            f"Реплика {position} не синтезировалась за {config.CHUNK_TIMEOUT_SEC:.0f} c "
-            "— возможно, завис инференс"
-        ) from exc
-    if failure is not None:
+    # Нехватка памяти Metal — единственный отказ, который осмысленно повторить:
+    # освободив тёплые движки, тот же кусок может пройти (§11.4 аудита). Попыток
+    # ровно две: если и после уборки памяти не хватило, дело не в соседях, и
+    # честнее показать ошибку, чем крутиться в повторе. Сид и ручки у повтора те
+    # же — причина отказа не в них, — и строка входа синтеза остаётся одна.
+    for attempt in range(2):
+        try:
+            outcome, failure = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _synthesize_in_thread,
+                    engine,
+                    text=text,
+                    ref_audio_path=ref_audio_path,
+                    ref_text=ref_text,
+                    speed=tuning.speed,
+                    **params,
+                ),
+                timeout=config.CHUNK_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError as exc:
+            # Зависший инференс нельзя прервать снаружи, если модель живёт в
+            # отдельном процессе: поток остался бы в нативном вызове, воркер —
+            # занятым навсегда, и следующая реплика встала бы за ним в очередь.
+            # Поэтому таймаут не только сообщается наверх, но и убивает процесс
+            # движка. Хук необязательный (`abort_current` есть только у
+            # изолированного движка): движки в процессе бэкенда о нём не знают и
+            # знать не должны.
+            abort = getattr(engine, "abort_current", None)
+            if callable(abort):
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(abort, f"таймаут {config.CHUNK_TIMEOUT_SEC:.0f} с"),
+                        timeout=ABORT_TIMEOUT_SEC,
+                    )
+                except Exception as abort_exc:  # noqa: BLE001 — исход всё равно таймаут
+                    logger.error(
+                        "Не удалось прервать зависший синтез %s: %s", engine.id, abort_exc
+                    )
+            logger.warning(
+                "Таймаут синтеза: реплика %s не готова за %.0f c (движок %s, голос %s, %s)",
+                position, config.CHUNK_TIMEOUT_SEC, engine.id, tuning.voice_id,
+                _text_fingerprint_text(text),
+            )
+            raise ChunkTimeoutError(
+                f"Реплика {position} не синтезировалась за {config.CHUNK_TIMEOUT_SEC:.0f} c "
+                "— возможно, завис инференс"
+            ) from exc
+        if failure is None:
+            break
+        if (
+            attempt == 0
+            and resource_guard.is_mps_oom(failure)
+            and await _relieve_mps_pressure(engine, failure, position)
+        ):
+            continue
         logger.error(
             "Реплика %s (%s): движок %s упал (%s), %s",
             position, label, engine.id, type(failure).__name__, _text_fingerprint_text(text),
@@ -1576,6 +1651,18 @@ async def _synthesize_checked(
         return chunk, seed, None, None
 
     started = time.monotonic()
+    # Reference проверки (текст реплики после `normalize`) не зависит от попытки,
+    # поэтому считается один раз — при первом обращении: в режиме «smart»
+    # расшифровка бывает не нужна вовсе, и платить за неё на каждой реплике незачем.
+    prepared_reference: list[str] = []
+
+    def qa_reference() -> str:
+        if not prepared_reference:
+            prepared_reference.append(
+                normalize(replica.text, pronunciation=active_rules(), supports_accents=False)
+            )
+        return prepared_reference[0]
+
     limit = max(
         qa.max_attempts if use_qa else 1,
         short.settings.max_attempts if short is not None else 1,
@@ -1648,7 +1735,7 @@ async def _synthesize_checked(
                 )
         if use_qa and qa_outcome is None:
             try:
-                transcription, wer = await _transcribe_and_measure(measured, replica.text)
+                transcription, wer = await _transcribe_and_measure(measured, qa_reference())
             except Exception as exc:  # noqa: BLE001 — упавшая расшифровка не губит задачу
                 logger.warning(
                     "Реплика %s: проверка недоступна (%s: %s) — принимаю без проверки",
@@ -1829,26 +1916,30 @@ def _attempt_score(verdict: su.ShortVerdict | None, wer: float | None) -> tuple:
     return (1 if verdict.ok else 0, reasons, negative_wer)
 
 
-async def _transcribe_and_measure(chunk: np.ndarray, expected: str) -> tuple[str, float]:
+async def _transcribe_and_measure(chunk: np.ndarray, reference: str) -> tuple[str, float]:
     """Расшифровка куска и WER — одной операцией, чтобы текст был под рукой.
 
     Короткая проверка хочет не только число, но и саму расшифровку («Да, да, да…»
     видно словами). Вернуть её из `_measure_wer` дешевле, чем запускать Whisper
     второй раз ради той же записи.
+
+    `reference` — **уже подготовленный** текст реплики (`normalize`), а не сырой:
+    он не зависит от попытки, поэтому готовится один раз на реплику. Расшифровка
+    нормализуется здесь — она своя у каждой попытки.
     """
     recognized = await _transcribe_chunk(chunk)
     if not recognized.strip():
         return recognized, 1.0  # модель промолчала — это провал проверки
-    rules = active_rules()
-    wer = word_error_rate(
-        normalize(expected, pronunciation=rules, supports_accents=False),
-        normalize(recognized, pronunciation=rules, supports_accents=False),
+    return recognized, word_error_rate(
+        reference,
+        normalize(recognized, pronunciation=active_rules(), supports_accents=False),
     )
-    return recognized, wer
 
 
-async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
+async def _measure_wer(chunk: np.ndarray, reference: str) -> float:
     """Считает WER куска относительно текста, который в него отправляли.
+
+    `reference` — уже подготовленный текст реплики (см. `_transcribe_and_measure`).
 
     Расшифровка проходит ту же предобработку (`normalize`), что и текст перед
     синтезом: Whisper пишет числа цифрами («2026»), а в модель ушло «две тысячи
@@ -1863,7 +1954,7 @@ async def _measure_wer(chunk: np.ndarray, expected: str) -> float:
     и тогда словарь нужен уже расшифровке. Один шаг на оба текста закрывает оба
     случая — ровно так же, как `normalize` закрывает числа.
     """
-    _, wer = await _transcribe_and_measure(chunk, expected)
+    _, wer = await _transcribe_and_measure(chunk, reference)
     return wer
 
 
@@ -1902,6 +1993,11 @@ async def render_dialogue(
     replicas = list(replicas)
     if not replicas:
         raise ValueError("Диалог пуст")
+
+    # Место на диске проверяется до загрузки движков и до первого куска: отказ
+    # после минут синтеза оставил бы недописанный файл вместо понятного текста
+    # (§6 «Заполнен диск»).
+    ensure_disk_space()
 
     labels = {r.voice: r.label for r in replicas}
     unknown = sorted({r.voice for r in replicas if r.voice not in speakers})
@@ -2681,6 +2777,39 @@ def safe_output_name(name: str) -> str:
         if cleaned.lower().endswith(suffix):
             cleaned = cleaned[: -len(suffix)].strip("_-. ")
     return cleaned
+
+
+def ensure_disk_space(limit_mb: int | None = None) -> None:
+    """Отказывает заранее, если на диске мало места (§6 «Заполнен диск»).
+
+    Проверка стоит перед рендером, а не перед записью: заполненный диск иначе
+    выяснился бы на середине файла — после минут синтеза, с недописанным
+    результатом и невнятной ошибкой записи. Свободное место берётся у каталога
+    `output/`, потому что именно туда ложатся куски и готовый файл.
+
+    Неудачная проверка (каталога ещё нет, файловая система не отвечает) не
+    останавливает синтез: это диагностика, а не разрешение. Порог `<= 0`
+    выключает проверку — так её гасят в тестах и на дисках под контролем.
+    """
+    if limit_mb is None:
+        limit_mb = config.DISK_MIN_FREE_MB
+    if limit_mb <= 0:
+        return
+    try:
+        usage = shutil.disk_usage(config.OUTPUT_DIR)
+    except OSError as exc:
+        logger.warning("Свободное место не проверено: %s", exc)
+        return
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < limit_mb:
+        logger.error(
+            "Мало места на диске: свободно %.0f МБ, нужно не меньше %s МБ",
+            free_mb, limit_mb,
+        )
+        raise AudioFileError(
+            f"Мало места на диске: свободно {free_mb:.0f} МБ, "
+            f"нужно не меньше {limit_mb} МБ. Освободите место и повторите."
+        )
 
 
 def _output_target(job_id: str, output_format: str, output_name: str = "") -> Path:

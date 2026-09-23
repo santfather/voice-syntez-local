@@ -7,11 +7,13 @@
 проект выглядит занятым, повторный рендер кажется ненужным, а недописанные файлы
 аудио копятся в каталогах.
 
-Модуль делает три вещи и только их:
+Модуль делает четыре вещи и только их:
 
 * переводит состояния «идёт» в прерванные (`interrupt_stale_state`);
 * записывает причину в диагностику падений (`worker_crashes`) — чтобы после
   рестарта было видно, что именно прервалось;
+* помечает осиротевшие задачи очереди (`jobs`) прерванными — очередь живёт в
+  памяти, и её задача без этого исчезала бы бесследно;
 * убирает недописанные `*.part`, оставшиеся от прерванной записи.
 
 Готовые файлы, варианты реплик и всё остальное не трогается: восстановление не
@@ -24,6 +26,8 @@ import logging
 from dataclasses import dataclass, field
 
 from . import audio_pipeline, config
+from .db.connection import transaction
+from .db.repositories.jobs import JobsRepository
 from .db.store import get_projects_store
 from .engines import worker_protocol as proto
 
@@ -39,10 +43,14 @@ class RecoveryReport:
     analyses: int = 0
     partial_files: int = 0
     crashes: int = 0
+    # Задачи очереди, оставшиеся «в работе» с прошлого запуска.
+    jobs: int = 0
 
     @property
     def empty(self) -> bool:
-        return not (self.projects or self.replicas or self.analyses or self.partial_files)
+        return not (
+            self.projects or self.replicas or self.analyses or self.partial_files or self.jobs
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +59,7 @@ class RecoveryReport:
             "analyses": self.analyses,
             "partial_files": self.partial_files,
             "crashes": self.crashes,
+            "jobs": self.jobs,
         }
 
 
@@ -91,6 +100,18 @@ def recover_after_restart() -> RecoveryReport:
         except Exception as exc:  # noqa: BLE001 — запись вторична
             logger.warning("Проект %s: не удалось записать прерывание (%s)", project.get("id"), exc)
 
+    # Задачи очереди: в памяти их после рестарта нет, а строки в `jobs` остались
+    # в `queued`/`processing`. Без этой пометки задача выглядела бы идущей вечно —
+    # и в интерфейсе, и в диагностике.
+    try:
+        with transaction() as connection:
+            orphaned = JobsRepository(connection).mark_unfinished_interrupted(
+                config.RECOVERY_QUEUE_MESSAGE, proto.ERROR_INTERRUPTED
+            )
+        report.jobs = len(orphaned)
+    except Exception as exc:  # noqa: BLE001 — старт важнее полноты восстановления
+        logger.warning("Не удалось пометить прерванные задачи очереди: %s", exc)
+
     try:
         report.partial_files = audio_pipeline.cleanup_partials()
     except Exception as exc:  # noqa: BLE001 — остатки на диске не повод не стартовать
@@ -101,7 +122,8 @@ def recover_after_restart() -> RecoveryReport:
     else:
         logger.warning(
             "Восстановление после перезапуска: проектов %d, реплик %d, анализов %d, "
-            "недописанных файлов %d",
-            len(report.projects), report.replicas, report.analyses, report.partial_files,
+            "задач очереди %d, недописанных файлов %d",
+            len(report.projects), report.replicas, report.analyses, report.jobs,
+            report.partial_files,
         )
     return report

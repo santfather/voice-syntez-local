@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from backend import audio_pipeline, config, main
+from backend.engines.base import ENGINE_KOKORO
 from backend.job_queue import JobQueue
 
 DIALOGUE = "ИВАН: Первая реплика.\nМАРГО: Вторая реплика."
@@ -68,6 +69,63 @@ def test_engines_endpoint_lists_passports(stub, fake_store, monkeypatch):
                 "temperature",
                 "repetition_penalty",
             }
+
+    _run(scenario)
+
+
+def test_builtin_voices_appear_without_any_recording(monkeypatch):
+    """Встроенные голоса движка видны в списке, как только у него есть веса.
+
+    Ни записи, ни подложенного файла для них не нужно: движок говорит своим
+    голосом по полу карточки (`EngineInfo.builtin_voices`). Проверяется весь путь
+    — от доступности весов до карточки в списке и её удаления.
+    """
+
+    async def scenario():
+        async with _client(monkeypatch) as (client, _queue):
+            # «Веса на диске»: только это условие делает встроенные голоса
+            # доступными, и задаётся оно менеджером моделей, а не хранилищем.
+            monkeypatch.setattr(
+                main.model_manager,
+                "engine_available",
+                lambda engine_id: engine_id == ENGINE_KOKORO,
+            )
+
+            listed = (await client.get("/api/voices")).json()["voices"]
+            builtin = [voice for voice in listed if voice["engine"] == ENGINE_KOKORO]
+            assert [voice["name"] for voice in builtin] == ["Света", "Дима", "Маша"]
+            # Референса нет — и это честно сказано интерфейсу: иначе он предложил бы
+            # записать голос движку, которому записывать нечего.
+            assert all(voice["has_audio"] is False for voice in builtin)
+            assert all(voice["ref_text"] == "" for voice in builtin)
+
+            # Второй запрос список не удваивает: заведение идемпотентно по движку.
+            again = (await client.get("/api/voices")).json()["voices"]
+            assert len(again) == len(listed)
+
+            # Своя карточка встроенного голоса создаётся без файла вовсе.
+            created = await client.post(
+                "/api/voices",
+                data={"name": "Мой Кокоро", "gender": "male", "engine": ENGINE_KOKORO},
+            )
+            assert created.status_code == 201, created.text
+            assert created.json()["engine"] == ENGINE_KOKORO
+            assert created.json()["has_audio"] is False
+
+            # Клонирующему движку запись по-прежнему обязательна — отказ понятный.
+            refused = await client.post(
+                "/api/voices", data={"name": "Без записи", "gender": "male", "engine": "f5"}
+            )
+            assert refused.status_code == 400, refused.text
+            assert "запись" in refused.json()["detail"]
+
+            # Удалённый встроенный голос не возвращается при следующем запросе:
+            # иначе удалить его было бы нельзя вовсе.
+            removed = builtin[0]["id"]
+            deleted = await client.delete(f"/api/voices/{removed}")
+            assert deleted.status_code == 200, deleted.text
+            after = (await client.get("/api/voices")).json()["voices"]
+            assert removed not in {voice["id"] for voice in after}
 
     _run(scenario)
 
@@ -218,3 +276,35 @@ def test_render_text_endpoint(stub, fake_store, monkeypatch):
             assert accepted.json()["total_replicas"] == 1
 
     _run(scenario)
+
+
+def test_render_text_analysis_does_not_block_other_requests(stub, fake_store, monkeypatch):
+    """Лингвистический анализ идёт в отдельном потоке, а не в event loop.
+
+    Ручка ожидания ответа LLM — секунды. Синхронный вызов держал бы в это время
+    весь сервер, включая `/api/status`, по которому лаунчер определяет готовность.
+    """
+
+    def slow_analysis(text, chunks):
+        time.sleep(1.0)
+        return {"status": "ready", "candidates_total": 0}
+
+    monkeypatch.setattr(main, "_analyze_text_chunks", slow_analysis)
+
+    async def scenario() -> None:
+        async with _client(monkeypatch) as (client, _queue):
+            render = asyncio.create_task(
+                client.post(
+                    "/api/render-text",
+                    json={"voice_id": "voice1", "text": "Сплошной текст для анализа."},
+                )
+            )
+            # Анализ длится секунду: если он выполняется в loop, к этому моменту
+            # запрос уже завершится, а loop — простоял всё это время.
+            await asyncio.sleep(0.2)
+            assert not render.done(), "анализ держал event loop вместо отдельного потока"
+            status = await client.get("/api/status")
+            assert status.status_code == 200
+            assert (await render).status_code == 202
+
+    asyncio.run(scenario())

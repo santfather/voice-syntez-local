@@ -20,6 +20,8 @@ from .audio_pipeline import (
     RenderSettings,
     SpeakerSettings,
 )
+from .db.connection import transaction
+from .db.repositories.jobs import JobsRepository
 from .db.store import get_projects_store
 from .dialogue_parser import Replica
 from .engines import worker_protocol as proto
@@ -33,6 +35,23 @@ logger = logging.getLogger(__name__)
 MAX_KEPT_JOBS = 50
 # Как часто перепроверять системную память, пока задача ждёт своей очереди.
 MEMORY_WAIT_RETRY_SEC = 5.0
+# Сколько секунд задача может ждать свободной памяти. Ожидание без предела —
+# это очередь, вставшая навсегда: пользователь видит «ожидание», а задача не
+# начнётся никогда (F-Q3). По истечении бюджета задача честно завершается ошибкой.
+MEMORY_WAIT_LIMIT_SEC = 600.0
+# Как часто перепроверять отмену внутри паузы ожидания. Отмена должна заканчивать
+# ожидание сразу, а не по истечении паузы: иначе очередь отвечает на неё только
+# через `MEMORY_WAIT_RETRY_SEC` секунд (F-Q3).
+WAIT_CANCEL_POLL_SEC = 0.1
+
+# Потолок ожидающих задач. Очередь живёт в памяти и держит payload'ы реплик:
+# без предела клиент, заваливший интерфейс запросами, копил бы их вместе с
+# готовыми кусками (F-Q4).
+QUEUE_MAX_PENDING = 64
+# Слоты, зарезервированные под прослушивание (`preview`): рендер их не занимает,
+# иначе под потоком сборок короткое интерактивное действие вставало бы в конец
+# очереди и ждало бы все сборки (F-Q4).
+QUEUE_PREVIEW_RESERVE = 8
 
 # Метка варианта, сохранённого из прерванного рендера: по ней видно, что это
 # остаток незавершённой сборки, а не обычный результат (creash_report §13).
@@ -59,6 +78,16 @@ class _RenderFailed(RuntimeError):
         self.partial = partial
         self.error_type = error_type
         self.attempts = attempts
+
+
+class QueueOverloadedError(RuntimeError):
+    """Очередь заполнена: задача не принята, её надо поставить позже (F-Q4).
+
+    Наследуется от `RuntimeError`: обработчики уже отвечают на него 503 «очередь
+    не запущена», и переполнение должно попадать в ту же ветку — с понятным
+    текстом вместо тихой потери задачи.
+    """
+
 
 # Приоритеты очереди (фаза 11). Воркер по-прежнему один: приоритет меняет только
 # порядок, в котором задачи доходят до модели, а не число одновременных
@@ -97,6 +126,55 @@ class JobStatus(str, Enum):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _job_row(job: "Job") -> dict:
+    """Снимок задачи для таблицы `jobs`.
+
+    Сохраняется ровно то, что показывает `to_dict()`: интерфейс и диагностика
+    после рестарта читают те же поля, что и до него. Полезная нагрузка задачи
+    (`payload`, куски, варианты) не сохраняется: она живёт в памяти, и запись её
+    в базу создала бы вид, будто прерванный синтез можно продолжить.
+    """
+    return {
+        "id": job.id,
+        "status": job.status.value,
+        "total_replicas": job.total_replicas,
+        "current_replica": job.current_replica,
+        "current_voice": job.current_voice,
+        "output_format": job.output_format,
+        "message": job.message,
+        "error": job.error,
+        "error_type": job.error_type,
+        "output_path": str(job.output_path) if job.output_path else None,
+        "duration_sec": job.duration_sec,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+    }
+
+
+def _persist_job(job: "Job") -> None:
+    """Записывает состояние задачи. Недоступная база задачу не прерывает.
+
+    Побочная запись не имеет права испортить основную работу: если строка статуса
+    не сохранилась, пользователь потеряет только объяснение после рестарта, а
+    сорванный из-за этого рендер — уже готовое аудио.
+    """
+    try:
+        with transaction() as connection:
+            JobsRepository(connection).save(_job_row(job))
+    except Exception as exc:  # noqa: BLE001 — состояние вторично по отношению к аудио
+        logger.warning("Задача %s: состояние не сохранилось (%s)", job.id, exc)
+
+
+def _prune_jobs_table(keep: int) -> None:
+    """Держит в таблице не больше `keep` завершённых задач — как и в памяти."""
+    try:
+        with transaction() as connection:
+            JobsRepository(connection).prune(keep)
+    except Exception as exc:  # noqa: BLE001 — уборка истории не повод падать
+        logger.warning("Не удалось подчистить историю задач: %s", exc)
 
 
 @dataclass
@@ -296,7 +374,7 @@ class JobQueue:
     async def start(self) -> None:
         if self._worker_task is not None:
             return
-        self._queue = asyncio.PriorityQueue()
+        self._queue = asyncio.PriorityQueue(maxsize=QUEUE_MAX_PENDING)
         self._worker_task = asyncio.create_task(self._worker(), name="tts-worker")
         logger.info("Воркер очереди запущен")
 
@@ -326,8 +404,7 @@ class JobQueue:
 
     # -- API -------------------------------------------------------------------
     def submit(self, payload: JobPayload, priority: int = PRIORITY_RENDER) -> Job:
-        if self._queue is None:
-            raise RuntimeError("Очередь не запущена")
+        self._ensure_capacity(priority)
         job = Job(
             id=uuid.uuid4().hex[:12],
             total_replicas=len(payload.replicas),
@@ -335,6 +412,7 @@ class JobQueue:
         )
         self._jobs[job.id] = job
         self._order.append(job.id)
+        _persist_job(job)
         self._prune()
         self._enqueue(RenderTask(job_id=job.id, payload=payload), priority)
         logger.info(
@@ -357,6 +435,7 @@ class JobQueue:
         job, payload = self._ready_job(job_id)
         if not 0 <= index < len(payload.replicas):
             raise ValueError("Такой реплики в задаче нет")
+        self._ensure_capacity(priority)
 
         job.regenerating = index
         job.regen_error = None
@@ -378,6 +457,7 @@ class JobQueue:
         variant = self.find_variant(job, index, variant_id)
         if job.active_variant.get(index) == variant.id:
             raise ValueError("Этот вариант уже стоит в файле")
+        self._ensure_capacity(priority)
 
         job.regenerating = index
         job.regen_error = None
@@ -404,8 +484,7 @@ class JobQueue:
         передаются готовыми: очередь про проекты не знает, а собирать их здесь
         означало бы вторую копию разбора наследования (см. audio_pipeline).
         """
-        if self._queue is None:
-            raise RuntimeError("Очередь не запущена")
+        self._ensure_capacity(priority)
         job = Job(
             id=uuid.uuid4().hex[:12],
             total_replicas=1,
@@ -414,6 +493,7 @@ class JobQueue:
         )
         self._jobs[job.id] = job
         self._order.append(job.id)
+        _persist_job(job)
         self._prune()
         self._enqueue(
             ProjectTakeTask(
@@ -446,8 +526,7 @@ class JobQueue:
         сразу, ещё до старта: интерфейс, опросивший его до начала работы, должен
         увидеть «в очереди», а не «запуск не найден».
         """
-        if self._queue is None:
-            raise RuntimeError("Очередь не запущена")
+        self._ensure_capacity(priority)
         engines = list(engines)
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -457,6 +536,7 @@ class JobQueue:
         )
         self._jobs[job.id] = job
         self._order.append(job.id)
+        _persist_job(job)
         self._prune()
         run = benchmark.register(
             benchmark.BenchmarkRun(
@@ -540,6 +620,39 @@ class JobQueue:
             raise ValueError(f"Реплика {job.regenerating + 1} уже пересобирается")
         return job, job.payload
 
+    def _ensure_capacity(self, priority: int) -> None:
+        """Проверяет, что в очереди есть место, — до регистрации задачи (F-Q4).
+
+        Стоит до создания записи, а не в `_enqueue`: отказ после регистрации
+        оставил бы в базе задачу «в очереди», которая никогда не начнётся, а у
+        перегенерации — ещё и выставленный флаг «уже пересобирается», из-за
+        которого повторный запрос был бы отклонён навсегда.
+
+        Рендеры (обычные и фоновые) не занимают слоты, зарезервированные под
+        `preview`: их потолок ниже на `QUEUE_PREVIEW_RESERVE`, поэтому под потоком
+        сборок короткое прослушивание всё равно принимается и идёт следующим, а не
+        встаёт в конец.
+        """
+        queue = self._queue
+        if queue is None:
+            raise RuntimeError("Очередь не запущена")
+        # Размер берётся на месте, а не из счётчика: проверка идёт без `await`,
+        # поэтому в одном потоке событий очередь между проверкой и постановкой не
+        # изменится и счётчик не разъехался бы с реальностью только зря.
+        if priority <= PRIORITY_REGENERATE:
+            # Интерактивные задачи могут занять весь потолок: они короткие, и
+            # откладывать их незачем — отказ получит только переполненная очередь.
+            if queue.qsize() >= QUEUE_MAX_PENDING:
+                raise QueueOverloadedError(
+                    f"Очередь переполнена ({QUEUE_MAX_PENDING} задач) — повторите позже"
+                )
+            return
+        limit = max(QUEUE_MAX_PENDING - QUEUE_PREVIEW_RESERVE, 0)
+        if queue.qsize() >= limit:
+            raise QueueOverloadedError(
+                f"Очередь сборок заполнена ({limit} задач) — дождитесь завершения текущих"
+            )
+
     def _enqueue(
         self,
         task: RenderTask | RegenerateTask | SelectVariantTask | ProjectTakeTask | BenchmarkTask,
@@ -551,6 +664,9 @@ class JobQueue:
         FIFO. Кортеж с уникальным вторым элементом ещё и снимает сравнение самих
         датаклассов: `PriorityQueue` сравнивает элементы, а `RenderTask` с `JobPayload`
         несравнимы.
+
+        Место в очереди проверяется вызывающим (`_ensure_capacity`) до регистрации
+        задачи: здесь остаётся только постановка, уже неспособная отказать.
         """
         queue = self._queue
         if queue is None:
@@ -666,6 +782,7 @@ class JobQueue:
         job.message = message
         job.regenerating = None
         self._discard_partial(job)
+        _persist_job(job)
 
     def _finish_interrupted(self, job: Job, project_id: str | None = None) -> None:
         """Завершает задачу, остановленную на безопасной точке.
@@ -707,6 +824,7 @@ class JobQueue:
         if job.payload is not None:
             for variant in (v for items in job.variants.values() for v in items):
                 audio_pipeline.drop_variant(variant)
+
     def _prune(self) -> None:
         while len(self._order) > MAX_KEPT_JOBS:
             oldest = self._order.pop(0)
@@ -715,6 +833,7 @@ class JobQueue:
                 self._order.append(oldest)
                 break
             self._jobs.pop(oldest, None)
+        _prune_jobs_table(MAX_KEPT_JOBS)
 
     async def _worker(self) -> None:
         # Своя ссылка на очередь: stop() обнуляет self._queue, и воркер, читающий
@@ -734,7 +853,11 @@ class JobQueue:
                     job.abort_reason = None
                 if self._skip_cancelled(task):
                     continue
-                await self._wait_for_memory(task.job_id)
+                if not await self._wait_for_memory(task.job_id):
+                    # Память не освободилась за бюджет ожидания: задача завершается
+                    # ошибкой здесь, а не ждёт вечно (F-Q3).
+                    self._fail_memory_wait(task)
+                    continue
                 if self._skip_cancelled(task):
                     continue
                 # Слот нужен только там, где реально работает модель. Выбор
@@ -784,9 +907,22 @@ class JobQueue:
             if not warned:
                 warned = True
                 logger.info("Задача %s ждёт тяжёлый слот: %s", job_id, holder)
-            await asyncio.sleep(MEMORY_WAIT_RETRY_SEC)
+            await self._sleep_until_cancelled(job_id, MEMORY_WAIT_RETRY_SEC)
 
-    async def _wait_for_memory(self, job_id: str) -> None:
+    async def _sleep_until_cancelled(self, job_id: str, seconds: float) -> None:
+        """Ждёт `seconds` или до запроса отмены — что раньше (F-Q3).
+
+        Отмена из интерфейса должна заканчивать ожидание сразу: без этого очередь
+        ответила бы на неё только по истечении паузы, а пауза — секунды.
+        """
+        deadline = time.monotonic() + seconds
+        while not self._cancelled(job_id):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(WAIT_CANCEL_POLL_SEC, left))
+
+    async def _wait_for_memory(self, job_id: str) -> bool:
         """Не начинает задачу, пока память не в порядке (creash_report §20–§22).
 
         Проверка стоит перед взятием job, а не только в фоновом watchdog: задача
@@ -798,12 +934,23 @@ class JobQueue:
         Перед ожиданием очередь пробует вернуть память самым дешёвым способом:
         выгружает простаивающие движки. Выгружать занятый движок нельзя — это
         оборвало бы чужой инференс, — а простаивающий держит гигабайты.
+
+        Ждёт не бесконечно (F-Q3): освобождения памяти, которое не наступит,
+        значит держать очередь вставшей навсегда — задача не начнётся никогда, а
+        пользователь видит «ожидание». По исчерпании бюджета
+        (`MEMORY_WAIT_LIMIT_SEC`) возвращается `False`, и судьбу задачи решает
+        вызывающий (см. `_fail_memory_wait`); сам метод ничего не завершает,
+        потому что он же — колбэк ожидания внутри синтеза, где задачи под рукой нет.
+
+        Возвращает `True` и при отмене: задачу ещё нужно провести через
+        `_skip_cancelled`, который и пометит её отменённой.
         """
         job = self._jobs.get(job_id)
         warned = False
+        deadline = time.monotonic() + MEMORY_WAIT_LIMIT_SEC
         while resource_guard.is_memory_critical():
             if self._cancelled(job_id):
-                return
+                return True
             if not warned:
                 unloaded = await asyncio.to_thread(self._free_memory_for_job)
                 if unloaded:
@@ -815,16 +962,58 @@ class JobQueue:
                     # до сообщения «перегружено», чтобы не пугать зря.
                     if not resource_guard.is_memory_critical():
                         logger.info("Задача %s: память освободилась после выгрузки", job_id)
-                        return
+                        return True
             state = resource_guard.memory_state()
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "Задача %s: память не освободилась за %.0f с (%s) — отказываюсь от задачи",
+                    job_id, MEMORY_WAIT_LIMIT_SEC, state["reason"],
+                )
+                return False
             if job is not None:
                 job.message = f"Система перегружена: {state['reason']} — ожидание"
             if not warned:
                 warned = True
                 logger.warning("Задача %s ждёт: %s", job_id, state["reason"])
-            await asyncio.sleep(MEMORY_WAIT_RETRY_SEC)
+            await self._sleep_until_cancelled(job_id, MEMORY_WAIT_RETRY_SEC)
         if warned:
             logger.info("Задача %s: память освободилась, начинаю", job_id)
+        return True
+
+    def _fail_memory_wait(self, task) -> None:
+        """Завершает задачу, не дождавшуюся памяти (F-Q3).
+
+        Развилка та же, что у отмены до запуска (`_skip_cancelled`): у задачи,
+        которая ещё не начиналась, ошибка ставится ей самой, а у готового рендера
+        ошибочной становится только несостоявшаяся пересборка реплики — файл на
+        месте и портить его статус незачем.
+        """
+        job = self._jobs.get(task.job_id)
+        if job is None:
+            return
+        reason = f"Не дождалась памяти за {MEMORY_WAIT_LIMIT_SEC:.0f} с"
+        if isinstance(task, RenderTask) or job.status is JobStatus.QUEUED:
+            job.status = JobStatus.ERROR
+            job.error = reason
+            job.error_type = proto.ERROR_WATCHDOG
+            job.message = "Прервано: нет памяти"
+            job.finished_at = _now_iso()
+            job.regenerating = None
+            # Проект уже помечен «рендерится» вызывающим роутом — без этой записи
+            # он остался бы в этом состоянии навсегда.
+            self._mark_project(
+                getattr(task, "project_id", None)
+                or getattr(getattr(task, "payload", None), "project_id", None),
+                config.PROJECT_STATUS_ERROR,
+                job.id,
+                reason,
+            )
+        else:
+            job.regenerating = None
+            job.regen_error = reason
+            job.message = f"Пересборка не началась: {reason.lower()}"
+        _persist_job(job)
+        logger.error("Задача %s: %s", job.id, reason)
 
     def _free_memory_for_job(self) -> list[str]:
         """Выгружает простаивающие движки, если прямо сейчас никто не синтезирует.
@@ -902,6 +1091,7 @@ class JobQueue:
         job.started_at = _now_iso()
         job.message = "Готовлю модель"
         self._current_job_id = job.id
+        _persist_job(job)
         self._mark_project(payload.project_id, config.PROJECT_STATUS_RENDERING, job.id)
         started = time.monotonic()
         # План рендера и статистика времени: до старта видно оценку по кускам
@@ -997,6 +1187,7 @@ class JobQueue:
         finally:
             self._current_job_id = None
             job.finished_at = _now_iso()
+            _persist_job(job)
 
     async def _render_with_recovery(
         self,
@@ -1569,6 +1760,7 @@ class JobQueue:
         self._current_job_id = job.id
         job.status = JobStatus.PROCESSING
         job.started_at = _now_iso()
+        _persist_job(job)
         try:
             if speaker is None:
                 raise ValueError(f"Для «{task.replica.label}» не найден голос")
@@ -1688,6 +1880,7 @@ class JobQueue:
         finally:
             self._current_job_id = None
             job.finished_at = _now_iso()
+            _persist_job(job)
 
     async def _benchmark(self, task: BenchmarkTask) -> None:
         """Сравнивает голос на выбранных движках тем же единственным воркером.
@@ -1704,6 +1897,7 @@ class JobQueue:
         job.status = JobStatus.PROCESSING
         job.started_at = _now_iso()
         run.status = benchmark.RUN_RUNNING
+        _persist_job(job)
         # Свой счётчик, а не общий прогресс рендера: у сравнения шаг — движок,
         # а не реплика, и «Реплика 1 из 3» в статусе читалось бы неверно.
         def on_progress(index: int, total: int, label: str) -> None:
@@ -1757,6 +1951,7 @@ class JobQueue:
             self._current_job_id = None
             job.finished_at = _now_iso()
             run.finished_at = job.finished_at
+            _persist_job(job)
 
     async def _keep_current(
         self, job: Job, index: int, settings: RenderSettings, source_path: Path
@@ -1963,6 +2158,21 @@ class JobQueue:
             if not 0 <= index < len(plan):
                 return
             step = plan[index]
+            # Время реплики — в лог, а не только в ETA (фаза 3, §3.4): тепловая
+            # деградация не видна нигде, кроме ряда времён, и на длинном диалоге
+            # рост времени реплик списывают на «модель тормозит». Точка измерения
+            # та же, что у ETA (`audio_pipeline`), поэтому второй замер не заводим.
+            logger.info(
+                "tts.replica.timing index=%d total=%d engine=%s chars=%d "
+                "render_sec=%.2f audio_sec=%.2f qa=%s",
+                index + 1,
+                len(plan),
+                step.engine,
+                step.chars,
+                seconds,
+                audio_sec,
+                step.qa_mode,
+            )
             tracker.observe(
                 engine=step.engine,
                 chars=step.chars,

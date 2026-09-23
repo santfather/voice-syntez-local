@@ -25,6 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 ANALYSIS_SR = 16_000
@@ -99,13 +101,22 @@ def load_mono(data: bytes | bytearray | str | Path, suffix: str = "", target_sr:
     else:
         command = ["-i", str(data)]
         stdin = None
-    process = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *command,
-         "-ac", "1", "-ar", str(target_sr), "-f", "s16le", "-"],
-        input=stdin,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        process = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *command,
+             "-ac", "1", "-ar", str(target_sr), "-f", "s16le", "-"],
+            input=stdin,
+            capture_output=True,
+            check=False,
+            timeout=config.FFMPEG_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Битый или зацикленный вход: ffmpeg его читает и не заканчивает. Ошибка с
+        # причиной вместо зависания — вызывающий код показывает её как отказ задачи.
+        raise RuntimeError(
+            f"ffmpeg не уложился в {config.FFMPEG_TIMEOUT_SEC:.0f} с на декодирование аудио: "
+            "файл повреждён или это не аудиопоток"
+        ) from exc
     if process.returncode != 0 or not process.stdout:
         tail = process.stderr.decode("utf-8", "replace").strip().splitlines()[-1:]
         raise RuntimeError(f"ffmpeg не смог прочитать аудио: {tail[0] if tail else process.returncode}")

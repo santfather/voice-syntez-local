@@ -154,6 +154,48 @@ def test_unknown_engine_is_reported_with_voice_name(workspace, monkeypatch):
     assert "нет-такого" in str(error.value)
 
 
+FALLBACK_PRESET_ID = "stub-preset-fallback"
+
+FALLBACK_PRESET_INFO = EngineInfo(
+    id=FALLBACK_PRESET_ID,
+    label="Заглушка-пресет с откатом",
+    description="Движок на встроенных голосах, объявивший откат по недоступности.",
+    supports_accents=False,
+    supports_cloning=False,
+    supports_prosody_profiles=False,
+    fallback_engine=STUB_ENGINE_ID,
+)
+
+
+def test_fallback_does_not_substitute_a_voice_without_reference(
+    workspace, routed_engines, monkeypatch, caplog
+):
+    """Голос без референса не откатывается на клонирующий движок.
+
+    У карточки встроенного голоса записи нет вовсе, и подмена движка попросила бы
+    клонирующую модель говорить по файлу, которого никогда не существовало: вместо
+    «скачайте модель» пользователь получил бы «файл референса потерян». Поэтому
+    откат здесь не срабатывает вовсе.
+    """
+    requested, _ = routed_engines
+    monkeypatch.setitem(ENGINE_INFOS, FALLBACK_PRESET_ID, FALLBACK_PRESET_INFO)
+    monkeypatch.setattr(model_manager, "engine_available", lambda engine_id: False)
+    voice = Voice(
+        id="voice-builtin",
+        name="Света",
+        gender="female",
+        ref_text="",
+        audio_file="",
+        engine=FALLBACK_PRESET_ID,
+    )
+
+    with caplog.at_level("WARNING"):
+        _engine_for(voice)
+
+    assert requested == [FALLBACK_PRESET_ID]
+    assert caplog.records == []
+
+
 # --- референс: нужен ли он движку ---------------------------------------------
 PRESET_ENGINE_ID = "stub-preset"
 

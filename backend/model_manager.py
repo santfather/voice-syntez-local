@@ -11,7 +11,9 @@
   на импорте: тесты подменяют `config.MODELS_DIR`, и закешированный путь сделал
   бы подмену бессмысленной;
 * сеть — единственная точка входа `_hf_download`: её мокают тесты, поэтому
-  реальные скачивания в прогоне невозможны;
+  реальные скачивания в прогоне невозможны; там же проверяется целостность
+  файла (размер и непустота), и результат проверки — обычная ошибка скачивания,
+  а не падение при подъёме модели;
 * ничто здесь не запускается само при старте сервера: скачивание инициирует
   пользователь, а `MODELS_DIR` только читается;
 * любой путь модели обязан лежать внутри `config.MODELS_DIR` (для `kind="local"`):
@@ -91,6 +93,10 @@ class ModelBusyError(RuntimeError):
 
 class ModelNotDownloadableError(RuntimeError):
     """Модель не скачивается этим менеджером (кеш `huggingface_hub`)."""
+
+
+class ModelIntegrityError(RuntimeError):
+    """Скачанный файл модели не сошёлся с тем, что заявлено на Hub."""
 
 
 @dataclass(frozen=True)
@@ -948,11 +954,67 @@ def _hf_download(repo_id: str, filename: str, local_dir: Path) -> Path:
 
     `hf_hub_download` с `local_dir` раскладывает файлы по путям репозитория, то
     есть каталог модели повторяет структуру HF (её и ждут движки).
+
+    Таймауты HTTP задаёт сама библиотека (`HF_HUB_ETAG_TIMEOUT` на метаданные и
+    `HF_HUB_DOWNLOAD_TIMEOUT` на чтение данных, по умолчанию 10 с; переопределяются
+    средой) — своих здесь не заводим. Проверка целостности — ниже, и она
+    намеренно внутри этой функции: `hf_hub_download` контролирует только то, что
+    скачал сам, а эту функцию тесты подменяют целиком, так что проверка не
+    подменяется вместе с сетью.
     """
     from huggingface_hub import hf_hub_download
 
     logger.info("Скачиваю %s/%s в %s", repo_id, filename, local_dir)
-    return Path(hf_hub_download(repo_id, filename, local_dir=str(local_dir)))
+    path = Path(hf_hub_download(repo_id, filename, local_dir=str(local_dir)))
+    _verify_download(repo_id, filename, path)
+    return path
+
+
+def _expected_size(repo_id: str, filename: str) -> int | None:
+    """Размер файла, заявленный на Hub, — `None`, если спросить не удалось.
+
+    Отдельным запросом к API, а не из ответа скачивания: `hf_hub_download`
+    метаданных не возвращает. Запрос дешёвый (один файл), и его провал не должен
+    отменять уже состоявшееся скачивание — поэтому `None`, а не исключение.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        found = HfApi().get_paths_info(repo_id, [filename], expand=True)
+    except Exception as exc:  # noqa: BLE001 — метаданные это проверка, а не условие
+        logger.warning("Не удалось узнать размер %s/%s: %s", repo_id, filename, exc)
+        return None
+    if not found:
+        return None
+    size = getattr(found[0], "size", None)
+    return int(size) if size else None
+
+
+def _verify_download(repo_id: str, filename: str, path: Path) -> None:
+    """Сверяет скачанное с тем, что о файле говорит Hub.
+
+    Библиотека сама сверяет etag (для LFS — это sha256 файла) и не перекладывает
+    файл на место при расхождении, поэтому хеш здесь не пересчитывается: чтение
+    пятигигабайтных весов ради того же результата ничего не добавило бы. Чего
+    библиотека не проверяет — файл, лежащий на диске **до** неё: если он там уже
+    был (или его подменили руками), скачивание пропускается, и битые веса
+    тихо доходят до загрузки модели. Это и ловят размер с непустотой, а
+    результат виден в логе ошибкой скачивания, а не падением при подъёме модели.
+    """
+    try:
+        actual = path.stat().st_size
+    except OSError as exc:
+        raise ModelIntegrityError(
+            f"Файл {filename} не найден после скачивания: {exc}"
+        ) from exc
+    if actual == 0:
+        raise ModelIntegrityError(f"Файл {filename} скачан пустым (0 байт)")
+    expected = _expected_size(repo_id, filename)
+    if expected is not None and actual != expected:
+        raise ModelIntegrityError(
+            f"Файл {filename} скачан не полностью: {actual} байт вместо {expected}"
+        )
+    logger.info("Скачан %s/%s: %d байт", repo_id, filename, actual)
 
 
 def _hf_snapshot(repo_id: str, local_dir: Path) -> None:
@@ -960,7 +1022,11 @@ def _hf_snapshot(repo_id: str, local_dir: Path) -> None:
 
     Мокается тестами так же, как `_hf_download`: обе функции — тонкие обёртки
     над `huggingface_hub`, и вся логика менеджера живёт выше, проверяемая без
-    сети.
+    сети. Целостность здесь контролирует сама библиотека — она сверяет etag
+    каждого файла снапшота и не перекладывает файлы на место при расхождении;
+    размер каждого файла заранее неизвестен (репозиторий публикует шарды, и
+    перечислить их без сети нельзя), поэтому отдельной сверки нет — отсутствие
+    обязательных файлов ловит `missing_files` сразу после скачивания.
     """
     from huggingface_hub import snapshot_download
 

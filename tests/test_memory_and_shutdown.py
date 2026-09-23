@@ -145,6 +145,35 @@ def test_full_status_payload_has_memory_state(monkeypatch):
     assert "workers" in payload and "worker_isolation" in payload
 
 
+def test_mps_oom_is_recognised_by_text_and_numbers_are_parsed():
+    """Нехватка памяти Metal опознаётся по тексту — и типом из воркера тоже (§11.4)."""
+    real = RuntimeError(
+        "MPS backend out of memory (MPS allocated: 5.43 GB, other allocations: 1.34 GB, "
+        "max allowed: 8.00 GB). Tried to allocate 1.00 GB on private pool."
+    )
+    assert resource_guard.is_mps_oom(real) is True
+    assert resource_guard.mps_oom_numbers(real) == {
+        "allocated": "5.43 GB",
+        "other": "1.34 GB",
+        "max_allowed": "8.00 GB",
+    }
+
+    # В изолированном режиме тот же текст приходит чужим классом: распознавание
+    # обязано работать по тексту, а не по типу исключения.
+    foreign = proto.TtsEngineError(str(real), engine="f5")
+    assert resource_guard.is_mps_oom(foreign) is True
+    assert resource_guard.mps_oom_numbers(foreign)["max_allowed"] == "8.00 GB"
+
+
+def test_non_mps_failures_are_not_treated_as_oom():
+    """Обычный отказ движка не повод выгружать тёплые движки и повторять реплику."""
+    assert resource_guard.is_mps_oom(RuntimeError("CUDA out of memory")) is False
+    assert resource_guard.is_mps_oom(RuntimeError("движок вернул пустой ответ")) is False
+    # Формулировку задаёт torch: если числа не разобрались, это не ошибка —
+    # вызывающий просто пишет текст исключения как есть.
+    assert resource_guard.mps_oom_numbers(RuntimeError("MPS out of memory")) is None
+
+
 # --- очередь и память ----------------------------------------------------------
 def _payload(replicas=None, project_id=None) -> JobPayload:
     replicas = replicas or [Replica(voice=F5_VOICE, text=FIRST, line_number=1)]
@@ -198,6 +227,65 @@ def test_queue_waits_in_critical_memory_and_explains_why(stub, voices, monkeypat
     # Причина ожидания названа, а не просто «подождите».
     assert any("память системы занята на 91%" in record.getMessage()
                for record in caplog.records)
+
+
+def test_memory_wait_gives_up_instead_of_waiting_forever(stub, voices, monkeypatch):
+    """F-Q3. Бюджет ожидания исчерпан — задача завершается ошибкой, а не ждёт вечно.
+
+    Память, которая не освободилась, оставляла задачу «ожидающей» навсегда:
+    очередь стояла, а пользователь видел только «ожидание».
+    """
+    monkeypatch.setattr(job_queue.resource_guard, "is_memory_critical", lambda: True)
+    monkeypatch.setattr(
+        job_queue.resource_guard,
+        "memory_state",
+        lambda: {"state": memory_monitor.STATE_CRITICAL, "reason": "память системы занята на 93%"},
+    )
+    monkeypatch.setattr(job_queue, "MEMORY_WAIT_RETRY_SEC", 0.01)
+    monkeypatch.setattr(job_queue, "MEMORY_WAIT_LIMIT_SEC", 0.05)
+
+    async def scenario():
+        queue = JobQueue()
+        await queue.start()
+        try:
+            job = queue.submit(_payload())
+            assert await _wait_until(lambda: job.status is JobStatus.ERROR), job.status
+            return job
+        finally:
+            await queue.stop()
+
+    job = asyncio.run(scenario())
+    assert job.error_type == proto.ERROR_WATCHDOG
+    assert "Не дождалась памяти" in (job.error or "")
+    assert job.message == "Прервано: нет памяти"
+    # До движка дело не дошло: задача так и не началась.
+    assert stub.calls == []
+
+
+def test_memory_wait_wakes_up_on_cancel(monkeypatch):
+    """F-Q3. Отмена заканчивает ожидание памяти сразу, а не по концу паузы.
+
+    Пауза между проверками — секунды, и без пробуждения по отмене очередь
+    отвечала бы на неё только по её истечении.
+    """
+    monkeypatch.setattr(job_queue.resource_guard, "is_memory_critical", lambda: True)
+    monkeypatch.setattr(job_queue, "MEMORY_WAIT_RETRY_SEC", 30.0)
+
+    async def scenario():
+        queue = JobQueue()
+        await queue.start()
+        try:
+            job = queue.submit(_payload())
+            waiter = asyncio.create_task(queue._wait_for_memory(job.id))
+            await asyncio.sleep(0.1)  # пауза ожидания уже началась (30 с)
+            started = time.monotonic()
+            queue.cancel(job.id)
+            assert await asyncio.wait_for(waiter, timeout=5.0) is True
+            return time.monotonic() - started
+        finally:
+            await queue.stop()
+
+    assert asyncio.run(scenario()) < 5.0, "ожидание не прервалось отменой"
 
 
 def test_critical_memory_unloads_idle_engines_first(stub, monkeypatch):

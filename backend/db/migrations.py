@@ -8,8 +8,13 @@ SQL нельзя — приложение локальное и ставится
 
 import logging
 import sqlite3
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Продолжение имени копии базы перед миграцией (F-D1). Копия лежит рядом с
+# оригиналом, поэтому её видно глазом и легко вернуть вручную.
+BACKUP_SUFFIX = ".bak"
 
 # Проект: то, что пользователь открывает и закрывает. Текст хранится целиком,
 # чтобы диалог не приходилось склеивать обратно из реплик — иначе при повторном
@@ -296,6 +301,38 @@ ALTER TABLE replicas ADD COLUMN reference_profile_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE replicas ADD COLUMN reference_fallback_reason TEXT NOT NULL DEFAULT '';
 """
 
+# Задачи очереди (F-Q1): до этой таблицы задача жила только в памяти процесса, и
+# после рестарта или краха от неё не оставалось ничего — ни статуса, ни причины.
+# Отдельная таблица, а не поля проекта: задача бывает и разовой (без проекта),
+# а `projects.job_id` хранит лишь последнюю. Хранится снимок того, что показывает
+# `Job.to_dict()`: интерфейс и диагностика читают одно и то же.
+#
+# Восстановление задач не делается: очередь и воркеры живут в процессе, и
+# «продолжить» синтез после рестарта нельзя. Смысл записи — в том, что
+# осиротевшая задача при старте получает внятный статус и причину, а не исчезает
+# бесследно (см. `recovery.recover_after_restart`).
+_MIGRATION_11 = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id              TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    total_replicas  INTEGER NOT NULL DEFAULT 0,
+    current_replica INTEGER NOT NULL DEFAULT 0,
+    current_voice   TEXT NOT NULL DEFAULT '',
+    output_format   TEXT NOT NULL DEFAULT 'wav',
+    message         TEXT NOT NULL DEFAULT '',
+    error           TEXT,
+    error_type      TEXT NOT NULL DEFAULT '',
+    output_path     TEXT,
+    duration_sec    REAL,
+    created_at      TEXT NOT NULL,
+    started_at      TEXT,
+    finished_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -307,16 +344,83 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (8, _MIGRATION_8),
     (9, _MIGRATION_9),
     (10, _MIGRATION_10),
+    (11, _MIGRATION_11),
 )
 
 
-def apply_migrations(connection: sqlite3.Connection) -> int:
-    """Доводит схему до последней версии. Возвращает итоговую версию."""
+class DatabaseCorruptedError(RuntimeError):
+    """Файл базы повреждён: `PRAGMA integrity_check` не подтвердил целостность.
+
+    Отдельный класс, а не общий `RuntimeError`: вызывающий должен отличать «база
+    бита» от «миграция не применилась» — советы разные (восстановить из копии
+    против сообщить об ошибке схемы), и смешивать их в одном тексте нельзя.
+    """
+
+
+def schema_version(connection: sqlite3.Connection) -> int:
+    """Версия схемы в базе; `0` — таблицы версий ещё нет."""
     connection.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
     )
     row = connection.execute("SELECT version FROM schema_version").fetchone()
-    current = int(row[0]) if row else 0
+    return int(row[0]) if row else 0
+
+
+def check_integrity(connection: sqlite3.Connection) -> None:
+    """Отказывает, если SQLite считает файл повреждённым (F-D1).
+
+    Полный `integrity_check`, а не `quick_check`: второй пропускает битые
+    индексы, а именно они ломают выборки при чтении. Проверка стоит до миграций —
+    применять схему к повреждённому файлу значит дописывать поверх мусора и
+    терять следы того, что испортилось. Плата — чтение всей базы, но она
+    происходит один раз за запуск (кеш `_initialized_path` в connection.py).
+    """
+    try:
+        rows = connection.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise DatabaseCorruptedError(f"База повреждена: {exc}") from exc
+    problems = [str(row[0]) for row in rows if str(row[0]).strip().lower() != "ok"]
+    if problems:
+        raise DatabaseCorruptedError("База повреждена: " + "; ".join(problems[:5]))
+
+
+def backup_before_migration(connection: sqlite3.Connection, path: Path) -> Path | None:
+    """Копия файла базы перед миграцией. `None` — копировать нечего (F-D1).
+
+    Копия кладётся только у существующей базы, которую действительно ждёт хотя бы
+    одна миграция: на первом запуске файла ещё нет, а когда схема уже последней
+    версии — терять нечего. Снимок делается средствами SQLite (`backup`), а не
+    копированием файла: в режиме WAL часть подтверждённых данных лежит в `-wal`,
+    и простое копирование дало бы старый или битый снимок.
+    """
+    if not path.exists():
+        return None
+    current = schema_version(connection)
+    if current <= 0 or not any(version > current for version, _ in MIGRATIONS):
+        return None
+    target = path.with_name(path.name + BACKUP_SUFFIX)
+    target.unlink(missing_ok=True)
+    destination = sqlite3.connect(target)
+    try:
+        connection.backup(destination)
+        destination.commit()
+    finally:
+        destination.close()
+    logger.info("Копия базы перед миграцией: %s", target)
+    return target
+
+
+def apply_migrations(connection: sqlite3.Connection, path: Path | None = None) -> int:
+    """Доводит схему до последней версии. Возвращает итоговую версию.
+
+    `path` — файл базы: по нему перед миграцией кладётся копия (см.
+    `backup_before_migration`). Без пути (так зовут миграции тесты и снимки в
+    памяти) копия не делается, а всё остальное работает как раньше.
+    """
+    check_integrity(connection)
+    current = schema_version(connection)
+    if path is not None:
+        backup_before_migration(connection, path)
     for version, script in MIGRATIONS:
         if version <= current:
             continue

@@ -1,13 +1,16 @@
 """Паспорта движков: границы ручек, подсказка по полу и контракт `synthesize`."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from backend import config
-from backend.engines import registry
+from backend.engines import registry, xtts_engine
 from backend.engines.base import (
     ENGINE_F5,
     ENGINE_INFOS,
+    ENGINE_KOKORO,
     ENGINE_MODE_DRAFT,
     ENGINE_MODE_EXPERIMENTAL,
     ENGINE_MODE_QUALITY,
@@ -18,6 +21,7 @@ from backend.engines.base import (
     EngineMode,
     EngineParam,
     SynthesisEngine,
+    builtin_voices,
     default_engine_for_gender,
     engine_info,
     fallback_engine,
@@ -139,6 +143,31 @@ def test_fallback_and_reference_helpers():
     assert fallback_engine("нет-такого") == ""  # неизвестный id тоже не цель отката
 
 
+def test_builtin_voices_are_declared_only_by_the_engine_that_speaks_them():
+    """Встроенные голоса объявляет паспорт, и только у движка без клонирования.
+
+    Этот список — единственный источник имён: и `voices_store` заводит по нему
+    карточки, и `/api/engines` отдаёт его интерфейсу. Выдумывать имена в
+    хранилище или на фронте значило бы завести второй источник правды и
+    разойтись с движком при первой же смене чекпоинта.
+    """
+    assert requires_reference(ENGINE_KOKORO) is False
+    voices = builtin_voices(ENGINE_KOKORO)
+    # По голосу на каждый пол: движок выбирает встроенный голос по полу карточки,
+    # и без пары «мужской/женский» часть выбора просто не звучала бы.
+    assert [voice.gender for voice in voices] == ["female", "male", "other"]
+    assert all(voice.id and voice.label for voice in voices)
+    # Клонирующему движку заводить нечего: пустой набор, а не выдуманные имена.
+    assert builtin_voices(ENGINE_F5) == ()
+    assert builtin_voices(ENGINE_QWEN) == ()
+    # Опечатка в id не рождает голосов: паспорт откатывается к F5.
+    assert builtin_voices("нет-такого") == ()
+
+    payload = ENGINE_INFOS[ENGINE_KOKORO].to_dict()
+    assert payload["builtin_voices"] == [voice.to_dict() for voice in voices]
+    assert set(payload["builtin_voices"][0]) == {"id", "label", "gender"}
+
+
 class _ModeEngine(SynthesisEngine):
     """Движок с режимами: проверяет слияние пресета, дефолтов и явных ручек."""
 
@@ -213,3 +242,68 @@ def test_mode_overrides_are_clamped_to_declared_bounds():
 
     # Значение пресета ниже минимума: приведено к границе, а не ушло в модель.
     assert engine.seen["steps"] == 8
+
+
+# --- откат XTTS с MPS на CPU --------------------------------------------------
+def _xtts_on_mps(monkeypatch, error: Exception):
+    """XTTS с MPS и подставным инференсом, падающим первым вызовом.
+
+    Веса не грузятся: проверяется только решение «перезагружать на CPU или нет».
+    """
+    engine = xtts_engine.XTTSEngine(ENGINE_XTTS, Path("/нет-такого-чекпоинта"))
+    engine._device = "mps"
+    engine._model = object()
+    calls = {"infer": 0, "loaded": [], "released": 0}
+
+    def fake_infer(text, ref_audio_path, speed, params):
+        calls["infer"] += 1
+        if calls["infer"] == 1:
+            raise error
+        return np.zeros(SAMPLE_RATE, dtype=np.float32), SAMPLE_RATE
+
+    def fake_load(device):
+        calls["loaded"].append(device)
+        engine._device = device
+        engine._model = object()
+
+    def fake_release():
+        calls["released"] += 1
+
+    monkeypatch.setattr(engine, "_infer", fake_infer)
+    monkeypatch.setattr(engine, "_load_model", fake_load)
+    monkeypatch.setattr(xtts_engine, "release_torch_memory", fake_release)
+    return engine, calls
+
+
+def test_xtts_fallback_ignores_errors_that_are_not_about_mps(monkeypatch):
+    """Сбой синтеза на MPS — это не сбой MPS: тихий перевод на CPU прятал ошибку."""
+    engine, calls = _xtts_on_mps(monkeypatch, ValueError("Пустой текст реплики"))
+
+    with pytest.raises(ValueError, match="Пустой текст"):
+        engine._synthesize("", "/tmp/ref.wav", "", 1.0, {})
+
+    assert calls["loaded"] == []  # модель не перезагружалась
+    assert calls["released"] == 0
+
+
+def test_xtts_fallback_moves_to_cpu_and_frees_metal_pool(monkeypatch):
+    engine, calls = _xtts_on_mps(monkeypatch, RuntimeError("MPS backend out of memory"))
+
+    wave, rate = engine._synthesize("Привет", "/tmp/ref.wav", "Привет", 1.0, {})
+
+    assert rate == SAMPLE_RATE and wave.size == SAMPLE_RATE
+    assert calls["loaded"] == ["cpu"]
+    # Старый Metal-пул освобождается до перезагрузки: иначе unified memory удваивается.
+    assert calls["released"] == 1
+
+
+def test_xtts_fallback_does_not_trigger_on_cpu_device(monkeypatch):
+    """На CPU «mps» в тексте ошибки ничего не значит — перезагружать некуда."""
+    engine, calls = _xtts_on_mps(monkeypatch, RuntimeError("unsupported MPS op"))
+    engine._device = "cpu"
+
+    with pytest.raises(RuntimeError, match="unsupported MPS"):
+        engine._synthesize("Привет", "/tmp/ref.wav", "Привет", 1.0, {})
+
+    assert calls["loaded"] == []
+    assert calls["released"] == 0

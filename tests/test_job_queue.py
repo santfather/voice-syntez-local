@@ -9,6 +9,7 @@
 
 import asyncio
 import contextlib
+import logging
 import threading
 import time
 
@@ -23,15 +24,19 @@ from backend.audio_pipeline import (
     SpeakerSettings,
     read_variant,
 )
+from backend.db.connection import transaction
 from backend.dialogue_parser import Replica
 from backend.job_queue import (
     PRIORITY_BACKGROUND,
     PRIORITY_PREVIEW,
     PRIORITY_RENDER,
+    QUEUE_MAX_PENDING,
+    QUEUE_PREVIEW_RESERVE,
     Job,
     JobPayload,
     JobQueue,
     JobStatus,
+    QueueOverloadedError,
 )
 
 
@@ -67,6 +72,42 @@ async def _queue():
 
 def _run(scenario) -> None:
     asyncio.run(scenario())
+
+
+def _job_rows() -> dict[str, dict]:
+    """Строки таблицы `jobs` — то, что переживает перезапуск приложения."""
+    with transaction() as connection:
+        return {
+            row["id"]: dict(row) for row in connection.execute("SELECT * FROM jobs").fetchall()
+        }
+
+
+def test_render_job_is_recorded_in_database(stub, fake_store):
+    """Состояние задачи пишется в базу: «в очереди» → «готово» с файлом и итогом.
+
+    Ради этой строки таблица и заведена: очередь живёт в памяти, и после краха
+    без записи от задачи не осталось бы ни статуса, ни причины.
+    """
+    async def scenario():
+        async with _queue() as queue:
+            job = queue.submit(_payload())
+            queued = _job_rows()[job.id]
+            assert queued["status"] == JobStatus.QUEUED.value
+            assert queued["total_replicas"] == 3
+            assert queued["started_at"] is None
+
+            assert await _wait_until(lambda: job.status is JobStatus.DONE), job.error
+
+        saved = _job_rows()[job.id]
+        assert saved["status"] == JobStatus.DONE.value
+        assert saved["message"] == job.message
+        assert saved["output_path"] == str(job.output_path)
+        assert saved["duration_sec"] == pytest.approx(job.duration_sec)
+        assert saved["current_replica"] == job.total_replicas
+        assert saved["started_at"] and saved["finished_at"]
+        assert saved["error"] is None
+
+    _run(scenario)
 
 
 def test_render_job_records_segments_and_seeds(stub, fake_store):
@@ -435,6 +476,57 @@ def test_fifo_inside_one_priority(monkeypatch, stub, fake_store):
     _run(scenario)
 
 
+def test_overloaded_queue_is_rejected_and_keeps_preview_reserve(monkeypatch, stub, fake_store):
+    """F-Q4. У очереди есть потолок, и последние слоты остаются за прослушиванием.
+
+    Очередь держит payload'ы реплик в памяти, поэтому поток запросов без потолка
+    копил бы их без предела. Сборки до потолка не доходят: слоты резерва за ними
+    не занимаются, иначе под потоком сборок короткое прослушивание получало бы
+    отказ вместо быстрого выполнения. Отказ приходит до регистрации задачи —
+    иначе в базе осталась бы задача «в очереди», которая никогда не начнётся.
+    """
+    engine, gate = _gated_engine()
+
+    async def scenario():
+        _use_engine(monkeypatch, engine)
+        gate.pass_through(0)  # воркер встанет на первой задаче и очередь не разберёт
+        async with _queue() as queue:
+            queue.submit(_single("Держу"))
+            assert await _wait_until(gate.entered.is_set), "воркер не занят"
+
+            limit = QUEUE_MAX_PENDING - QUEUE_PREVIEW_RESERVE
+            for index in range(limit):
+                queue.submit(_single(f"Сборка {index}"))
+            assert queue.queue_size() == limit
+            registered = len(_job_rows())
+
+            with pytest.raises(QueueOverloadedError, match="сборок"):
+                queue.submit(_single("Лишняя сборка"))
+            # Отказ не оставил следа: задачи нет ни в очереди, ни в базе, где она
+            # висела бы «в очереди» до перезапуска.
+            assert queue.queue_size() == limit
+            assert len(_job_rows()) == registered
+
+            # Слоты резерва пусты: прослушивание принимается — и ровно их и хватает.
+            previews = [
+                queue.submit(_single("Прослушивание"), priority=PRIORITY_PREVIEW)
+                for _ in range(QUEUE_PREVIEW_RESERVE)
+            ]
+            assert queue.queue_size() == QUEUE_MAX_PENDING
+            with pytest.raises(QueueOverloadedError, match="переполнена"):
+                queue.submit(_single("Прослушивание"), priority=PRIORITY_PREVIEW)
+            with pytest.raises(QueueOverloadedError, match="сборок"):
+                queue.submit(_single("Сборка"))
+
+            # Резерв держится и при выдаче: прослушивание идёт сразу за текущей
+            # задачей, хотя поставлено после всех сборок.
+            gate.open()
+            assert await _wait_until(lambda: _terminated(queue, previews[0]))
+            assert gate.calls[:2] == ["Держу", "Прослушивание"]
+
+    _run(scenario)
+
+
 def test_queued_job_is_cancelled_before_start(monkeypatch, stub, fake_store):
     """4-5. Ожидающая задача отменяется сразу и никогда не доходит до движка."""
     engine, gate = _gated_engine()
@@ -461,6 +553,31 @@ def test_queued_job_is_cancelled_before_start(monkeypatch, stub, fake_store):
             await asyncio.sleep(0.1)  # воркер доходит до отменённой задачи в очереди
             assert waiting.status is JobStatus.CANCELLED
             assert gate.calls == ["Держу"]  # движок её так и не увидел
+
+    _run(scenario)
+
+
+def test_cancelled_queued_job_is_recorded_as_cancelled(monkeypatch, stub, fake_store):
+    """Отмена тоже попадает в базу: иначе задача навсегда осталась бы «в очереди»."""
+    engine, gate = _gated_engine()
+
+    async def scenario():
+        _use_engine(monkeypatch, engine)
+        gate.pass_through(0)
+        async with _queue() as queue:
+            blocker = queue.submit(_single("Держу"))
+            assert await _wait_until(gate.entered.is_set), "воркер не занят"
+            waiting = queue.submit(_single("Ожидание"), priority=PRIORITY_RENDER)
+            await asyncio.sleep(0.2)
+
+            queue.cancel(waiting.id)
+            saved = _job_rows()[waiting.id]
+            assert saved["status"] == JobStatus.CANCELLED.value
+            assert "до запуска" in saved["message"]
+            assert saved["finished_at"]
+
+            gate.open()
+            assert await _wait_until(lambda: _terminated(queue, blocker))
 
     _run(scenario)
 
@@ -937,3 +1054,48 @@ def test_watchdog_interrupt_is_an_error_not_a_cancellation(monkeypatch, stub, fa
             assert follow_up.cancel_requested is False
 
     _run(scenario)
+
+
+# --- ФАЗА 3, §3.4: время реплики остаётся в логе ------------------------------
+def _replica_timings(caplog) -> list[dict[str, str]]:
+    """Разбирает строки `tts.replica.timing` на пары ключ-значение."""
+    timings: list[dict[str, str]] = []
+    for record in caplog.records:
+        if record.name != "backend.job_queue":
+            continue
+        message = record.getMessage()
+        if not message.startswith("tts.replica.timing "):
+            continue
+        timings.append(dict(part.split("=", 1) for part in message.split()[1:]))
+    return timings
+
+
+def test_replica_timing_is_logged_for_every_chunk(stub, fake_store, caplog):
+    """У каждой реплики есть строка со своим временем — иначе троттлинг не увидеть.
+
+    Тепловая деградация MPS заметна только в ряду времён: одна реплика на
+    секунду дольше — это обычный разброс, а рост от первой к двадцатой — уже
+    сигнал, который легко списать на «модель тормозит» (фаза 3, §3.4). Раньше
+    такое время жило только внутри ETA, откуда его не вычитать. Поэтому
+    проверяется не факт строки, а её состав: по номеру, движку и длине текста
+    ряд времён и читается.
+    """
+    async def scenario():
+        with caplog.at_level(logging.INFO, logger="backend.job_queue"):
+            async with _queue() as queue:
+                job = queue.submit(_payload(count=3))
+                assert await _wait_until(lambda: job.status is JobStatus.DONE), job.error
+
+    _run(scenario)
+
+    timings = _replica_timings(caplog)
+    assert [entry["index"] for entry in timings] == ["1", "2", "3"]
+    for entry in timings:
+        assert entry["total"] == "3"
+        assert entry["engine"] == "stub"
+        assert int(entry["chars"]) > 0
+        # Время синтеза — то, что копится в ряд; аудио и режим проверки —
+        # подпись, без которой ряд не с чем сопоставить.
+        assert float(entry["render_sec"]) >= 0.0
+        assert float(entry["audio_sec"]) > 0.0
+        assert entry["qa"] == config.QA_MODE_OFF

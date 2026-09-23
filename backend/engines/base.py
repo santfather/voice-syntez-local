@@ -14,6 +14,7 @@ F5-TTS сейчас синтезирует кусок или XTTS v2. Ручки
 
 import gc
 import logging
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -74,22 +75,60 @@ class EngineBusyError(RuntimeError):
     """
 
 
-def release_torch_memory() -> None:
-    """Best-effort возврат памяти Python/Torch/MPS после выгрузки модели.
+def release_torch_memory(light: bool = False) -> None:
+    """Best-effort возврат памяти Python/Torch/MPS: после выгрузки и между синтезами.
 
     `gc.collect()` идёт раньше `empty_cache()`: пока на тензоры есть ссылки в
     циклах, драйвер их не заберёт. Отсутствие torch или MPS и ошибка очистки не
     считаются ошибкой выгрузки — ссылки на модель уже обнулены, а кеш драйвера
     ОС заберёт сама, поэтому сбой уборки только логируется.
+
+    Зовётся в двух случаях с разным смыслом. При выгрузке (из `_release`
+    подклассов) ссылки на модель уже обнулены, и `empty_cache()` возвращает
+    драйверу всё. В конце каждого синтеза (см. `SynthesisEngine.synthesize`)
+    модель остаётся в памяти, и убираются только промежуточные тензоры
+    прошедшего инференса: без этого `driver_allocated_memory()` растёт от реплики
+    к реплике — «главный симптом утечки» (§11.2 аудита), который на длинном
+    диалоге заканчивается swap-ом, а затем падением Metal.
+
+    `light=True` — именно этот второй случай: полная коллекция не нужна, хватает
+    молодого поколения, где и живут тензоры только что прошедшей реплики. Полная
+    коллекция на разросшемся процессе стоит ~0.2 с (замер на этом проекте) и,
+    вызываясь на каждой реплике, съедала бы время синтеза больше, чем сам синтез
+    (§3.1): модель из памяти не убирается, а её циклы живут в старших поколениях.
     """
-    gc.collect()
+    if light:
+        gc.collect(0)
+    else:
+        gc.collect()
     try:
         import torch
 
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
     except Exception as exc:  # noqa: BLE001 — уборка мусора не должна ломать выгрузку
-        logger.warning("Не удалось очистить кеш MPS после выгрузки: %s", exc)
+        logger.warning("Не удалось очистить кеш MPS: %s", exc)
+
+
+def mps_driver_allocated_mb() -> float | None:
+    """Занятая процессом память Metal в МБ — `None`, если torch или MPS недоступны.
+
+    Отдельно от `resource_guard.mps_memory_snapshot` намеренно: тот обслуживает
+    `/api/status` и на сбое чтения пишет `warning`, а здесь метрика берётся на
+    каждом синтезе, и та же ошибка превратилась бы в строку на каждую реплику.
+    Поэтому сбой уходит в `debug`, а счётчик читается по `sys.modules`, а не
+    импортом: `import torch` в процессе, где его ещё нет, стоит секунды.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.backends.mps.is_available():
+            return None
+        return torch.mps.driver_allocated_memory() / (1024 * 1024)
+    except Exception as exc:  # noqa: BLE001 — метрика не повод ронять синтез
+        logger.debug("Не удалось прочитать память MPS: %s", exc)
+        return None
 
 
 @dataclass(frozen=True)
@@ -168,6 +207,29 @@ class EngineMode:
 
 
 @dataclass(frozen=True)
+class EngineVoice:
+    """Встроенный голос движка — то, чем он говорит вместо клонирования.
+
+    Объявляется паспортом, потому что у движка без клонирования нет чужих
+    референсов: набор того, что он умеет произносить, — часть его возможностей, а
+    не данные приложения. Из этого объявления приложение заводит карточки
+    голосов (`voices_store.ensure_builtin_voices`), поэтому пользователю не нужно
+    ничего записывать, чтобы услышать движок.
+    """
+
+    id: str
+    label: str
+    # Пол карточки. Сам встроенный голос движок выбирает по нему: `male`/`female`
+    # у Kokoro-ru — свои чекпоинты, всё остальное достаётся третьему голосу
+    # (см. engines/kokoro_engine.py, config.KOKORO_VOICE_*). Здесь он объявлен,
+    # чтобы карточка появлялась с правильной подписью пола, а не «—».
+    gender: str
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "label": self.label, "gender": self.gender}
+
+
+@dataclass(frozen=True)
 class EngineInfo:
     """Паспорт движка: имя, назначение, возможности и набор его ручек.
 
@@ -194,6 +256,12 @@ class EngineInfo:
     # встроенных голосах (пресетах), и пайплайн синтезирует без референса:
     # резолвер профилей не вызывается вовсе, а не «вызывается и падает».
     supports_cloning: bool = True
+    # Встроенные голоса движка (`EngineVoice`). Пусто — движок говорит только
+    # записанным голосом, и голоса для него создаёт пользователь из референса.
+    # Непусто — приложение заводит карточки этих голосов само, как только файлы
+    # движка оказываются на диске: требовать запись для движка, который её
+    # игнорирует, бессмысленно.
+    builtin_voices: tuple[EngineVoice, ...] = ()
     # Применимы ли к движку интонационные профили (UPDATE 3). У движка без
     # клонирования профилей нет по определению: профиль — это запись голоса,
     # которой у пресетного движка не существует.
@@ -225,6 +293,7 @@ class EngineInfo:
             "fallback_engine": self.fallback_engine,
             "default_mode": self.default_mode,
             "note": self.note,
+            "builtin_voices": [voice.to_dict() for voice in self.builtin_voices],
             "params": [param.to_dict() for param in self.params],
             "modes": [mode.to_dict() for mode in self.modes],
         }
@@ -417,6 +486,15 @@ ENGINE_INFOS: dict[str, EngineInfo] = {
         # модели, поэтому `+`-разметка пайплайна ей не требуется.
         supports_cloning=False,
         supports_prosody_profiles=False,
+        # Три встроенных голоса — ровно те голосовые пакеты, что лежат в
+        # `voices/*.pt` репозитория модели (см. config.KOKORO_VOICE_*). Пол карточки
+        # и есть выбор голоса: движок берёт пакет по нему, поэтому отдельных
+        # ручек у голоса нет.
+        builtin_voices=(
+            EngineVoice(id=config.KOKORO_VOICE_FEMALE, label="Света", gender="female"),
+            EngineVoice(id=config.KOKORO_VOICE_MALE, label="Дима", gender="male"),
+            EngineVoice(id=config.KOKORO_VOICE_OTHER, label="Маша", gender="other"),
+        ),
         note=(
             "Веса ~0.7 ГБ (два чекпоинта), лицензия весов OpenRAIL, работает на CPU "
             "(RTF ~0.1). Тёмный тембр и фрикативный призвук в ж/ш/х — известные "
@@ -528,6 +606,15 @@ def normalize_engine_mode(engine_id: str, raw: Any) -> str:
 def requires_reference(engine_id: str) -> bool:
     """Нужен ли движку референс голоса (см. `EngineInfo.supports_cloning`)."""
     return engine_info(engine_id).supports_cloning
+
+
+def builtin_voices(engine_id: str) -> tuple[EngineVoice, ...]:
+    """Встроенные голоса движка (см. `EngineInfo.builtin_voices`).
+
+    Пустой набор — обычный случай: движок клонирует записанный голос, и заводить
+    ему карточки нечего.
+    """
+    return engine_info(engine_id).builtin_voices
 
 
 def fallback_engine(engine_id: str) -> str:
@@ -730,13 +817,25 @@ class SynthesisEngine(ABC):
         `not is_loaded`, поэтому ручная или фоновая выгрузка не ломает следующий
         синтез — он просто снова платит за загрузку. Пока вызов активен, счётчик
         не ноль, и `unload()` отказывается освобождать модель (см. `EngineBusyError`).
+
+        Хвост синтеза убирает за собой: кеш Metal чистится на каждом вызове, а не
+        только при выгрузке модели (см. `release_torch_memory`), и дельта
+        `driver_allocated_memory()` уходит в лог — по ней видно, растёт ли память
+        от реплики к реплике (§11.2 аудита). Уборка лёгкая (`light=True`): полная
+        коллекция на каждой реплике стоила бы дороже синтеза. Идёт она до снятия
+        счётчика: пока вызов числится активным, `unload()` не заберёт модель
+        из-под неё.
         """
+        before_mb: float | None = None
         with self._active_lock:
             self._active_synthesizes += 1
         try:
             if not self.is_loaded:
                 self.load()
             merged = self._merged_params(params)
+            # Снимок берётся после загрузки: иначе в дельту попал бы вес модели,
+            # а не след одной реплики.
+            before_mb = mps_driver_allocated_mb()
             waveform, sample_rate = self._synthesize(
                 text, ref_audio_path, ref_text, float(speed), merged
             )
@@ -747,6 +846,14 @@ class SynthesisEngine(ABC):
                 )
             return waveform, sample_rate
         finally:
+            release_torch_memory(light=True)
+            after_mb = mps_driver_allocated_mb()
+            if before_mb is not None and after_mb is not None:
+                logger.info(
+                    "tts.mps.synthesis engine=%s driver_before_mb=%.1f "
+                    "driver_after_mb=%.1f delta_mb=%+.1f",
+                    self.id, before_mb, after_mb, after_mb - before_mb,
+                )
             with self._active_lock:
                 self._active_synthesizes -= 1
             self._touch()

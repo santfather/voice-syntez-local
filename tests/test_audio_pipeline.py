@@ -1,11 +1,13 @@
 """Сборка трека: подготовка куска, громкость файла, лимитер, варианты и паузы."""
 
 import asyncio
+import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import soundfile as sf
-from conftest import dominant_hz, sine
+from conftest import StubEngine, dominant_hz, sine
 
 from backend import audio_pipeline, config, warmup_context
 from backend.audio_pipeline import (
@@ -262,6 +264,41 @@ def test_render_dialogue_rejects_empty_and_unknown_voice(stub, fake_store):
         _render([_replica()], {"#2": _speaker()})
     with pytest.raises(ValueError, match="не найден"):
         _render([_replica()], {"#1": _speaker(voice_id="нет-такого")})
+
+
+def test_render_dialogue_refuses_when_disk_is_full(stub, fake_store, monkeypatch):
+    """§6. Нет места на диске — отказ до синтеза, а не недописанный файл после него.
+
+    Заполненный диск воспроизводится подменой отчёта о свободном месте и порога
+    из конфига: по-настоящему забивать диск в тесте нельзя. Проверяется и текст
+    (его видит пользователь), и то, что синтез не начинался: движок не вызывался,
+    а в `output/` не появилось ни файла, ни `.part`.
+    """
+    monkeypatch.setattr(config, "DISK_MIN_FREE_MB", 512)
+    monkeypatch.setattr(
+        audio_pipeline.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100, used=100, free=10 * 1024 * 1024),
+    )
+
+    with pytest.raises(audio_pipeline.AudioFileError, match="Мало места на диске"):
+        _render([_replica()], {"#1": _speaker()})
+
+    assert stub.calls == []
+    assert list(config.OUTPUT_DIR.glob("job*")) == []
+
+
+def test_render_dialogue_skips_disk_check_when_disabled(stub, fake_store, monkeypatch):
+    """Порог `0` выключает проверку: синтез идёт, даже если места нет вовсе."""
+    monkeypatch.setattr(config, "DISK_MIN_FREE_MB", 0)
+    monkeypatch.setattr(
+        audio_pipeline.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100, used=100, free=0),
+    )
+
+    result = _render([_replica()], {"#1": _speaker()})
+    assert result.output_path.exists()
 
 
 def test_render_dialogue_aborts_between_replicas(stub, fake_store):
@@ -665,3 +702,100 @@ def test_warmup_takes_priority_over_short_layer(stub, fake_store, monkeypatch):
 
     # Даже если короткий слой построил свой план, первый вход модели — префикс прогрева.
     assert stub.calls[0]["text"] == f"{WARMUP_PREFIX} {WARMUP_TARGET}"
+
+
+# --- Фаза 3 (§11.4): нехватка памяти Metal и повтор реплики --------------------
+# Текст — как его печатает torch: три числа в скобках и попытка аллокации.
+MPS_OOM_TEXT = (
+    "MPS backend out of memory (MPS allocated: 5.43 GB, other allocations: 1.34 GB, "
+    "max allowed: 8.00 GB). Tried to allocate 1.00 GB on private pool."
+)
+
+
+class _CountingEngine(StubEngine):
+    """Заглушка с журналом попыток: по нему видно, повторялся синтез или нет."""
+
+    def __init__(self, failure: Exception | None = None, fail_times: int = 0) -> None:
+        super().__init__()
+        self.failure = failure
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    def _synthesize(self, text, ref_audio_path, ref_text, speed, params):
+        self.attempts += 1
+        if self.failure is not None and self.attempts <= self.fail_times:
+            raise self.failure
+        return super()._synthesize(text, ref_audio_path, ref_text, speed, params)
+
+
+def _chunk(engine, voice):
+    return asyncio.run(
+        audio_pipeline._synthesize_chunk(
+            engine,
+            voice,
+            "Привет, это тест",
+            SpeakerSettings(voice_id=voice.id),
+            RenderSettings(),
+            position="1",
+            label="Анна",
+        )
+    )
+
+
+def test_mps_oom_frees_warm_engines_and_retries_once(fake_store, monkeypatch, caplog):
+    """Нехватка памяти Metal: тёплый сосед выгружается, реплика повторяется (§11.4)."""
+    engine = _CountingEngine(failure=RuntimeError(MPS_OOM_TEXT), fail_times=1)
+    engine.load()
+    warm = StubEngine()
+    warm.load()
+    monkeypatch.setattr(
+        audio_pipeline.engine_lifecycle,
+        "created_engines",
+        lambda: {"stub": engine, "warm": warm},
+    )
+
+    with caplog.at_level(logging.INFO, logger="backend.audio_pipeline"):
+        chunk, seed = _chunk(engine, fake_store)
+
+    assert engine.attempts == 2, "после освобождения памяти реплика обязана повториться"
+    assert warm.is_loaded is False, "память освобождает именно соседний движок"
+    assert chunk.size > 0 and seed is not None
+    # Три числа из сообщения torch — полями лога, а не в тексте исключения.
+    oom_line = next(
+        record.getMessage() for record in caplog.records if "tts.mps.oom" in record.getMessage()
+    )
+    assert "allocated=5.43 GB" in oom_line
+    assert "other=1.34 GB" in oom_line
+    assert "max_allowed=8.00 GB" in oom_line
+
+
+def test_mps_oom_without_freeable_engines_fails_fast(fake_store, monkeypatch, caplog):
+    """Освобождать нечего — повтор не делается: он дал бы тот же отказ."""
+    engine = _CountingEngine(failure=RuntimeError(MPS_OOM_TEXT), fail_times=10)
+    engine.load()
+    monkeypatch.setattr(
+        audio_pipeline.engine_lifecycle, "created_engines", lambda: {"stub": engine}
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="backend.audio_pipeline"),
+        pytest.raises(RuntimeError, match="out of memory"),
+    ):
+        _chunk(engine, fake_store)
+
+    assert engine.attempts == 1
+    assert "повтор отменён" in caplog.text
+
+
+def test_engine_failure_is_not_retried(fake_store, monkeypatch):
+    """Обычный отказ движка повтору не подлежит — иначе ошибка вернулась бы дважды."""
+    engine = _CountingEngine(failure=RuntimeError("внутренняя ошибка движка"), fail_times=10)
+    engine.load()
+    monkeypatch.setattr(
+        audio_pipeline.engine_lifecycle, "created_engines", lambda: {"stub": engine}
+    )
+
+    with pytest.raises(RuntimeError, match="внутренняя ошибка движка"):
+        _chunk(engine, fake_store)
+
+    assert engine.attempts == 1

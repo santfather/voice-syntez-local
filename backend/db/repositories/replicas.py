@@ -168,13 +168,17 @@ class ReplicasRepository:
         )
         return cursor.rowcount > 0
 
-    def replace(self, project_id: str, replicas: list[dict]) -> None:
+    def replace(self, project_id: str, replicas: list[dict]) -> list[str]:
         """Приводит список реплик проекта к новому результату разбора.
 
         Реплика, у которой текст и спикер не изменились, остаётся той же строкой
         в базе: у неё сохраняются варианты и выбранный take. Иначе правка одной
         фразы в исходном тексте обнуляла бы уже проделанную работу по всему
         диалогу, хотя изменилась одна строчка.
+
+        Возвращает пути файлов вариантов удалённых реплик: `ON DELETE CASCADE`
+        чистит только строки в базе, а куски на диске остались бы сиротами
+        (F-S2). Файлы удаляет вызывающий — репозиторий о диске не знает.
         """
         existing = {
             int(row["idx"]): row
@@ -182,6 +186,7 @@ class ReplicasRepository:
                 "SELECT * FROM replicas WHERE project_id = ?", (project_id,)
             )
         }
+        orphan_paths: list[str] = []
         keep: list[int] = []
         for item in replicas:
             index = int(item["index"])
@@ -206,6 +211,7 @@ class ReplicasRepository:
                 )
                 continue
             if old is not None:
+                orphan_paths.extend(self._take_paths([int(old["id"])]))
                 self._conn.execute("DELETE FROM replicas WHERE id = ?", (old["id"],))
             self._conn.execute(
                 "INSERT INTO replicas (project_id, idx, text, speaker, voice_id, overrides,"
@@ -220,6 +226,9 @@ class ReplicasRepository:
                     config.REPLICA_STATUS_PENDING,
                 ),
             )
+        # Реплики, которых нет в новом разборе, уходят вместе с вариантами.
+        removed = self._extra_replica_ids(project_id, keep)
+        orphan_paths.extend(self._take_paths(removed))
         if keep:
             placeholders = ", ".join("?" for _ in keep)
             self._conn.execute(
@@ -228,6 +237,32 @@ class ReplicasRepository:
             )
         else:
             self._conn.execute("DELETE FROM replicas WHERE project_id = ?", (project_id,))
+        return orphan_paths
+
+    def _extra_replica_ids(self, project_id: str, keep: list[int]) -> list[int]:
+        """Идентификаторы реплик, которых нет в новом разборе (уходят целиком)."""
+        if keep:
+            placeholders = ", ".join("?" for _ in keep)
+            rows = self._conn.execute(
+                f"SELECT id FROM replicas WHERE project_id = ? AND idx NOT IN ({placeholders})",
+                (project_id, *keep),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id FROM replicas WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def _take_paths(self, replica_ids: list[int]) -> list[str]:
+        """Пути файлов вариантов указанных реплик — до их каскадного удаления."""
+        if not replica_ids:
+            return []
+        placeholders = ", ".join("?" for _ in replica_ids)
+        rows = self._conn.execute(
+            f"SELECT audio_path FROM takes WHERE replica_id IN ({placeholders})",
+            tuple(replica_ids),
+        ).fetchall()
+        return [str(row["audio_path"]) for row in rows]
 
     def set_voice(self, replica_id: int, voice_id: str | None) -> bool:
         """Голос одной реплики: свой (`voice_id`) или наследуемый (`None`).

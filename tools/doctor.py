@@ -4,7 +4,8 @@
 Инструмент отвечает на вопрос «почему не запускается / что настроено не так» до
 первого синтеза: версия Python и venv, ffmpeg, наличие и размер моделей, место на
 диске, права на `data/` и `output/`, состояние порта и замка единственного
-инстанса, пробелы/не-ASCII в пути проекта и доступность MPS (best-effort).
+инстанса, пробелы/не-ASCII в пути проекта, доступность MPS (best-effort) и
+давление памяти ядра (`sysctl`, без `sudo`).
 
 Модели здесь **не поднимаются**: состояние берётся у `model_manager` (он смотрит
 только файлы и уже созданные движки), `get_engine`/`load` не вызываются вовсе.
@@ -22,6 +23,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -289,6 +291,71 @@ def _mps_check() -> tuple[dict, dict]:
     )
 
 
+# Уровни давления памяти ядра macOS (`sysctl kern.memorystatus_vm_pressure_level`):
+# 1 — норма, 2 — предупреждение, 4 — критично (значения из kern_memorystatus.h).
+# Текст, а не число, потому что пользователю в отчёте число ничего не говорит.
+VM_PRESSURE_LEVELS = {1: "норма", 2: "предупреждение", 4: "критично"}
+
+
+def _vm_pressure_check() -> tuple[dict, dict]:
+    """Давление памяти по счётчику ядра — минимальный сигнал троттлинга и swap.
+
+    `sysctl` выбран вместо `powermetrics` намеренно: тот требует `sudo`, а doctor
+    обязан оставаться безопасным и неинтерактивным. Чтение счётчика ничего не
+    меняет в системе. Провал самой команды — предупреждение, а не ошибка: без
+    этого пункта остальные проверки сохраняют смысл.
+    """
+    if sys.platform != "darwin":
+        return (
+            check("давление памяти", OK, f"не macOS ({sys.platform}) — проверка неприменима"),
+            {"level": None, "level_name": None},
+        )
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            check("давление памяти", WARN, f"не удалось прочитать: {exc}", "Проверьте доступность sysctl."),
+            {"level": None, "level_name": None},
+        )
+    raw = (result.stdout or "").strip()
+    try:
+        level = int(raw)
+    except ValueError:
+        return (
+            check("давление памяти", WARN, f"неожиданный ответ sysctl: {raw!r}"),
+            {"level": None, "level_name": None},
+        )
+    name = VM_PRESSURE_LEVELS.get(level, f"уровень {level}")
+    data = {"level": level, "level_name": name}
+    if level >= 4:
+        return (
+            check(
+                "давление памяти",
+                WARN,
+                f"{name} (level {level}) — система под давлением памяти",
+                "Закройте лишние приложения: при таком давлении синтез может идти медленнее, а MPS — упереться в потолок.",
+            ),
+            data,
+        )
+    if level >= 2:
+        return (
+            check(
+                "давление памяти",
+                WARN,
+                f"{name} (level {level}) — память почти занята",
+                "Для длинного диалога освободите память заранее: синтез и распознавание работают одновременно.",
+            ),
+            data,
+        )
+    return check("давление памяти", OK, f"{name} (level {level})"), data
+
+
 def collect(start_port: int = 8000) -> dict:
     """Собирает полный отчёт. Модели не поднимает, сеть не трогает."""
     checks: list[dict] = []
@@ -310,6 +377,8 @@ def collect(start_port: int = 8000) -> dict:
     checks.extend(port_items)
     mps_item, mps_data = _mps_check()
     checks.append(mps_item)
+    capacity_item, capacity_data = _vm_pressure_check()
+    checks.append(capacity_item)
 
     failures = [item for item in checks if item["status"] == FAIL]
     warnings = [item for item in checks if item["status"] == WARN]
@@ -323,6 +392,7 @@ def collect(start_port: int = 8000) -> dict:
         "path": path_data,
         "port": port_data,
         "mps": mps_data,
+        "vm_pressure": capacity_data,
         "checks": checks,
         "summary": {"ok": len(checks) - len(failures) - len(warnings), "warn": len(warnings), "fail": len(failures)},
     }

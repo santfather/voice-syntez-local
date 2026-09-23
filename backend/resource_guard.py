@@ -16,6 +16,7 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -84,6 +85,40 @@ def mps_memory_snapshot() -> dict | None:
     except Exception as exc:  # noqa: BLE001 — метрика не повод валить статус
         logger.warning("Не удалось прочитать память MPS: %s", exc)
         return None
+
+
+# Как torch сообщает об исчерпании памяти Metal. Ищем по тексту, а не по типу:
+# в изолированном режиме ошибка приходит из другого процесса уже чужим классом
+# (`TtsEngineError`), и `isinstance` на ней не сработает.
+_MPS_OOM_MARKERS = ("mps backend out of memory", "mps out of memory")
+# Те же три числа, что torch печатает в сообщении: занято процессом, чужие
+# аллокации и потолок. Разбираем их отдельно, чтобы они попали в лог полями, а не
+# тонули в тексте исключения.
+_MPS_OOM_NUMBERS = re.compile(
+    r"mps allocated:\s*([\d.]+\s*\w+)[,;]?\s*"
+    r"other allocations:\s*([\d.]+\s*\w+)[,;]?\s*"
+    r"max allowed:\s*([\d.]+\s*\w+)",
+    re.IGNORECASE,
+)
+
+
+def is_mps_oom(exc: BaseException) -> bool:
+    """Похоже ли исключение на нехватку памяти Metal (аудит §11.4)."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _MPS_OOM_MARKERS)
+
+
+def mps_oom_numbers(exc: BaseException) -> dict[str, str] | None:
+    """Три числа из сообщения MPS-OOM — `None`, если разобрать не удалось.
+
+    Формулировку задаёт torch, и её изменение не должно превращать разбор в
+    ошибку: вызывающий в этом случае пишет текст исключения как есть.
+    """
+    found = _MPS_OOM_NUMBERS.search(str(exc))
+    if found is None:
+        return None
+    allocated, other, max_allowed = found.groups()
+    return {"allocated": allocated, "other": other, "max_allowed": max_allowed}
 
 
 def check_system_memory_pressure() -> bool:

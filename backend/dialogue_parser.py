@@ -71,6 +71,11 @@ class Replica:
     text: str
     line_number: int
     overrides: dict[str, float] = field(default_factory=dict)
+    # Части текста до склейки. Разбор копит их списком и собирает `text` один раз
+    # в конце: дописывание строки на каждой части росло бы квадратично по длине
+    # реплики, а в сплошном тексте реплика набирается из сотен строк. Наружу не
+    # выходит: к концу `parse_dialogue` в `text` уже лежит готовый результат.
+    text_parts: list[str] = field(default_factory=list, repr=False)
     # Голос именно этой реплики поверх голоса спикера; None — наследовать.
     # В тексте не выражается: это правка карточки реплики в интерфейсе.
     voice_id: str | None = None
@@ -289,7 +294,11 @@ def _marker_label(text: str, marker: _Marker) -> tuple[str | None, int, int]:
 
 
 def parse_dialogue(raw_text: str, max_replica_chars: int | None = None) -> ParsedDialogue:
-    """Разбирает текст в список кусков, каждый — со своим голосом."""
+    """Разбирает текст в список кусков, каждый — со своим голосом.
+
+    Текст реплики собирается один раз, уже после разбора: `text_parts` хранит
+    части списком, поэтому склейка линейна по объёму текста.
+    """
     if not raw_text or not raw_text.strip():
         return ParsedDialogue()
 
@@ -310,12 +319,12 @@ def parse_dialogue(raw_text: str, max_replica_chars: int | None = None) -> Parse
             return
         # Текст до первого маркера (или без единого маркера) читает голос слота 1.
         segment = current or start(slot_key(config.DEFAULT_SLOT), {}, line_number)
-        if segment.text:
-            segment.text = f"{segment.text} {chunk}"
+        if segment.text_parts:
+            segment.text_parts.append(chunk)
             return
         chunk = _CHUNK_HEAD_RE.sub("", chunk)
         if chunk:
-            segment.text = chunk
+            segment.text_parts.append(chunk)
 
     for line_number, raw_line in enumerate(raw_text.splitlines(), start=1):
         line = raw_line.strip()
@@ -334,7 +343,15 @@ def parse_dialogue(raw_text: str, max_replica_chars: int | None = None) -> Parse
             position = label_end
         append(body[position:], line_number)
 
+    for replica in replicas:
+        replica.text = " ".join(replica.text_parts)
     result = [replica for replica in replicas if replica.text]
+
+    if len(result) > config.MAX_REPLICAS:
+        raise ValueError(
+            f"Реплик в диалоге слишком много: {len(result)} (максимум {config.MAX_REPLICAS})"
+            " — разбейте текст на части"
+        )
 
     # Имена одного персонажа, записанные по-разному («АРТЁМ» и «АРТЕМ»), — один
     # голос. Без этого правила диалог получал бы две карточки голоса на одного

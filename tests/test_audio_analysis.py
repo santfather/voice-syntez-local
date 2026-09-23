@@ -1,10 +1,12 @@
 """Проверка референса: полоса частот, перегрузка, высота тона и пол."""
 
+import subprocess
+
 import numpy as np
 import pytest
 import soundfile as sf
 
-from backend import audio_analysis
+from backend import audio_analysis, config
 from backend.engines.base import SAMPLE_RATE
 from conftest import sine
 
@@ -85,3 +87,21 @@ def test_analyze_reports_duration_of_plain_tone(tmp_path):
     report = audio_analysis.analyze(path)
     assert report.duration_sec == pytest.approx(1.5, abs=0.05)
     assert report.f0_hz == pytest.approx(180.0, abs=4.0)
+
+
+def test_load_mono_passes_timeout_to_ffmpeg(monkeypatch):
+    """Без `timeout=` битый вход держал ffmpeg, а с ним и воркер, вечно."""
+    seen: dict = {}
+
+    def fake_run(*args, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(audio_analysis.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError) as exc:
+        audio_analysis.load_mono(b"\x00\x01\x02")
+
+    assert seen["timeout"] == config.FFMPEG_TIMEOUT_SEC
+    # Ошибка объясняет причину: зависание молча заменено понятным отказом.
+    assert "ffmpeg" in str(exc.value)
+    assert "не уложился" in str(exc.value)

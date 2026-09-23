@@ -12,14 +12,20 @@
 Границы слова заданы явным классом символов (кириллица, латиница, цифры), а не
 `\b`: `\b` считает словом ещё и подчёркивание, а его поведение на стыке алфавитов
 зависит от Unicode-категорий. Явный класс — ровно то правило, которое обещает UI.
+
+Регулярки компилируются один раз на версию словаря (`get_compiled_dictionary`):
+словарь спрашивают на каждой реплике длинного диалога, а компиляция сотни
+шаблонов заметнее самого применения правил. Версия — число записей и хеш их
+содержимого: правка словаря даёт другую версию, и кеш пересобирается.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -64,6 +70,9 @@ class _CompiledRule:
     source: str
     target: str
     pattern: re.Pattern
+    # Выключенное правило не участвует в замене, но нужно предикату покрытия:
+    # оно остаётся памятью об отклонённом варианте (см. `coverage_predicate`).
+    enabled: bool = True
 
 
 def _coerce_rule(value: Any) -> PronunciationRule | None:
@@ -130,7 +139,74 @@ def compile_rule(rule: PronunciationRule, supports_accents: bool = True) -> _Com
     except re.error as exc:  # защита от будущих изменений в сборке шаблона
         logger.warning("Правило словаря пропущено (некорректный шаблон %r): %s", source, exc)
         return None
-    return _CompiledRule(source=source, target=target, pattern=pattern)
+    return _CompiledRule(source=source, target=target, pattern=pattern, enabled=rule.enabled)
+
+
+@dataclass(frozen=True)
+class CompiledDictionary:
+    """Правила словаря, готовые к применению, — одной версии словаря.
+
+    `rules` — включённые правила в порядке применения (длинный источник раньше
+    короткого); `cover` — те же плюс выключенные: проверка «слово уже покрыто»
+    смотрит и на отклонённые варианты, чтобы не предлагать их снова.
+    """
+
+    rules: tuple[_CompiledRule, ...]
+    cover: tuple[_CompiledRule, ...]
+
+
+# Кеш скомпилированного словаря: версия → правила. Держим только последнюю
+# версию (старая после правки словаря — мусор), поэтому при смене версии словарь
+# кеша очищается, а не растёт.
+_compiled_cache: dict[int, CompiledDictionary] = {}
+
+
+def _dictionary_version(entries: list) -> int:
+    """Версия словаря: число записей и хеш их содержимого.
+
+    Пересчитывается дешевле компиляции регулярок и не зависит от времени, поэтому
+    TTL и сверка таймстемпов не нужны: пока словарь не меняли, версия та же.
+    Считается по исходным записям, а не по скомпилированным правилам, — иначе
+    проверка версии стоила бы ровно столько же, сколько компиляция.
+    """
+    digest = hashlib.blake2b(digest_size=8)
+    for value in entries:
+        digest.update(repr(value).encode("utf-8", "replace"))
+        digest.update(b"\x00")
+    digest.update(f"#{len(entries)}".encode())
+    return int.from_bytes(digest.digest(), "big")
+
+
+def _compile_dictionary(entries: list) -> CompiledDictionary:
+    """Компилирует все записи сразу, включая выключенные."""
+    compiled: list[_CompiledRule] = []
+    for value in entries:
+        rule = _coerce_rule(value)
+        if rule is None:
+            logger.warning("Правило словаря пропущено (непонятный формат): %r", value)
+            continue
+        item = compile_rule(rule)
+        if item is not None:
+            compiled.append(item)
+    # Порядок — длинный источник раньше короткого; при равной длине порядок
+    # исходный: сортировка стабильна, и словарь не «переставляет» равные правила сам.
+    compiled.sort(key=lambda item: len(item.source), reverse=True)
+    return CompiledDictionary(
+        rules=tuple(item for item in compiled if item.enabled),
+        cover=tuple(compiled),
+    )
+
+
+def get_compiled_dictionary(entries: PronunciationEntries = None) -> CompiledDictionary:
+    """Скомпилированный словарь; при той же версии — из кеша, без перекомпиляции."""
+    values = list(_iter_entries(entries)) if entries else []
+    version = _dictionary_version(values)
+    cached = _compiled_cache.get(version)
+    if cached is None:
+        _compiled_cache.clear()
+        cached = _compile_dictionary(values)
+        _compiled_cache[version] = cached
+    return cached
 
 
 def compile_rules(
@@ -146,24 +222,14 @@ def compile_rules(
     повторно предлагать нельзя. Для самого применения правил выключенные
     пропускаются всегда.
 
-    Порядок — длинный источник раньше короткого; при равной длине порядок
-    исходный: сортировка стабильна, и словарь не «переставляет» равные правила сам.
+    `supports_accents=False` отдаёт копии правил без разметки ударений: движок без
+    поддержки «+» прочитал бы знак как отдельный символ.
     """
-    compiled: list[_CompiledRule] = []
-    if not entries:
-        return compiled
-    for value in _iter_entries(entries):
-        rule = _coerce_rule(value)
-        if rule is None:
-            logger.warning("Правило словаря пропущено (непонятный формат): %r", value)
-            continue
-        if not rule.enabled and not include_disabled:
-            continue
-        item = compile_rule(rule, supports_accents=supports_accents)
-        if item is not None:
-            compiled.append(item)
-    compiled.sort(key=lambda item: len(item.source), reverse=True)
-    return compiled
+    compiled = get_compiled_dictionary(entries)
+    rules = compiled.cover if include_disabled else compiled.rules
+    if supports_accents:
+        return list(rules)
+    return [replace(item, target=strip_stress(item.target)) for item in rules]
 
 
 def coverage_predicate(
@@ -175,10 +241,11 @@ def coverage_predicate(
     побеждать автоматику. С `include_disabled=True` годится и для фильтра
     предложений — выключенное правило остаётся памятью об отклонённом варианте.
     """
-    compiled = compile_rules(entries, include_disabled=include_disabled)
+    compiled = get_compiled_dictionary(entries)
+    rules = compiled.cover if include_disabled else compiled.rules
 
     def covered(word: str) -> bool:
-        return any(item.pattern.search(word) is not None for item in compiled)
+        return any(item.pattern.search(word) is not None for item in rules)
 
     return covered
 
@@ -195,20 +262,21 @@ def apply_pronunciation_report(
     if not text or not entries:
         return text, []
 
-    compiled = compile_rules(entries, supports_accents=supports_accents)
+    compiled = get_compiled_dictionary(entries)
 
     matches: list[dict] = []
-    for item in compiled:
+    for item in compiled.rules:
+        target = item.target if supports_accents else strip_stress(item.target)
         count = 0
 
-        def replace(_match: re.Match, target: str = item.target) -> str:
+        def replace(_match: re.Match, target: str = target) -> str:
             nonlocal count
             count += 1
             return target
 
         text = item.pattern.sub(replace, text)
         if count:
-            matches.append({"source": item.source, "target": item.target, "count": count})
+            matches.append({"source": item.source, "target": target, "count": count})
     return text, matches
 
 

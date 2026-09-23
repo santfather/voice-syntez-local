@@ -23,6 +23,7 @@ from backend.audio_pipeline import (
     _write_output,
     validate_audio_file,
 )
+from backend.db.connection import transaction
 from backend.db.store import get_projects_store
 from backend.engines import worker_protocol as proto
 
@@ -190,6 +191,7 @@ def test_startup_recovery_interrupts_stale_state(workspace):
         "analyses": 1,
         "partial_files": 1,
         "crashes": 1,
+        "jobs": 0,
     }
     project = store.get_project(project_id)
     assert project["status"] == config.PROJECT_STATUS_DRAFT
@@ -213,6 +215,52 @@ def test_startup_recovery_interrupts_stale_state(workspace):
     assert crashes[0]["project_id"] == project_id
 
 
+def _abandoned_job(job_id: str, status: str) -> None:
+    """Строка задачи, оставшаяся от прошлого запуска: в памяти её уже нет.
+
+    Пишется прямо в таблицу, минуя очередь: воспроизводится именно состояние
+    базы после краха, когда писать снимок уже некому.
+    """
+    with transaction() as connection:
+        connection.execute(
+            "INSERT INTO jobs (id, status, total_replicas, current_replica, created_at)"
+            " VALUES (?, ?, 3, 1, '2026-01-01T00:00:00+00:00')",
+            (job_id, status),
+        )
+
+
+def _job_rows() -> dict[str, dict]:
+    with transaction() as connection:
+        return {
+            row["id"]: dict(row) for row in connection.execute("SELECT * FROM jobs").fetchall()
+        }
+
+
+def test_startup_recovery_interrupts_orphaned_queue_jobs(workspace):
+    """Задача, застрявшая «в работе» с прошлого запуска, получает ошибку с причиной.
+
+    Очередь живёт в памяти, поэтому после рестарта задачу не продолжить — но её
+    строка остаётся, и без пометки задача выглядела бы идущей вечно.
+    """
+    _abandoned_job("job-queued", "queued")
+    _abandoned_job("job-processing", "processing")
+    _abandoned_job("job-done", "done")
+
+    report = recovery.recover_after_restart()
+
+    assert report.jobs == 2
+    assert report.to_dict()["jobs"] == 2
+    rows = _job_rows()
+    for job_id in ("job-queued", "job-processing"):
+        assert rows[job_id]["status"] == "error", f"{job_id}: задача осталась незавершённой"
+        assert rows[job_id]["error"] == config.RECOVERY_QUEUE_MESSAGE
+        assert rows[job_id]["error_type"] == proto.ERROR_INTERRUPTED
+        assert rows[job_id]["finished_at"], f"{job_id}: у прерванной задачи нет времени"
+    # Сделанное не переписывается: восстановление не имеет права портить результат.
+    assert rows["job-done"]["status"] == "done"
+    assert rows["job-done"]["error"] is None
+
+
 def test_recovery_is_idempotent(workspace):
     """Второй прогон на чистой базе ничего не восстанавливает."""
     _interrupted_project()
@@ -225,6 +273,7 @@ def test_recovery_is_idempotent(workspace):
         "analyses": 0,
         "partial_files": 0,
         "crashes": 0,
+        "jobs": 0,
     }
     assert second.empty is True
 

@@ -89,6 +89,38 @@ class TakesRepository:
         self._conn.execute("DELETE FROM takes WHERE id = ?", (take_id,))
         return str(row["audio_path"])
 
+    def prune(self, replica_id: int, limit: int) -> list[str]:
+        """Оставляет у реплики не больше `limit` вариантов, вытесняя самые старые.
+
+        Возвращает пути вытесненных файлов: строки удаляются здесь, а файлы —
+        вызывающим, потому что репозиторий о диске ничего не знает (см. store).
+
+        Активный (`selected_take_id`) вариант не вытесняется никогда: это текущее
+        звучание реплики, а не история, и его удаление сломало бы воспроизведение
+        при следующем же открытии проекта.
+        """
+        if limit <= 0:
+            return []
+        rows = self._conn.execute(
+            "SELECT id, audio_path FROM takes WHERE replica_id = ? ORDER BY id",
+            (replica_id,),
+        ).fetchall()
+        excess = len(rows) - limit
+        if excess <= 0:
+            return []
+        row = self._conn.execute(
+            "SELECT selected_take_id FROM replicas WHERE id = ?", (replica_id,)
+        ).fetchone()
+        selected = None if row is None else row["selected_take_id"]
+        victims = [
+            item
+            for item in rows
+            if selected is None or int(item["id"]) != int(selected)
+        ][:excess]
+        for item in victims:
+            self._conn.execute("DELETE FROM takes WHERE id = ?", (item["id"],))
+        return [str(item["audio_path"]) for item in victims]
+
     def paths(self, project_id: str) -> list[str]:
         """Пути файлов всех вариантов проекта: нужны при удалении проекта."""
         rows = self._conn.execute(

@@ -8,6 +8,7 @@ API работает только через этот класс: держать
 import logging
 import shutil
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -50,7 +51,23 @@ def _now_iso() -> str:
     """Метка времени анализа в том же формате, что у остальных записей базы."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+
 logger = logging.getLogger(__name__)
+
+
+def _remove_files(paths: Iterable[str]) -> None:
+    """Удаляет файлы вариантов, не падая на уже отсутствующих.
+
+    Ошибка удаления не прерывает операцию: файл мог быть удалён руками или
+    потерян при переносе каталога, и это не причина оставлять запись проекта
+    наполовину применённой. Каталог проекта подчищается отдельно (`rmtree`).
+    """
+    for raw in paths:
+        try:
+            Path(raw).unlink(missing_ok=True)
+        except OSError as exc:  # файл занят или нет прав — запись важнее
+            logger.warning("Не удалось удалить файл варианта %s: %s", raw, exc)
+
 
 # Значение не передано вовсе — в отличие от `None`, которое означает «вернуть
 # наследуемое»: у правки реплики это разные вещи, и различать их должен вызывающий.
@@ -189,20 +206,19 @@ class ProjectsStore:
         return self.get_project(project_id)  # type: ignore[return-value]
 
     def delete_project(self, project_id: str) -> bool:
-        """Удаляет проект и файлы его вариантов.
+        """Удаляет проект вместе с файлами его вариантов.
 
-        Файлы — до записи в базу: если удаление файла не удалось, проект лучше
-        оставить целым, чем получить записи, ссылающиеся в никуда.
+        Файлы — до записи в базу и в той же транзакции: `ON DELETE CASCADE`
+        чистит только строки, а если удалять файлы отдельным шагом после коммита,
+        падение между шагами снова оставит сирот на диске (F-S2).
         """
         with transaction() as connection:
-            takes_repo = TakesRepository(connection)
-            paths = takes_repo.paths(project_id)
+            paths = TakesRepository(connection).paths(project_id)
+            _remove_files(paths)
+            shutil.rmtree(self.project_dir(project_id), ignore_errors=True)
             deleted = ProjectsRepository(connection).delete(project_id)
         if not deleted:
             return False
-        for raw in paths:
-            Path(raw).unlink(missing_ok=True)
-        shutil.rmtree(self.project_dir(project_id), ignore_errors=True)
         logger.info("Проект %s удалён", project_id)
         return True
 
@@ -234,7 +250,7 @@ class ProjectsStore:
             assigned = {
                 item["key"]: item["voice_id"] for item in projects.speakers(project_id)
             }
-            ReplicasRepository(connection).replace(
+            orphan_paths = ReplicasRepository(connection).replace(
                 project_id,
                 [
                     {
@@ -247,6 +263,8 @@ class ProjectsStore:
                     for index, replica in enumerate(parsed.replicas)
                 ],
             )
+            # Файлы кусков исчезнувших реплик: каскад чистит только строки (F-S2).
+            _remove_files(orphan_paths)
             render_settings = dict(project["render_settings"])
             render_settings["chunk_strategy"] = strategy
             projects.update(project_id, render_settings=render_settings)
@@ -717,6 +735,7 @@ class ProjectsStore:
                     quality=take.get("quality"),
                 )
                 replicas.select_take(int(replica["id"]), int(saved["id"]))
+                self._prune_replica_takes(connection, int(replica["id"]))
                 ProjectsRepository(connection).update(project_id)
         except Exception:
             target.unlink(missing_ok=True)
@@ -762,18 +781,22 @@ class ProjectsStore:
                 raise KeyError(project_id)
             projects.replace_speakers(project_id, speakers)
             replicas_repo = ReplicasRepository(connection)
-            replicas_repo.replace(
-                project_id,
-                [
-                    {
-                        "index": int(item["index"]),
-                        "text": str(item.get("text") or ""),
-                        "speaker": str(item.get("speaker") or ""),
-                        "voice_id": str(item.get("voice_id") or ""),
-                        "overrides": item.get("overrides") or {},
-                    }
-                    for item in replicas
-                ],
+            # Импорт идёт в пустой проект, но если в нём уже что-то было, старые
+            # реплики уходят вместе с файлами кусков — иначе сироты на диске (F-S2).
+            _remove_files(
+                replicas_repo.replace(
+                    project_id,
+                    [
+                        {
+                            "index": int(item["index"]),
+                            "text": str(item.get("text") or ""),
+                            "speaker": str(item.get("speaker") or ""),
+                            "voice_id": str(item.get("voice_id") or ""),
+                            "overrides": item.get("overrides") or {},
+                        }
+                        for item in replicas
+                    ],
+                )
             )
             by_index = {
                 int(item["index"]): item for item in replicas_repo.list_for_project(project_id)
@@ -804,6 +827,7 @@ class ProjectsStore:
                     if take.get("selected") and not selected:
                         replicas_repo.select_take(replica_id, int(saved["id"]))
                         selected = True
+                self._prune_replica_takes(connection, replica_id)
                 # Статус восстанавливается только у реплики без активного take:
                 # выбор take'а сам ставит `rendered`, и переписывать его нечем.
                 if not selected:
@@ -848,6 +872,7 @@ class ProjectsStore:
                     quality=item.get("quality"),
                 )
                 replicas.select_take(int(replica["id"]), int(take["id"]))
+                self._prune_replica_takes(connection, int(replica["id"]))
             projects.update(
                 project_id,
                 status=config.PROJECT_STATUS_RENDERED,
@@ -884,6 +909,7 @@ class ProjectsStore:
                     quality=item.get("quality"),
                 )
                 replicas.select_take(int(replica["id"]), int(take["id"]))
+                self._prune_replica_takes(connection, int(replica["id"]))
 
     def set_project_status(
         self, project_id: str, status: str, job_id: str | None = None, error: str | None = None
@@ -947,6 +973,18 @@ class ProjectsStore:
     def project_dir(self, project_id: str) -> Path:
         """Каталог кусков проекта: удаляется вместе с проектом."""
         return config.PROJECTS_OUTPUT_DIR / project_id
+
+    def _prune_replica_takes(self, connection, replica_id: int) -> None:
+        """Держит у реплики не больше `MAX_TAKES_PER_REPLICA` вариантов (F-S1).
+
+        Каждый рендер добавляет реплике вариант, и без предела `output/projects/`
+        рос бы вместе с числом прогонов. Вытесняются самые старые, активный не
+        трогается; файл вытесненного удаляется в той же транзакции, что и строка,
+        — иначе сирота на диске (F-S2).
+        """
+        _remove_files(
+            TakesRepository(connection).prune(replica_id, config.MAX_TAKES_PER_REPLICA)
+        )
 
 
 _store = ProjectsStore()

@@ -43,7 +43,11 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаёт базу и схему, если их ещё нет. Идемпотентно."""
+    """Создаёт базу и схему, если их ещё нет. Идемпотентно.
+
+    Путь передаётся в миграции, чтобы перед обновлением схемы легла копия
+    (F-D1), а целостность файла проверялась до того, как в него что-то запишут.
+    """
     global _initialized_path
     path = db_path()
     with _init_lock:
@@ -51,7 +55,7 @@ def init_db() -> None:
             return
         connection = connect()
         try:
-            apply_migrations(connection)
+            apply_migrations(connection, path)
             connection.commit()
         finally:
             connection.close()

@@ -5,7 +5,7 @@
 целиком: создать проект → назначить два голоса → разобрать диалог со смешанными
 спикерами → отрендерить F5 + XTTS → Smart QA → перегенерировать реплику →
 вернуть старый take → перезапустить backend → открыть проект заново → выгрузить
-WAV и SRT → экспортировать проект → импортировать его → отрендерить снова.
+WAV, MP3 и SRT → экспортировать проект → импортировать его → отрендерить снова.
 
 Модели поднимает сам сервер: инструмент их не запускает и ничего не мокает.
 Поэтому в pytest он не входит (см. `pytest.ini`) и запускается вручную, когда
@@ -56,6 +56,7 @@ PLAN = (
     "перезапуск backend (вручную)",
     "повторное открытие проекта",
     "экспорт WAV",
+    "экспорт MP3",
     "экспорт SRT",
     "экспорт проекта (.ttsproject)",
     "импорт проекта",
@@ -405,28 +406,39 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
         _require_takes(reopened, "повторное открытие")
         report.add(PLAN[9], "PASS", f"реплик {len(reopened['replicas'])}, take'ы на месте")
 
-        # 10-12. Экспорт: WAV, SRT и архив проекта.
+        # 10-13. Экспорт: WAV, MP3, SRT и архив проекта.
         wav = api.download("GET", f"/api/projects/{project_id}/export/audio?format=wav")
         (workdir / "smoke.wav").write_bytes(wav)
         if len(wav) < 44:
             raise SmokeError(f"WAV подозрительно мал: {len(wav)} байт")
         report.add(PLAN[10], "PASS", f"{len(wav)} байт → {workdir / 'smoke.wav'}")
 
+        # MP3 идёт через ffmpeg (pydub), поэтому проверяется отдельно от WAV:
+        # у формата свой путь кодирования и свой риск «пустого» файла.
+        mp3 = api.download("GET", f"/api/projects/{project_id}/export/audio?format=mp3")
+        (workdir / "smoke.mp3").write_bytes(mp3)
+        if not _looks_like_mp3(mp3):
+            raise SmokeError(
+                f"MP3 не распознан: {len(mp3)} байт, начало {mp3[:4].hex()} — "
+                "проверьте, что ffmpeg доступен процессу backend"
+            )
+        report.add(PLAN[11], "PASS", f"{len(mp3)} байт → {workdir / 'smoke.mp3'}")
+
         srt = api.download("GET", f"/api/projects/{project_id}/export/subtitles?format=srt")
         (workdir / "smoke.srt").write_bytes(srt)
         text = srt.decode("utf-8", errors="replace")
         if "-->" not in text:
             raise SmokeError("в SRT нет таймстемпов '-->'")
-        report.add(PLAN[11], "PASS", f"таймстемпов {text.count('-->')}")
+        report.add(PLAN[12], "PASS", f"таймстемпов {text.count('-->')}")
 
         archive = api.download("POST", f"/api/projects/{project_id}/export")
         archive_path = workdir / "smoke.ttsproject"
         archive_path.write_bytes(archive)
         if not archive.startswith(b"PK"):
             raise SmokeError("архив проекта не похож на zip")
-        report.add(PLAN[12], "PASS", f"{len(archive)} байт → {archive_path}")
+        report.add(PLAN[13], "PASS", f"{len(archive)} байт → {archive_path}")
 
-        # 13. Импорт архива — новый проект, исходный не трогается.
+        # 14. Импорт архива — новый проект, исходный не трогается.
         imported = api.upload("/api/projects/import", "file", "smoke.ttsproject", archive)
         imported_id = imported["id"]
         # Импортированный проект приходит без подготовки — и это правильно: текст
@@ -435,12 +447,12 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
         prepare_project(api, imported_id)
         if imported_id == project_id:
             raise SmokeError("импорт должен создавать новый проект")
-        report.add(PLAN[13], "PASS", f"новый проект {imported_id}")
+        report.add(PLAN[14], "PASS", f"новый проект {imported_id}")
 
-        # 14. Повторный рендер уже импортированного проекта.
+        # 15. Повторный рендер уже импортированного проекта.
         imported = render_and_wait(api, imported_id, "off", args.timeout, "повторный рендер")
         _require_takes(imported, "повторный рендер")
-        report.add(PLAN[14], "PASS", f"{len(imported['replicas'])} реплик с take'ами")
+        report.add(PLAN[15], "PASS", f"{len(imported['replicas'])} реплик с take'ами")
     except SmokeError as exc:
         report.add("сценарий", "FAIL", str(exc))
     finally:
@@ -454,6 +466,17 @@ def run_scenario(api: Api, report: Report, args: argparse.Namespace) -> None:
                 if target:
                     status, _body = api.call("DELETE", f"/api/projects/{target}")
                     print(f"  Удалён проект {target}: HTTP {status}")
+
+
+def _looks_like_mp3(data: bytes) -> bool:
+    """MP3 опознаётся по тегу ID3v2 или по синхрослову кадра.
+
+    Расширению `.mp3` из ответа сервера верить нельзя: заголовок выставляет сам
+    backend, а проверять надо содержимое.
+    """
+    if data.startswith(b"ID3"):
+        return True
+    return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
 
 
 def _require_takes(project: dict, label: str) -> None:

@@ -6,17 +6,22 @@ import functools
 import json
 import logging
 import os
+import re
 import socket
+import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, Field, field_validator
 from starlette.background import BackgroundTask
@@ -48,12 +53,13 @@ from . import (
 from . import short_utterance as su
 from .accentizer import Accentizer
 from .audio_pipeline import QaOutcome, QaSettings, RenderSettings, SpeakerSettings
-from .db.connection import init_db
+from .db.connection import connect, init_db
 from .db.store import UNSET, get_projects_store
 from .dialogue_parser import Replica, parse_dialogue, split_into_chunks
 from .engines.base import (
     ENGINE_F5,
     ENGINE_INFOS,
+    STATE_FAILED,
     STATE_IDLE,
     EngineBusyError,
     EngineInfo,
@@ -91,15 +97,109 @@ from .text_normalization import PronunciationRule, normalize_stages
 from .text_normalization.pronunciation import compile_rule
 from .voices_store import ALLOWED_AUDIO_SUFFIXES, MAX_AUDIO_BYTES, Voice, get_store
 
+LOG_FORMAT = "%(asctime)s %(levelname)-7s [%(request_id)s] %(name)s: %(message)s"
+# Метка нашего файлового обработчика: по ней повторный старт в одном процессе
+# (тесты поднимают приложение не один раз) снимает прежний обработчик, а не копит
+# их — иначе старый писал бы в уже удалённый временный файл.
+FILE_HANDLER_MARK = "_tts_file_handler"
+
+# Request-id запроса, внутри которого пишется лог (F-A5). Именно переменная
+# контекста, а не аргумент функции: `logging` о запросе ничего не знает, а фильтр
+# ниже достаёт значение отсюда и подставляет в каждую строку — так строки лога
+# одного запроса сшиваются, включая записи сторонних библиотек.
+NO_REQUEST_ID = "-"
+_request_id_var: ContextVar[str] = ContextVar("request_id", default=NO_REQUEST_ID)
+
+
+class _RequestIdFilter(logging.Filter):
+    """Подставляет request-id в запись, у которой его ещё нет.
+
+    Фильтр навешивается на обработчики, а не на логгер: фильтры логгера не
+    применяются к записям, пришедшим от дочерних логгеров по наследованию, а
+    именно так пишет почти весь код.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = _request_id_var.get()
+        return True
+
+
+def _install_request_id_filter() -> None:
+    """Навешивает фильтр request-id на все текущие обработчики корневого логгера.
+
+    Обработчик консоли создаётся `basicConfig` при импорте, файловый — в
+    `_configure_file_logging`; без фильтра формат с `%(request_id)s` упал бы на
+    первой же записи через этот обработчик.
+    """
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(item, _RequestIdFilter) for item in handler.filters):
+            handler.addFilter(_RequestIdFilter())
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    format=LOG_FORMAT,
 )
+_install_request_id_filter()
 # torch сообщает о фолбэке MPS→CPU обычным Python-warning'ом (TORCH_WARN →
 # warnings.warn), а не через logging. Без перенаправления этот warning теряется,
 # и «тихий» CPU-фолбэк внутри куска остаётся незамеченным — а он даёт микро-артефакты.
 logging.captureWarnings(True)
 logger = logging.getLogger("tts.main")
+
+
+def _configure_file_logging() -> None:
+    """Подключает к корневому логгеру журнал с ротацией (F-F1).
+
+    До этого в файл всё попадало только перенаправлением вывода лаунчера: файл рос
+    без предела, а приложение про свой журнал ничего не знало. Здесь файл — такой же
+    обработчик, как вывод в консоль, только с ротацией (см. `LOG_MAX_BYTES`).
+    Прежний такой же обработчик снимается: настройка обязана быть идемпотентной.
+
+    Неудачное открытие файла синтез не останавливает — консольный вывод остаётся.
+    """
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if getattr(handler, FILE_HANDLER_MARK, False):
+            root.removeHandler(handler)
+            handler.close()
+    # Уровень задаётся здесь, а не только в `basicConfig`: та молча ничего не
+    # делает, если у корня уже есть обработчики (так бывает под тестовым
+    # раннером), и тогда INFO-строки в журнал не попадали бы вовсе.
+    root.setLevel(logging.INFO)
+    try:
+        config.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            config.LOG_PATH,
+            maxBytes=config.LOG_MAX_BYTES,
+            backupCount=config.LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("Журнал в файл не подключён: %s", exc)
+        return
+    setattr(handler, FILE_HANDLER_MARK, True)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(handler)
+    _install_request_id_filter()
+
+
+def _adopt_uvicorn_loggers() -> None:
+    """Ведёт логи uvicorn через корневой логгер (F-F1).
+
+    uvicorn ставит своим логгерам собственные обработчики и `propagate=False`,
+    поэтому его старт, отказы и трейсбеки обработчиков не доходили бы до журнала.
+    Обработчики снимаются, сообщения поднимаются к корню — туда, где файл с
+    ротацией и общий формат.
+    """
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(name)
+        for handler in list(uvicorn_logger.handlers):
+            uvicorn_logger.removeHandler(handler)
+            handler.close()
+        uvicorn_logger.propagate = True
+
 
 MIME_BY_FORMAT = {"wav": "audio/wav", "mp3": "audio/mpeg"}
 
@@ -460,8 +560,41 @@ def _acquire_instance_lock():
     return handle
 
 
+def _seed_builtin_voices() -> int:
+    """Заводит карточки встроенных голосов для движков, чьи файлы уже на диске.
+
+    Карточке такого голоса запись не нужна вовсе (см. `EngineInfo.builtin_voices`):
+    движок говорит своим встроенным голосом, и пользователю нечего ни записывать,
+    ни подкладывать файлом. Заведение идемпотентно, поэтому зовётся и при старте,
+    и перед выдачей списка голосов — тогда карточки появляются и сразу после
+    скачивания модели, без отдельного шага.
+
+    Ошибка здесь не отменяет список голосов: карточки — удобство, а не условие
+    того, чтобы уже записанные голоса были видны.
+    """
+    available = [
+        engine_id for engine_id in ENGINE_INFOS if model_manager.engine_available(engine_id)
+    ]
+    try:
+        return get_store().ensure_builtin_voices(available)
+    except Exception as exc:  # noqa: BLE001 — список голосов важнее удобных карточек
+        logger.error("Не удалось завести встроенные голоса движков: %s", exc)
+        return 0
+
+
 def _warmup() -> None:
     """Тяжёлая инициализация в фоне, чтобы сервер был доступен сразу."""
+    # До заведения карточек и до проверки голосов: если `voices.json` пропал,
+    # список сначала восстанавливается по файлам (F-F2). Иначе встроенные голоса
+    # завелись бы поверх пустого списка, а записи пользователя остались бы
+    # невидимыми до ручного вмешательства.
+    try:
+        get_store().recover_from_files()
+    except Exception as exc:  # noqa: BLE001 — восстановление не повод не стартовать
+        logger.error("Не удалось восстановить voices.json по файлам: %s", exc)
+    # До проверки голосов: карточки встроенных голосов заводятся сами, и
+    # `inspect_existing` не должен считать их голосами с потерянным референсом.
+    _seed_builtin_voices()
     try:
         get_store().inspect_existing()  # F0 и метки для голосов, загруженных раньше
     except Exception as exc:
@@ -478,6 +611,10 @@ def _warmup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Первым делом журнал: всё, что происходит дальше (замок, миграции, прогрев),
+    # должно попадать и в файл, а не только в консоль (F-F1).
+    _configure_file_logging()
+    _adopt_uvicorn_loggers()
     app.state.instance_lock = _acquire_instance_lock()
     _assert_port_free()
     torch = config.configure_torch()
@@ -525,10 +662,242 @@ config.FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=config.FRONTEND_DIR), name="static")
 
 
+# --- middleware: пределы тела и request-id -------------------------------------
+# Импорт архива — единственный путь, тело которого заведомо больше «текстового»
+# предела: он переносит файл проекта, а не форму.
+_IMPORT_PATH = "/api/projects/import"
+# Ключ request-id в ASGI-scope: обработчик необработанных исключений лежит снаружи
+# middleware и на момент его вызова переменная контекста уже сброшена, а scope —
+# тот же самый словарь, поэтому id достаётся из него.
+REQUEST_ID_SCOPE_KEY = "tts.request_id"
+# Запас на multipart-обвязку (boundary, заголовки частей), чтобы предел на файл
+# архива не отсекал корректный запрос на последних килобайтах.
+_MULTIPART_OVERHEAD = 64 * 1024
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _header(headers: list, name: bytes) -> str | None:
+    """Значение заголовка ASGI-запроса по имени, или None."""
+    for key, value in headers:
+        if key.lower() == name:
+            return value.decode("latin-1")
+    return None
+
+
+def _fits(declared_length: str, limit: int) -> bool:
+    """Укладывается ли объявленная длина тела в предел. Нечисловой — нет."""
+    try:
+        return int(declared_length) <= limit
+    except ValueError:
+        return False
+
+
+def _request_body_limit(path: str, content_type: str) -> int:
+    """Предел тела запроса для этого пути и типа содержимого (SECURITY Major).
+
+    Читается из `config` на каждом запросе, а не на старте: предел — настройка
+    развёртывания, и её правка не должна требовать перезапуска. Тело без файла —
+    это текст диалога, ему мегабайтов хватает; загрузка файла идёт multipart и
+    ограничена выше, по самому крупному из загружаемых типов.
+    """
+    if path == _IMPORT_PATH:
+        return config.MAX_ARCHIVE_BYTES + _MULTIPART_OVERHEAD
+    if content_type.startswith("multipart/form-data"):
+        return config.MAX_UPLOAD_BYTES
+    return config.MAX_JSON_BODY_BYTES
+
+
+async def _send_too_large(send, limit: int) -> None:
+    """413 с понятным текстом — без участия FastAPI: обработчик ещё не вызван."""
+    body = json.dumps(
+        {"detail": f"Тело запроса больше {limit // (1024 * 1024)} МБ"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+class _RequestBodyTooLarge(Exception):
+    """Тело запроса превысило предел: обработчик не должен его читать."""
+
+
+class RequestSizeLimitMiddleware:
+    """Не даёт прочитать в память тело запроса больше предела.
+
+    Проверяются оба входа: объявленный `Content-Length` и фактически прочитанные
+    байты. Одного заголовка мало — клиент вправе его не прислать (chunked), и
+    тогда единственный способ не дать обработчику прочитать гигабайты — считать
+    их по мере поступления. Отказ отдаётся до вызова обработчика, поэтому ни
+    память, ни диск на большое тело не тратятся.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        content_type = _header(scope["headers"], b"content-type") or ""
+        limit = _request_body_limit(scope["path"], content_type)
+        declared = _header(scope["headers"], b"content-length")
+        if declared is not None and not _fits(declared, limit):
+            await _send_too_large(send, limit)
+            return
+        read = 0
+        response_started = False
+
+        async def counting_receive():
+            nonlocal read
+            message = await receive()
+            if message["type"] == "http.request":
+                read += len(message.get("body", b""))
+                if read > limit:
+                    raise _RequestBodyTooLarge
+            return message
+
+        async def tracking_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, tracking_send)
+        except _RequestBodyTooLarge:
+            # Ответ уже начат — второй отправлять нельзя, поэтому отдаём ошибку
+            # наверх: такую ситуацию обработчик создаёт только сам.
+            if response_started:
+                raise
+            await _send_too_large(send, limit)
+
+
+class RequestIdMiddleware:
+    """Проставляет request-id запросу, ответу и логам внутри него (F-A5).
+
+    Заголовок `X-Request-ID` от клиента принимается, но только если похож на
+    идентификатор: произвольную строку в ответ отдавать нельзя (перевод строки в
+    заголовке — это подмена ответа), поэтому формат проверяется.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        incoming = _header(scope["headers"], b"x-request-id") or ""
+        request_id = incoming if _REQUEST_ID_RE.fullmatch(incoming) else uuid.uuid4().hex[:12]
+        scope[REQUEST_ID_SCOPE_KEY] = request_id
+        token = _request_id_var.set(request_id)
+
+        async def send_with_id(message):
+            if message["type"] == "http.response.start":
+                message["headers"] = list(message["headers"]) + [
+                    (b"x-request-id", request_id.encode("ascii"))
+                ]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            _request_id_var.reset(token)
+
+
+# Порядок важен: `add_middleware` кладёт обработчик поверх прежних, поэтому
+# request-id ставится последним — иначе отказ по размеру тела уходил бы без
+# заголовка, по которому его находят в журнале.
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(RequestIdMiddleware)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Непредвиденное исключение: трейсбек в журнал, клиенту — общий текст (F-A4).
+
+    Раньше причина уходила в тело ответа (`str(exc)`): в ней бывают пути и
+    внутренние детали, а разобрать по ней инцидент всё равно нельзя — стека в
+    журнале не было. Теперь наоборот: стек пишется целиком, а в ответе остаётся
+    общий текст и request-id, по которому эта запись находится в журнале.
+    """
+    request_id = request.scope.get(REQUEST_ID_SCOPE_KEY) or _request_id_var.get()
+    logger.exception(
+        "Необработанная ошибка в %s %s (request_id=%s)",
+        request.method,
+        request.url.path,
+        request_id,
+    )
+    return JSONResponse(
+        status_code=500,
+        headers={"x-request-id": request_id},
+        content={
+            "detail": "Внутренняя ошибка сервера. Подробности — в журнале приложения.",
+            "request_id": request_id,
+        },
+    )
+
+
 # --- роуты --------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(config.FRONTEND_DIR / "index.html")
+
+
+def _db_health() -> str:
+    """`PRAGMA quick_check` в своём соединении: `ok` или текст повреждения.
+
+    `quick_check` читает таблицы и индексы, но не сверяет каждый индекс с
+    данными, поэтому остаётся дешёвым даже на большой базе — а повреждение файла
+    всё равно видно. Ошибка открытия тоже говорит о нездоровье: `ok` вернуть
+    нечем, но и падать проверке нельзя.
+    """
+    connection = connect()
+    try:
+        row = connection.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error as exc:
+        return f"ошибка: {exc}"
+    finally:
+        connection.close()
+    return str(row[0]) if row else "ok"
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> JSONResponse:
+    """Живость сервиса: цела ли база и нет ли упавших движков (F-A5).
+
+    Отдельно от `/api/status`: тот собирает подробную картину для интерфейса, а
+    здесь — быстрый ответ «можно работать или нет». Готовность движка, который
+    ещё не поднимался, не проверяется: модели грузятся лениво, и «idle» — это
+    норма, а не проблема. Нездоровым считается только состояние `failed`.
+
+    200 — можно работать, 503 — база повреждена или движок упал: внешнему
+    сторожу нужна разница между «жив» и «жив, но деградировал».
+    """
+    database = await asyncio.to_thread(_db_health)
+    engines = {
+        engine_id: engine.state for engine_id, engine in created_engines().items()
+    }
+    failed = [engine_id for engine_id, state in engines.items() if state == STATE_FAILED]
+    healthy = database == "ok" and not failed
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "database": database,
+            "engines": engines,
+            "request_id": _request_id_var.get(),
+        },
+    )
 
 
 @app.get("/api/llm/status")
@@ -723,11 +1092,13 @@ async def unload_engine(engine_id: str) -> dict:
     except EngineBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
-        # Освободить не удалось, но сервис жив: отдаём причину текстом и 500.
+        # Освободить не удалось, но сервис жив: причина уходит в журнал, а клиенту —
+        # общий текст (F-A4): в `str(exc)` бывают пути и внутренние детали.
         logger.exception("Не удалось выгрузить движок %s", engine_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Не удалось выгрузить движок «{info.label}»: {exc}",
+            detail=f"Не удалось выгрузить движок «{info.label}». "
+            "Подробности — в журнале приложения.",
         ) from exc
     return {
         "engine": engine_id,
@@ -752,11 +1123,13 @@ async def load_engine(engine_id: str) -> dict:
         engine = get_engine(engine_id)
         await asyncio.to_thread(engine.load)
     except Exception as exc:
-        # Не поднялся: причина уходит в текст ответа, состояние движка уже `failed`.
+        # Не поднялся: причина уходит в журнал, состояние движка уже `failed`,
+        # а клиенту — общий текст (F-A4), без внутренних деталей исключения.
         logger.exception("Не удалось поднять движок %s", engine_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Движок «{info.label}» не поднялся: {exc}",
+            detail=f"Движок «{info.label}» не поднялся. "
+            "Подробности — в журнале приложения.",
         ) from exc
     return {
         "engine": engine_id,
@@ -1014,6 +1387,10 @@ async def parse(payload: ParseRequest) -> dict:
 
 @app.get("/api/voices")
 async def list_voices() -> dict:
+    # Встроенные голоса движков заводятся до выдачи списка: они не требуют записи
+    # и должны быть видны сразу — в том числе если модель скачали только что
+    # (см. `_seed_builtin_voices`).
+    await asyncio.to_thread(_seed_builtin_voices)
     return {"voices": [voice.to_dict() for voice in get_store().list()]}
 
 
@@ -1025,15 +1402,18 @@ async def create_voice(
     verify_ref_text: bool = Form(True),
     engine: str = Form(""),
     denoise: bool = Form(False),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
 ) -> dict:
+    # Файл необязателен: движку со встроенными голосами запись не нужна вовсе
+    # (см. `EngineInfo.builtin_voices`). Кому она нужна — скажет `create`: он же
+    # выбирает движок по полу, когда он не задан.
     # Размер проверяем до чтения в память: иначе 50-МБ файл целиком окажется в RSS.
-    if file.size is not None and file.size > MAX_AUDIO_BYTES:
+    if file is not None and file.size is not None and file.size > MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=400,
             detail=f"Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ",
         )
-    audio_bytes = await file.read()
+    audio_bytes = await file.read() if file is not None else b""
     try:
         # Проверка F0 и демо-файлов — не в event loop: декодирование аудио с ffmpeg
         voice = await asyncio.to_thread(
@@ -1041,7 +1421,7 @@ async def create_voice(
             name=name,
             gender=gender,
             ref_text=ref_text,
-            audio_filename=file.filename or "",
+            audio_filename=(file.filename or "") if file is not None else "",
             audio_bytes=audio_bytes,
             verify_ref_text=verify_ref_text,
             engine=engine,
@@ -1205,7 +1585,10 @@ async def add_voice_reference(
     if not data:
         raise HTTPException(status_code=400, detail="Пустой файл записи")
     try:
-        profile = get_store().add_reference(
+        # `add_reference` пишет файл, декодирует запись и сверяет её с текстом —
+        # в loop это секунды, в течение которых сервер не отвечает.
+        profile = await asyncio.to_thread(
+            get_store().add_reference,
             voice_id,
             emotion=emotion,
             audio_filename=file.filename or "reference.wav",
@@ -1879,7 +2262,9 @@ async def render_text(payload: RenderTextRequest) -> dict:
     if not chunks:
         raise HTTPException(status_code=400, detail="Текст пуст — нечего озвучивать")
 
-    llm_report = _analyze_text_chunks(text, chunks)
+    # Анализ уходит в LLM и синхронный: в loop он держал бы весь сервер, включая
+    # `/api/status`, на всё время ответа модели.
+    llm_report = await asyncio.to_thread(_analyze_text_chunks, text, chunks)
     if llm_report.get("required_block"):
         raise HTTPException(status_code=409, detail=llm_report["required_block"])
 

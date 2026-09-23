@@ -19,6 +19,7 @@ from conftest import STUB_ENGINE_ID, StubEngine
 from test_api import _client, _generate, _wait
 
 from backend import config, engine_lifecycle, main, resource_guard
+from backend.engines import base as engines_base
 from backend.engines import registry
 from backend.engines.base import (
     ENGINE_XTTS,
@@ -533,3 +534,269 @@ def test_unload_is_quick_and_frees_engine_time():
     engine.unload()
     assert time.monotonic() - before < 5.0
     assert engine.last_used_at is not None
+
+
+# --- Фаза 3 (§11.2/§11.3/§11.4): уборка памяти, потолок Metal, принудительная выгрузка
+def _fake_torch(mps, *, threads: list[int] | None = None) -> types.SimpleNamespace:
+    """Заглушка torch: MPS-счётчики и `set_num_threads` без импорта настоящего."""
+    def set_num_threads(value: int) -> None:
+        if threads is not None:
+            threads.append(value)
+
+    return types.SimpleNamespace(
+        backends=types.SimpleNamespace(mps=mps),
+        mps=mps,
+        set_num_threads=set_num_threads,
+    )
+
+
+def test_mps_driver_allocated_mb_is_none_without_torch_or_mps(monkeypatch):
+    """Метрика берётся только у живого MPS: без torch и без Metal — `None`.
+
+    torch метрикой не импортируется намеренно (читается `sys.modules`): иначе
+    каждая реплика платила бы секунды за первый импорт ради одной строки лога.
+    """
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert engines_base.mps_driver_allocated_mb() is None
+
+    class _NoMps:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_NoMps))
+    assert engines_base.mps_driver_allocated_mb() is None
+
+
+def test_mps_driver_allocated_mb_reads_counter_and_swallows_errors(monkeypatch):
+    class _FakeMps:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def driver_allocated_memory() -> int:
+            return 512 * 1024 * 1024
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_FakeMps))
+    assert engines_base.mps_driver_allocated_mb() == 512.0
+
+    class _BrokenMps:
+        @staticmethod
+        def is_available() -> bool:
+            raise RuntimeError("Metal недоступен")
+
+    # Сбой чтения — не повод ронять синтез: метрика нужна логу, а не решению.
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_BrokenMps))
+    assert engines_base.mps_driver_allocated_mb() is None
+
+
+def test_synthesize_cleans_mps_cache_in_tail_and_logs_delta(monkeypatch, caplog):
+    """Хвост синтеза чистит кеш Metal и пишет дельту — по ней виден рост памяти (§11.2)."""
+    releases: list[dict] = []
+    monkeypatch.setattr(
+        engines_base, "release_torch_memory", lambda **kwargs: releases.append(kwargs)
+    )
+    readings = iter([100.0, 130.0])
+    monkeypatch.setattr(engines_base, "mps_driver_allocated_mb", lambda: next(readings))
+
+    engine = StubEngine()
+    with caplog.at_level(logging.INFO, logger="backend.engines.base"):
+        engine.synthesize("Привет", "/tmp/ref.wav", "Привет")
+
+    assert len(releases) == 1, "уборка обязана идти на каждом синтезе, а не только при выгрузке"
+    # Уборка именно лёгкая: полная коллекция на каждой реплике дороже самого синтеза.
+    assert releases == [{"light": True}]
+    assert engine.active_synthesizes == 0
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "tts.mps.synthesis" in record.getMessage()
+    )
+    assert "driver_before_mb=100.0" in line
+    assert "driver_after_mb=130.0" in line
+    assert "delta_mb=+30.0" in line
+
+
+def test_light_release_collects_only_young_generation(monkeypatch):
+    """Хвост реплики собирает молодое поколение, выгрузка — все: цена разная (§3.1).
+
+    Полная коллекция на разросшемся процессе стоит ~0.2 с (замер на этом проекте),
+    и на каждой реплике она съедала бы время синтеза; модель при этом остаётся в
+    памяти, а ссылки на неё живут в старших поколениях, то есть полный сбор в
+    хвосте не нужен.
+    """
+    generations: list[int] = []
+
+    def fake_collect(generation: int = 2) -> int:
+        generations.append(generation)
+        return 0
+
+    class _NoMps:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    monkeypatch.setattr(engines_base.gc, "collect", fake_collect)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_NoMps))
+
+    engines_base.release_torch_memory(light=True)
+    engines_base.release_torch_memory()  # выгрузка: ссылки на модель уже обнулены
+
+    assert generations == [0, 2]
+
+
+def test_synthesize_releases_memory_even_when_engine_fails(monkeypatch):
+    """Упавший инференс тоже убирает за собой и снимает счётчик занятости."""
+
+    class _FailingEngine(StubEngine):
+        def _synthesize(self, *_args, **_kwargs):
+            raise RuntimeError("инференс упал")
+
+    releases: list[str] = []
+    monkeypatch.setattr(
+        engines_base, "release_torch_memory", lambda **kwargs: releases.append("clean")
+    )
+    engine = _FailingEngine()
+
+    with pytest.raises(RuntimeError, match="инференс упал"):
+        engine.synthesize("Привет", "/tmp/ref.wav", "Привет")
+
+    assert releases == ["clean"]
+    assert engine.active_synthesizes == 0
+
+
+def test_limit_mps_memory_sets_fraction_and_logs_recommended(monkeypatch, caplog):
+    """Доля памяти выставляется явно, и в лог уходит потолок, от которого она взята."""
+    calls: list[float] = []
+
+    class _FakeMps:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def set_per_process_memory_fraction(value: float) -> None:
+            calls.append(value)
+
+        @staticmethod
+        def recommended_max_memory() -> int:
+            return 16 * 1024**3
+
+    monkeypatch.setattr(config, "MPS_MEMORY_FRACTION", 0.75)
+    with caplog.at_level(logging.INFO, logger="tts.config"):
+        config.limit_mps_memory(_fake_torch(_FakeMps))
+
+    assert calls == [0.75]
+    assert "рекомендовано 16.0 ГБ" in caplog.text
+    assert "разрешено 12.0 ГБ" in caplog.text
+
+
+def test_limit_mps_memory_is_optional_and_never_breaks_start(monkeypatch, caplog):
+    """Нет MPS, доля `0` или сбой вызова — сервис поднимается, а не падает (§11.3)."""
+    caplog.set_level(logging.INFO, logger="tts.config")
+
+    class _NoMps:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    config.limit_mps_memory(_fake_torch(_NoMps))  # без MPS ограничивать нечего
+
+    calls: list[float] = []
+
+    class _FailingMps:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def set_per_process_memory_fraction(value: float) -> None:
+            calls.append(value)
+
+        @staticmethod
+        def recommended_max_memory() -> int:
+            raise RuntimeError("MPS не отвечает")
+
+    # Доля нулевая — потолок не выставляем вовсе: `0.0` в этом API означает «всё»,
+    # а не «ничего», и молчаливое «разрешить всю unified memory» тут недопустимо.
+    monkeypatch.setattr(config, "MPS_MEMORY_FRACTION", 0.0)
+    config.limit_mps_memory(_fake_torch(_FailingMps))
+    assert calls == []
+    assert "не задан" in caplog.text
+
+    # Сбой на самом вызове — предупреждение, а не отказ старта.
+    monkeypatch.setattr(config, "MPS_MEMORY_FRACTION", 0.5)
+    config.limit_mps_memory(_fake_torch(_FailingMps))
+    assert calls == [0.5]
+    assert "Не удалось ограничить память MPS" in caplog.text
+
+
+def test_configure_torch_sets_threads_from_config(monkeypatch):
+    """Потоки CPU ограничиваются значением проекта — на CPU-фолбэке иначе все ядра (§11.7)."""
+    threads: list[int] = []
+    calls: list[float] = []
+
+    class _FakeMps:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def set_per_process_memory_fraction(value: float) -> None:
+            calls.append(value)
+
+        @staticmethod
+        def recommended_max_memory() -> int:
+            return 8 * 1024**3
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(_FakeMps, threads=threads))
+    monkeypatch.setattr(config, "_torch", None)
+    monkeypatch.setattr(config, "TORCH_NUM_THREADS", 3)
+
+    assert config.configure_torch().set_num_threads is not None
+    assert threads == [3]
+    # Тот же вызов задаёт и потолок Metal: оба ограничения — часть одной настройки.
+    assert calls == [config.MPS_MEMORY_FRACTION]
+
+
+def test_free_warm_engines_unloads_only_idle_neighbours(monkeypatch):
+    """Принудительная уборка трогает тёплые свободные движки и не трогает остальные."""
+    warm = StubEngine()
+    warm.load()
+    busy = StubEngine()
+    busy.load()
+    busy._active_synthesizes = 1
+    cold = StubEngine()  # не поднят: освобождать нечего
+    requester = StubEngine()
+    requester.load()
+    monkeypatch.setattr(
+        engine_lifecycle,
+        "created_engines",
+        lambda: {"warm": warm, "busy": busy, "cold": cold, "requester": requester},
+    )
+
+    assert engine_lifecycle.free_warm_engines(exclude="requester") == ["warm"]
+    assert not warm.is_loaded
+    assert busy.is_loaded  # занятый движок не выгружаем: `unload()` отказал бы
+    assert requester.is_loaded  # ради него память и освобождали
+    assert not cold.is_loaded
+
+
+def test_free_warm_engines_survives_failed_unload(monkeypatch):
+    """Отказ выгрузки одного движка не мешает убрать остальные и не поднимается наверх."""
+    broken = StubEngine()
+    broken.load()
+    healthy = StubEngine()
+    healthy.load()
+
+    def refuse() -> None:
+        raise EngineBusyError("движок занят")
+
+    monkeypatch.setattr(broken, "unload", refuse)
+    monkeypatch.setattr(
+        engine_lifecycle, "created_engines", lambda: {"broken": broken, "healthy": healthy}
+    )
+
+    assert engine_lifecycle.free_warm_engines() == ["healthy"]
+    assert healthy.is_loaded is False

@@ -8,6 +8,7 @@
 """
 
 import gzip
+import unicodedata
 
 import pytest
 
@@ -148,6 +149,26 @@ def test_normalize_stages_exposes_yo_between_normalization_and_dictionary():
     assert stages.yo == "ёжик и эс-кью-эл"
     assert stages.result == "ёжик и эскьюэль"
     assert stages.matches == [{"source": "SQL", "target": "эскьюэль", "count": 1}]
+
+
+# --- юникод-форма входа -------------------------------------------------------
+def test_decomposed_yo_is_composed_on_pipeline_input():
+    """«е» + U+0308 из чужого файла приводится к «ё» ещё до шага «ё»."""
+    decomposed = unicodedata.normalize("NFD", "ёжик и ещё")
+    assert decomposed != "ёжик и ещё"  # вход действительно декомпозирован
+    assert normalize(decomposed) == "ёжик и ещё"
+
+
+def test_restoration_of_composed_e_works_on_decomposed_input():
+    """Реплика с декомпозированной «ё» проходит пайплайн так же, как композированная.
+
+    Здесь в одной строке и «Ёлка» с диакритикой из чужого источника, и «ежик» из
+    однозначного словаря: NFC обязан сложить первую, не помешав второй.
+    """
+    text = "Ёлка, ежик и чёрный кот"
+    decomposed = unicodedata.normalize("NFD", text)
+    assert len(decomposed) > len(text)
+    assert normalize(decomposed) == normalize(text) == "Ёлка, ёжик и чёрный кот"
 
 
 # --- fallback при отсутствии/поломке данных -----------------------------------

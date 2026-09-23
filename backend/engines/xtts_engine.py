@@ -188,12 +188,17 @@ class XTTSEngine(SynthesisEngine):
             try:
                 return self._infer(text, ref_audio_path, speed, params)
             except Exception as exc:
-                if self._device != "mps":
+                # На CPU переводим только сбой, в тексте которого назван MPS: любое
+                # другое исключение — обычная ошибка синтеза, и перезагрузкой её не
+                # лечат, только прячут за замедлением в 10–30×.
+                if self._device != "mps" or "mps" not in str(exc).lower():
                     raise
-                # Часть операций на MPS может падать — перезапускаем модель на CPU.
                 logger.warning("MPS упал в XTTS (%s). Перезагружаю %s на CPU.", exc, self.info.label)
                 with self._load_lock:
                     self._model = None
+                    # Старый Metal-пул держится, пока модель жива: без сброса
+                    # перезагрузка на CPU удваивала бы расход unified memory.
+                    release_torch_memory()
                     self._load_model("cpu")
                 return self._infer(text, ref_audio_path, speed, params)
 

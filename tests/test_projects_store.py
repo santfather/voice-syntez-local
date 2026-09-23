@@ -226,3 +226,72 @@ def test_schema_created_automatically(workspace):
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
     assert {"projects", "speakers", "replicas", "takes", "schema_version"} <= tables
+
+
+def test_take_limit_evicts_oldest_with_its_file(workspace, monkeypatch):
+    """F-S1: число take'ов на реплику ограничено, самый старый уходит с файлом."""
+    monkeypatch.setattr(config, "MAX_TAKES_PER_REPLICA", 2)
+    store = ProjectsStore()
+    project = store.create_project("Лимит", source_text=DIALOGUE)
+    store.parse_project(project["id"])
+
+    files = []
+    for seq in range(3):
+        path = workspace / f"render{seq}.wav"
+        path.write_bytes(b"RIFF" + bytes([seq]))
+        files.append(path)
+        store.save_render_takes(
+            project["id"],
+            f"job{seq}",
+            [{"index": 0, "audio_path": str(path), "duration_sec": 1.0}],
+        )
+
+    replica = store.get_project(project["id"])["replicas"][0]
+    assert len(replica["takes"]) == 2
+    # Вытеснен самый старый, и его файл исчез вместе со строкой.
+    assert not files[0].exists()
+    assert files[1].exists() and files[2].exists()
+    # Активный вариант — последний: его вытеснять нельзя, это текущее звучание.
+    assert replica["selected_take_id"] == replica["takes"][-1]["id"]
+
+
+def test_reparse_removes_files_of_dropped_replicas(workspace):
+    """F-S2: каскадное удаление реплики чистит и файл на диске, не только строку."""
+    store = ProjectsStore()
+    project = store.create_project("Разбор", source_text=DIALOGUE)
+    source = workspace / "source.wav"
+    source.write_bytes(b"RIFF")
+    store.parse_project(project["id"])
+    store.save_replica_take(
+        project["id"], 0, {"audio_path": str(source), "duration_sec": 1.0}
+    )
+    copied = list(store.project_dir(project["id"]).glob("*.wav"))
+    assert len(copied) == 1 and copied[0].exists()
+
+    # Новый разбор меняет текст первой реплики: её старая строка уходит каскадом,
+    # а вместе с ней должен исчезнуть и файл единственного варианта.
+    store.update_project(
+        project["id"],
+        source_text="ИВАН: Совсем другой текст.\nМАРГО: Вторая реплика.",
+    )
+    store.parse_project(project["id"])
+    assert not copied[0].exists()
+    assert _rows("takes") == 0
+
+
+def test_delete_project_removes_take_files(workspace):
+    """F-S2: удаление проекта уносит файлы вариантов, а не оставляет сирот."""
+    store = ProjectsStore()
+    project = store.create_project("Удаляемый", source_text=DIALOGUE)
+    store.parse_project(project["id"])
+    source = workspace / "source.wav"
+    source.write_bytes(b"RIFF")
+    store.save_replica_take(
+        project["id"], 0, {"audio_path": str(source), "duration_sec": 1.0}
+    )
+    copied = list(store.project_dir(project["id"]).glob("*.wav"))
+    assert copied and copied[0].exists()
+
+    assert store.delete_project(project["id"]) is True
+    assert not copied[0].exists()
+    assert not store.project_dir(project["id"]).exists()

@@ -1,7 +1,14 @@
 """Разбор диалога: спикеры, слоты, параметры в маркерах и нарезка длинных реплик."""
 
+import pytest
+
 from backend import config
-from backend.dialogue_parser import parse_dialogue, slot_key, split_into_chunks, voice_label
+from backend.dialogue_parser import (
+    parse_dialogue,
+    slot_key,
+    split_into_chunks,
+    voice_label,
+)
 
 
 def test_named_speakers_split():
@@ -80,3 +87,17 @@ def test_short_paragraphs_are_merged_into_one_chunk():
 def test_empty_input_gives_empty_list():
     assert parse_dialogue("   \n  ").replicas == []
     assert split_into_chunks("") == []
+
+
+def test_replica_lines_are_joined_with_single_spaces():
+    """Строки одной реплики склеиваются в текст: части копятся, а не строки."""
+    parsed = parse_dialogue("Просто текст\nиз трёх строк\nбез единого спикера.")
+    assert len(parsed.replicas) == 1
+    assert parsed.replicas[0].text == "Просто текст из трёх строк без единого спикера."
+
+
+def test_too_many_replicas_are_rejected(monkeypatch):
+    """Гигантский диалог отклоняется с понятной причиной, а не уходит в очередь."""
+    monkeypatch.setattr(config, "MAX_REPLICAS", 3)
+    with pytest.raises(ValueError, match="Реплик в диалоге слишком много: 4"):
+        parse_dialogue("ИВАН: раз\nМАРГО: два\nИВАН: три\nМАРГО: четыре")
