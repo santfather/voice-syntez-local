@@ -83,7 +83,7 @@ emotion_effective = override → detected → NEUTRAL
    (`enabled_for_auto`) — только тогда его берёт автоматическая маршрутизация. По умолчанию
    флаг **выключен**: свежая запись не становится автоматикой сама по себе.
 
-Таблица «фраза → ключ профиля» (`RECORD_PHRASE_PROFILES`, `frontend/app.js`):
+Таблица «фраза → ключ профиля» (`RECORD_PHRASE_PROFILES`, `frontend/voice-record.js`):
 
 | Подпись фразы | Ключ профиля |
 |---|---|
