@@ -5,10 +5,10 @@ import subprocess
 import numpy as np
 import pytest
 import soundfile as sf
+from conftest import sine
 
 from backend import audio_analysis, config
 from backend.engines.base import SAMPLE_RATE
-from conftest import sine
 
 
 def _narrow_band_signal(seconds: float = 3.0) -> np.ndarray:

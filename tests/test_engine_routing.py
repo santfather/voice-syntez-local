@@ -19,7 +19,12 @@ import soundfile as sf
 from conftest import STUB_ENGINE_ID, StubEngine, sine
 
 from backend import audio_pipeline, model_manager, reference_resolver
-from backend.audio_pipeline import RenderSettings, SpeakerSettings, _engine_for, _reference_for
+from backend.audio_pipeline import (
+    RenderSettings,
+    SpeakerSettings,
+    _engine_for,
+    _reference_for,
+)
 from backend.dialogue_parser import Replica
 from backend.engines.base import (
     ENGINE_F5,

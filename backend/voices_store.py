@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import threading
 import uuid
@@ -141,6 +142,26 @@ def _as_bool(value: object, *, default: bool) -> bool:
     return bool(value)
 
 
+def _safe_audio_file(audio_file: object) -> str:
+    """Имя файла референса внутри `voices/`; `""` — имя выводит за каталог.
+
+    `audio_file` лежит в `voices.json`, который правят руками и переносят между
+    машинами (архив голосов). Значение вида `../../…`, абсолютный путь или
+    симлинк наружу иначе превратилось бы в путь к чужому файлу, а `unlink` при
+    удалении голоса или профиля удалил бы его. Такое имя читается как «референса
+    нет», а сам голос остаётся в списке.
+    """
+    name = str(audio_file or "")
+    if not name:
+        return ""
+    root = config.VOICES_DIR.resolve()
+    candidate = (root / name).resolve()
+    if root in candidate.parents:
+        return name
+    logger.warning("Имя файла референса %r выводит за каталог voices/ — игнорирую", name)
+    return ""
+
+
 @dataclass
 class ReferenceProfile:
     """Один референс голоса: нейтральный или интонационный профиль (UPDATE 2 §8,
@@ -236,6 +257,12 @@ class ReferenceProfile:
             return None
         known = {key: value for key, value in raw.items() if key in _PROFILE_FIELDS}
         if not known.get("id") or not known.get("audio_file"):
+            return None
+        # Имя файла не должно выводить за `voices/`: профиль без безопасного
+        # имени отбрасывается целиком — синтезировать по нему всё равно нечем.
+        known["audio_file"] = _safe_audio_file(known["audio_file"])
+        if not known["audio_file"]:
+            logger.warning("Профиль %s: файл референса недоступен — пропускаю", known["id"])
             return None
         # `profile_key` — имя поля из §18, `emotion` — то, под которым профиль
         # лежит в `voices.json` и в API. Принимаем оба: запись нового формата не
@@ -419,6 +446,9 @@ class VoicesStore:
                     voice.engine, voice.engine_params if isinstance(voice.engine_params, dict) else {}
                 )
                 voice.preset = _normalize_preset(voice.preset)
+                # Имя основного референса — тоже из `voices.json`: не позволяем
+                # ему вывести за `voices/` (см. `_safe_audio_file`).
+                voice.audio_file = _safe_audio_file(voice.audio_file)
                 # Профили: битая запись пропускается поштучно, остальные остаются.
                 voice.profiles = [
                     profile
@@ -449,10 +479,14 @@ class VoicesStore:
         marker = sorted({*(self._read_seeded() if seeded is None else seeded)})
         if marker:
             data["builtin_seeded"] = marker
-        config.VOICES_JSON.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        # Атомарная запись: временный файл рядом, затем `os.replace`. Прямая
+        # `write_text` при обрыве (перезагрузка, полный диск) оставила бы
+        # обрезанный JSON, `_read` вернул бы пустой список, и следующая запись
+        # затёрла бы все голоса насовсем. `os.replace` в пределах каталога
+        # атомарен, поэтому читатель видит либо прежний файл, либо новый.
+        tmp = config.VOICES_JSON.with_name(config.VOICES_JSON.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, config.VOICES_JSON)
 
     def _resolve_ref_text(self, audio_path: Path, ref_text: str, verify: bool) -> tuple[str, str | None]:
         """Готовит дословную расшифровку референса и сверяет её с введённой вручную.

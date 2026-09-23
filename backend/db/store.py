@@ -217,6 +217,9 @@ class ProjectsStore:
             paths = TakesRepository(connection).paths(project_id)
             _remove_files(paths)
             shutil.rmtree(self.project_dir(project_id), ignore_errors=True)
+            # Разборы LLM удаляются явно: внешнего ключа на `projects` у таблицы нет
+            # (ключом бывает синтетическое `text-<хеш>`), и каскад их не задевает.
+            LlmAnalysesRepository(connection).delete_for_project(project_id)
             deleted = ProjectsRepository(connection).delete(project_id)
         if not deleted:
             return False
@@ -266,6 +269,15 @@ class ProjectsStore:
             )
             # Файлы кусков исчезнувших реплик: каскад чистит только строки (F-S2).
             _remove_files(orphan_paths)
+            # Разборы реплик, которых нет в новом тексте, уходят вместе с ними:
+            # своей связи с проектом у таблицы нет, и каскад их не задевает.
+            analyses = LlmAnalysesRepository(connection)
+            removed_indexes = sorted(
+                {int(row["replica_index"]) for row in analyses.list_for_project(project_id)}
+                - set(range(len(parsed.replicas)))
+            )
+            if removed_indexes:
+                analyses.delete_for_replicas(project_id, removed_indexes)
             render_settings = dict(project["render_settings"])
             render_settings["chunk_strategy"] = strategy
             projects.update(project_id, render_settings=render_settings)

@@ -162,3 +162,52 @@ def test_integrity_check_accepts_healthy_database(tmp_path):
         assert migrations.check_integrity(connection) is None
     finally:
         connection.close()
+
+
+def test_failed_migration_rolls_back_schema_and_version(tmp_path, monkeypatch):
+    """Падение посреди миграции не оставляет схему изменённой при старой версии.
+
+    Иначе повторный прогон падал бы, а починить это из интерфейса нельзя: схема и
+    запись версии обязаны применяться одной транзакцией.
+    """
+    path = tmp_path / "voice_syntez.db"
+    connection = sqlite3.connect(path)
+    try:
+        apply_migrations(connection, None)  # схема последней версии
+        last = MIGRATIONS[-1][0]
+        broken = """
+CREATE TABLE probe (id INTEGER);
+INSERT INTO нет_такой_таблицы (id) VALUES (1);
+"""
+        monkeypatch.setattr(migrations, "MIGRATIONS", (*MIGRATIONS, (last + 1, broken)))
+
+        with pytest.raises(sqlite3.OperationalError):
+            apply_migrations(connection)
+
+        # Откат полный: ни таблицы первого оператора, ни новой версии.
+        assert migrations.schema_version(connection) == last
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'probe'"
+        ).fetchone() is None
+    finally:
+        connection.close()
+
+
+def test_alter_for_existing_column_is_skipped(tmp_path):
+    """Повторный прогон миграции с уже добавленными колонками не падает.
+
+    Так выглядит база после обрыва между изменением схемы и записью версии:
+    `ADD COLUMN` для существующей колонки пропускается (иначе — `duplicate column
+    name`, и сервис не стартует).
+    """
+    path = tmp_path / "voice_syntez.db"
+    _old_database(path, version=7)
+    connection = sqlite3.connect(path)
+    try:
+        # Колонки миграции 8 добавлены, а версия осталась 7.
+        connection.executescript(dict(MIGRATIONS)[8])
+        connection.commit()
+
+        assert apply_migrations(connection, path) == MIGRATIONS[-1][0]
+    finally:
+        connection.close()

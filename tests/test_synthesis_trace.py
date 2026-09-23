@@ -14,13 +14,12 @@ import json
 import numpy as np
 import pytest
 import soundfile as sf
+from conftest import sine
 
 from backend import audio_pipeline, synthesis_trace
 from backend.audio_pipeline import RenderSettings, SpeakerSettings
 from backend.dialogue_parser import Replica
 from backend.engines.base import SAMPLE_RATE
-
-from conftest import sine
 
 TEXT = "Красивая."
 

@@ -790,6 +790,63 @@ def test_analysis_pass_stops_on_hard_stop_memory():
     assert client.unloaded == ["qwen3:8b"], "модель обязана быть выгружена при остановке"
 
 
+def test_analysis_pass_stops_when_reserve_is_exhausted_without_hard_stop():
+    """Исчерпанный резерв останавливает проход, даже если HARD STOP не достигнут.
+
+    `available_gb < reserve_min_gb` даёт уровень CRITICAL, а не HARD STOP, но
+    политика уже говорит «прерывать идущую работу» (`must_abort_running`). Проверка
+    только по уровню HARD STOP этот случай пропускала, и анализ продолжался на
+    машине, где свободной памяти меньше жёсткого минимума.
+    """
+    from backend.llm import integration as integration_module
+    from backend.llm import memory_policy as memory
+    from backend.llm import scheduler as scheduler_module
+    from backend.llm.analyzer import LinguisticAnalyzer
+    from backend.llm.fake_client import FakeOllamaClient
+    from backend.llm.ollama_client import OllamaModel
+
+    client = FakeOllamaClient(
+        models=[OllamaModel(tag="qwen3:8b", digest="d1", size_bytes=5 * 1024**3)],
+        responder=lambda case: json.dumps(
+            {
+                "schema_version": s.SCHEMA_VERSION,
+                "replica_id": case["replica_id"],
+                "items": [],
+                "utterance": {"class": "NORMAL"},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    green = {"system_percent": 50.0, "available_gb": 12.0, "pressure": "green"}
+    # Занято 60 % (ниже CRITICAL), но свободно 2 GB — меньше жёсткого резерва 3.5 GB.
+    low_reserve = {"system_percent": 60.0, "available_gb": 2.0, "pressure": "green"}
+    samples = [dict(green), dict(green), dict(low_reserve)]
+    state = {"index": 0}
+
+    def sensor() -> dict:
+        index = min(state["index"], len(samples) - 1)
+        state["index"] += 1
+        return samples[index]
+
+    analyzer = LinguisticAnalyzer(settings=llm.AnalyzerSettings(enabled=True), client=client)
+    runner = integration_module.ProjectLlmAnalyzer(
+        analyzer=analyzer,
+        scheduler=scheduler_module.HeavyScheduler(gate=memory.HeavyGate(), sensor=sensor),
+        lookup=lambda index, key: None,
+        save=lambda index, analysis: None,
+    )
+    outcome = runner.run(
+        project_id="p1",
+        replicas=[{"index": 0, "text": "Да."}, {"index": 1, "text": "Нет."}, {"index": 2, "text": "Ок."}],
+    )
+
+    assert outcome.status == llm.STATUS_FAILED
+    assert memory.LEVEL_CRITICAL in outcome.error
+    assert "резерва" in outcome.error
+    assert outcome.calls == 1, "при исчерпанном резерве модель больше не спрашивают"
+    assert client.unloaded == ["qwen3:8b"], "модель обязана быть выгружена при остановке"
+
+
 def test_failed_replica_is_stored_and_visible(llm_env, voices, stub, monkeypatch):
     """Неудачный разбор реплики сохраняется и виден с причиной, а не исчезает.
 
@@ -1196,6 +1253,35 @@ def test_window_prompt_version_invalidates_scene_cache(llm_env, voices, stub, mo
 
     result = asyncio.run(scenario())
     assert result["second"] > result["first"], "новый prompt — новый разбор, кеш не подходит"
+
+
+def test_inference_params_change_invalidates_analysis_cache(llm_env, voices, stub, monkeypatch):
+    """Смена параметров запроса инвалидирует разбор: он получен при других (§46).
+
+    Текст, модель, prompt и словарь те же, но ответ модели зависел ещё и от
+    `temperature`. Прежний разбор отдан быть не должен — иначе пользователь увидел
+    бы результат, сделанный не при тех настройках, что стоят сейчас.
+    """
+    from dataclasses import replace
+
+    client = llm_env()
+
+    async def scenario() -> dict:
+        async with _client(monkeypatch) as api:
+            project = await _project_with_voices(api)
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            first = len(client.calls)
+            analyzer = llm.get_analyzer()
+            llm._analyzer = llm.LinguisticAnalyzer(
+                settings=replace(analyzer.settings, temperature=0.7),
+                client=analyzer.client,
+                window_prompt=analyzer.window_prompt,
+            )
+            await api.post(f"/api/projects/{project['id']}/analyze", json={})
+            return {"first": first, "second": len(client.calls)}
+
+    result = asyncio.run(scenario())
+    assert result["second"] > result["first"], "другие параметры — другой разбор, кеш не подходит"
 
 
 def test_speaker_change_invalidates_scene_cache():

@@ -132,7 +132,7 @@ class Accentizer:
                 self._last_error = None
                 logger.info("RUAccent загружен (%s)", config.OMOGRAPH_MODEL_SIZE)
                 return True
-            except Exception as exc:  # сеть/модели могут быть недоступны
+            except Exception as exc:  # noqa: BLE001 — сеть/модели могут быть недоступны
                 self._state = STATE_FAILED
                 self._last_error = str(exc)
                 self._retry_after = time.monotonic() + _RETRY_COOLDOWN_SEC
@@ -168,7 +168,7 @@ class Accentizer:
                 if manual:
                     return self._accent_between_manual(text)
                 return self._accent.process_all(text)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — синтез без ударений лучше отказа
             self._state = STATE_FAILED
             self._last_error = str(exc)
             logger.warning("Не удалось расставить ударения (%s). Синтез без них.", exc)

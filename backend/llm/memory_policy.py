@@ -405,22 +405,30 @@ class HeavyGate:
         with self._lock:
             if self._current is not None:
                 return f"уже выполняется {self._current.kind} ({self._current.owner or 'без имени'})"
-        if self._external_busy is not None:
-            try:
-                return str(self._external_busy() or "")
-            except Exception as exc:  # noqa: BLE001 — проверка не повод падать
-                return f"не удалось проверить внешнюю занятость: {exc}"
-        return ""
+        return self._external_reason()
+
+    def _external_reason(self) -> str:
+        """Занятость, о которой знает только внешний потребитель (чужой процесс)."""
+        if self._external_busy is None:
+            return ""
+        try:
+            return str(self._external_busy() or "")
+        except Exception as exc:  # noqa: BLE001 — проверка не повод падать
+            return f"не удалось проверить внешнюю занятость: {exc}"
 
     def try_acquire(self, kind: str, owner: str = "") -> GateTicket:
         if kind not in HEAVY_KINDS:
             raise ValueError(f"неизвестный вид тяжёлой задачи: {kind}")
-        reason = self.busy()
-        if reason:
-            raise HeavyResourceBusy(reason)
         with self._lock:
+            # Обе проверки — под тем же локом, что и захват. Иначе между «слот
+            # свободен» и «слот занят мной» вклинивается второй претендент, и один
+            # из двоих получает `HeavyResourceBusy` уже после того, как решил, что
+            # можно начинать (у очереди это ожидание слота, см. `_run_heavy`).
             if self._current is not None:
                 raise HeavyResourceBusy(f"уже выполняется {self._current.kind}")
+            reason = self._external_reason()
+            if reason:
+                raise HeavyResourceBusy(reason)
             self._current = GateTicket(kind=kind, owner=owner)
             return self._current
 

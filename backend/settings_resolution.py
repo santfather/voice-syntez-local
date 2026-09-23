@@ -107,7 +107,7 @@ def clamp_value(engine_id: str, field: str, value: Any) -> Any:
         except (TypeError, ValueError):
             return config.DEFAULT_NFE_STEP if field == "nfe_step" else low
         number = min(max(number, low), high)
-        return int(round(number)) if field in INT_FIELDS else round(number, 4)
+        return round(number) if field in INT_FIELDS else round(number, 4)
     for param in engine_info(engine_id).params:
         if param.name == field:
             return param.clamp(value)

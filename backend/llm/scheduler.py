@@ -55,6 +55,11 @@ class ScheduleDecision:
     memory_reason: str = ""
     holder: str = ""
     model_size_gb: float | None = None
+    # Прерывать ли **уже идущую** работу, а не только запрещать новую. Поле
+    # повторяет решение `memory_policy` (HARD STOP или исчерпанный резерв), чтобы
+    # вызывающий слой не выводил это условие сам — иначе первый же пропущенный
+    # случай (резерв под порогом, но не HARD STOP) продолжил бы проход.
+    must_abort_running: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -65,6 +70,7 @@ class ScheduleDecision:
             "memory_reason": self.memory_reason,
             "holder": self.holder,
             "model_size_gb": self.model_size_gb,
+            "must_abort_running": self.must_abort_running,
         }
 
 
@@ -109,6 +115,7 @@ class HeavyScheduler:
                 memory_reason=decision.reason,
                 holder=holder,
                 model_size_gb=model_size_gb,
+                must_abort_running=decision.must_abort_running,
             )
         if kind == memory.HEAVY_LLM:
             allowed = decision.allow_llm_start
@@ -124,6 +131,7 @@ class HeavyScheduler:
             memory_reason=decision.reason,
             holder=holder,
             model_size_gb=model_size_gb,
+            must_abort_running=decision.must_abort_running,
         )
 
     def busy_reason(self) -> str:

@@ -918,6 +918,16 @@ class ModelManager:
             )
         self.guard_delete(spec)
         path = validate_model_path(spec)
+        # F5 живёт файлами прямо в корне `models/` (см. паспорт), а не в своём
+        # подкаталоге. `rmtree` такого пути снёс бы веса всех остальных моделей,
+        # поэтому корень каталога моделей удалять нельзя ни при какой настройке.
+        if Path(path).resolve() == Path(config.MODELS_DIR).resolve():
+            names = ", ".join(Path(name).name for name in spec.required_files)
+            raise ModelPathError(
+                f"Модель «{spec.label}» лежит прямо в каталоге моделей "
+                f"({config.MODELS_DIR}) рядом с остальными, поэтому удаление стёрло бы "
+                f"и их. Удалите её файлы вручную: {names}."
+            )
         forget_dir_size(path)
         freed = dir_size(path, follow_symlinks=True)
         if path.exists():

@@ -13,6 +13,7 @@ source_text_hash  — изменился текст реплики
 context_hash      — изменились соседи, по которым модель читала контекст
 dictionary_hash   — изменился словарь, влияющий на реплику
 model_digest      — та же модель пересобрана или выбрана другая
+inference_hash    — изменились параметры запроса (num_ctx, temperature, seed)
 prompt_version    — изменился prompt (условия задачи)
 schema_version    — изменился контракт ответа
 ```
@@ -93,6 +94,10 @@ class AnalysisKey:
     context_hash: str
     dictionary_hash: str
     model_digest: str
+    # Параметры запроса влияют на ответ так же, как текст и модель: без этого поля
+    # смена `temperature`/`num_ctx`/`seed` оставляла бы прежний разбор в кеше
+    # действительным (см. `analyzer.inference_hash`).
+    inference_hash: str
     prompt_version: str
     schema_version: str
 
@@ -102,6 +107,7 @@ class AnalysisKey:
             "context_hash": self.context_hash,
             "dictionary_hash": self.dictionary_hash,
             "model_digest": self.model_digest,
+            "inference_hash": self.inference_hash,
             "prompt_version": self.prompt_version,
             "schema_version": self.schema_version,
         }
@@ -206,6 +212,7 @@ def key_for(analysis: ReplicaAnalysis) -> AnalysisKey:
         context_hash=analysis.context_hash,
         dictionary_hash=analysis.dictionary_hash,
         model_digest=analysis.model_digest,
+        inference_hash=analysis.inference_hash,
         prompt_version=analysis.prompt_version,
         schema_version=analysis.schema_version,
     )
@@ -219,19 +226,33 @@ def analysis_from_dict(payload: dict[str, Any]) -> ReplicaAnalysis:
     """
     items: list[s.Annotation] = []
     for raw in payload.get("items") or []:
-        if isinstance(raw, dict):
+        if not isinstance(raw, dict):
+            continue
+        # Приведение типов в `Annotation.from_dict` не защищено: запись с мусором
+        # (`"span_start": "abc"`) бросила бы `ValueError`/`TypeError` и уронила
+        # чтение разбора целиком. Негодная аннотация отбрасывается — остальные
+        # остаются, и проект открывается.
+        try:
             items.append(s.Annotation.from_dict(raw))
+        except (TypeError, ValueError):
+            logger.warning("Сохранённая аннотация с неподходящими типами полей отброшена: %r", raw)
     utterance_raw = payload.get("utterance") or {}
+    try:
+        utterance = s.UtteranceHint.from_dict(utterance_raw if isinstance(utterance_raw, dict) else {})
+    except (TypeError, ValueError):
+        logger.warning("Сохранённая подсказка о реплике отброшена: %r", utterance_raw)
+        utterance = s.UtteranceHint()
     return ReplicaAnalysis(
         replica_id=int(payload.get("replica_id") or 0),
         status=str(payload.get("status") or "READY"),
         items=tuple(items),
         dropped=tuple(payload.get("dropped") or ()),
-        utterance=s.UtteranceHint.from_dict(utterance_raw if isinstance(utterance_raw, dict) else {}),
+        utterance=utterance,
         model_tag=str(payload.get("model_tag") or ""),
         model_digest=str(payload.get("model_digest") or ""),
         prompt_version=str(payload.get("prompt_version") or ""),
         schema_version=str(payload.get("schema_version") or s.SCHEMA_VERSION),
+        inference_hash=str(payload.get("inference_hash") or ""),
         source_hash=str(payload.get("source_hash") or ""),
         context_hash=str(payload.get("context_hash") or ""),
         dictionary_hash=str(payload.get("dictionary_hash") or ""),

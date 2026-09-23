@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import numpy as np
@@ -77,14 +78,26 @@ class FakeWorkerEngine(SynthesisEngine):
 
     @staticmethod
     def _crash() -> None:
-        """Падает нативно — один раз, если задан маркер разового сбоя."""
+        """Падает нативно — один раз, если задан маркер разового сбоя.
+
+        Перед падением в stderr уходит метка `FAKE-WORKER-CRASH`: родитель читает
+        stderr воркера и пишет его в общий лог (supervisor `_start_drains`), поэтому
+        тестовый SIGABRT в `~/Library/Logs/DiagnosticReports/` опознаётся по одной
+        строке, а не сопоставлением `procLaunch`, `coalitionName` и mtime
+        `.pytest_cache/`. Заглушка падает тем же путём, что и настоящий нативный
+        крах, и без метки её отчёт неотличим от продуктового.
+        """
         once = os.environ.get(CRASH_ONCE_ENV, "")
-        if not once:
-            os.abort()
-        if os.path.exists(once):
+        if once and os.path.exists(once):
             return
-        with open(once, "w", encoding="utf-8") as handle:
-            handle.write("crashed\n")
+        print(
+            f"FAKE-WORKER-CRASH pid={os.getpid()} marker={once or '-'}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if once:
+            with open(once, "w", encoding="utf-8") as handle:
+                handle.write("crashed\n")
         os.abort()
 
     def _synthesize(self, text, ref_audio_path, ref_text, speed, params):

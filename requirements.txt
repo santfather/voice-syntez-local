@@ -2,9 +2,11 @@
 # torch, torchaudio и f5-tts связаны между собой: менять их только вместе и осознанно.
 
 fastapi==0.141.1
+pydantic==2.13.5       # модели запросов (backend/main.py); раньше приходил транзитивно через fastapi
+starlette==1.6.0       # BackgroundTask при отдаче файлов (backend/main.py); раньше — транзитивно
 uvicorn[standard]==0.53.0
 python-multipart==0.0.32
-torch==2.14.0
+torch==2.11.0           # один минорный ряд с torchaudio: 2.14 у torchaudio не существует (F-C1)
 torchaudio==2.11.0
 f5-tts==1.1.22
 coqui-tts==0.27.5      # движок XTTS v2 (Фаза 5). Требует шима isin_mps_friendly — см. engines/xtts_engine.py
@@ -21,3 +23,4 @@ numpy==2.4.6
 psutil==7.2.2          # watchdog по RSS/CPU в resource_guard.py
 huggingface_hub==1.31.0
 pytest==8.4.2          # юнит-тесты (tests/): запускаются без моделей, на движке-заглушке
+httpx==0.28.1          # TestClient тестов (tests/); раньше приходил транзитивно через starlette

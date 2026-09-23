@@ -27,7 +27,9 @@ from backend.audio_pipeline import (
 )
 from backend.db.connection import transaction
 from backend.dialogue_parser import Replica
+from backend.engines import worker_protocol as proto
 from backend.job_queue import (
+    ABORT_WATCHDOG,
     PRIORITY_BACKGROUND,
     PRIORITY_PREVIEW,
     PRIORITY_RENDER,
@@ -37,6 +39,7 @@ from backend.job_queue import (
     JobPayload,
     JobQueue,
     JobStatus,
+    ProjectTakeTask,
     QueueOverloadedError,
 )
 from backend.llm import memory_policy as llm_memory
@@ -1058,6 +1061,55 @@ def test_watchdog_interrupt_is_an_error_not_a_cancellation(monkeypatch, stub, fa
     _run(scenario)
 
 
+def test_project_take_watchdog_does_not_leave_job_stuck_processing(
+    monkeypatch, fake_store
+):
+    """Прерывание watchdog'ом в пересинтезе реплики проекта завершает задачу ошибкой.
+
+    Иначе `status` навсегда остаётся `processing`: `is_busy()` всегда истинно, и
+    выгрузка движка и полный сброс отвечают 409 до перезапуска сервера.
+    """
+
+    async def scenario():
+        async with _queue() as queue:
+            job = Job(
+                id="take1",
+                total_replicas=1,
+                output_format="wav",
+                message="Реплика 1: синтез",
+            )
+            job.abort_kind = ABORT_WATCHDOG
+            job.abort_reason = "превышен лимит памяти"
+            queue._jobs[job.id] = job
+            # Проектного хранилища здесь нет: проверяется исход задачи, а не запись
+            # статуса реплики в базу.
+            monkeypatch.setattr(queue, "_set_replica_status", lambda *args, **kwargs: None)
+
+            async def abort(*args, **kwargs):
+                raise audio_pipeline.JobCancelledError("прервано")
+
+            monkeypatch.setattr(audio_pipeline, "synthesize_replica", abort)
+
+            task = ProjectTakeTask(
+                job_id=job.id,
+                project_id="p1",
+                index=0,
+                replica=Replica(voice="voice1", text="Текст", line_number=1),
+                speakers={"voice1": SpeakerSettings(voice_id="voice1")},
+                settings=RenderSettings(output_format="wav"),
+            )
+            await queue._project_take(task)
+
+            assert job.status is JobStatus.ERROR
+            assert job.error == "превышен лимит памяти"
+            assert job.error_type == proto.ERROR_WATCHDOG
+            assert job.regenerating is None
+            assert job.finished_at is not None
+            assert queue.is_busy() is False
+
+    _run(scenario)
+
+
 def test_job_waiting_for_heavy_slot_is_cancelled_without_starting_engine(
     monkeypatch, stub, fake_store
 ):
@@ -1091,6 +1143,51 @@ def test_job_waiting_for_heavy_slot_is_cancelled_without_starting_engine(
             following = queue.submit(_single("После отмены"))
             assert await _wait_until(lambda: following.status is JobStatus.DONE), following.error
             assert gate.calls == ["После отмены"]
+
+    _run(scenario)
+
+
+def test_heavy_slot_race_between_wait_and_acquire_keeps_worker_alive(
+    monkeypatch, stub, fake_store
+):
+    """Гонка за тяжёлый слот — ожидание, а не падение воркера.
+
+    Проверка «слот свободен» отвечает `True`, а захват следом получает
+    `HeavyResourceBusy`: слот занял второй потребитель. Необработанное исключение
+    убило бы воркер, и очередь встала бы до перезапуска сервера — поэтому очередь
+    обязана пережить гонку, дождаться освобождения и выполнить задачу.
+    """
+    engine, gate = _gated_engine()
+
+    async def scenario():
+        _use_engine(monkeypatch, engine)
+        async with _queue() as queue:
+            occupant = llm_memory.get_gate().try_acquire(
+                llm_memory.HEAVY_TTS, owner="чужой рендер"
+            )
+            original = queue._wait_for_heavy_slot
+            checks = {"n": 0}
+
+            async def racing_wait(job_id: str) -> bool:
+                checks["n"] += 1
+                if checks["n"] == 1:
+                    # Первая проверка видит слот свободным — его занимает второй
+                    # потребитель сразу после ответа.
+                    return True
+                # Дальше очередь ждёт по-настоящему, а «чужой» отпускает слот.
+                llm_memory.get_gate().release(occupant)
+                return await original(job_id)
+
+            monkeypatch.setattr(queue, "_wait_for_heavy_slot", racing_wait)
+
+            job = queue.submit(_single("Под гонкой"))
+            assert await _wait_until(lambda: job.status is JobStatus.DONE), job.error
+            assert gate.calls == ["Под гонкой"]
+            assert llm_memory.get_gate().busy() == "", "слот освобождён"
+
+            # Воркер жив: следующая задача обрабатывается им же.
+            following = queue.submit(_single("После гонки"))
+            assert await _wait_until(lambda: following.status is JobStatus.DONE), following.error
 
     _run(scenario)
 

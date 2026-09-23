@@ -2,9 +2,9 @@
 
 Проверяется то, ради чего кеш вообще заведён и чем он опасен: одинаковый вход не
 должен гоняться через модель дважды, но ни одно изменение входа — текст, контекст,
-словарь, digest модели, версия prompt'а или схемы — не должно оставлять старый разбор
-«действительным». Ошибка здесь тихая: пользователь увидит предложение, сделанное по
-другому тексту, и не поймёт, почему оно не подходит.
+словарь, digest модели, параметры запроса, версия prompt'а или схемы — не должно
+оставлять старый разбор «действительным». Ошибка здесь тихая: пользователь увидит
+предложение, сделанное по другому тексту, и не поймёт, почему оно не подходит.
 
 Модель не поднимается: разборы строятся как объекты, а база — временная (фикстура
 `workspace` из conftest уводит `DB_PATH` в tmp_path).
@@ -22,8 +22,8 @@ from backend.db.migrations import MIGRATIONS, apply_migrations
 from backend.db.repositories.llm_analyses import LlmAnalysesRepository
 from backend.db.store import get_projects_store
 from backend.llm import analysis_cache as cache
-from backend.llm import versioning
 from backend.llm import schemas as s
+from backend.llm import versioning
 from backend.llm.analyzer import (
     STATUS_NEEDS_REVIEW,
     STATUS_READY,
@@ -53,6 +53,7 @@ def _analysis(**overrides) -> ReplicaAnalysis:
         "model_digest": "digest-primary",
         "prompt_version": versioning.PROMPT_VERSION,
         "schema_version": s.SCHEMA_VERSION,
+        "inference_hash": "параметры-по-умолчанию",
         "source_hash": cache.text_hash(TEXT),
         "context_hash": cache.context_hash({"target_text": TEXT}),
         "dictionary_hash": cache.dictionary_hash([]),
@@ -133,6 +134,24 @@ def test_model_and_prompt_and_schema_changes_invalidate_analysis():
             hit = analysis_cache.lookup(project_id, 0, cache.key_for(_analysis(**override)))
             assert hit.hit is False, override
             assert field in hit.reason
+
+
+def test_inference_params_change_invalidates_analysis():
+    """Другие параметры запроса — другой разбор: прежний кешем не отдаётся.
+
+    `temperature`, `seed` и `num_ctx` меняют ответ при том же тексте и модели.
+    Без их хеша в ключе пользователь увидел бы разбор, полученный не при тех
+    настройках, что стоят сейчас.
+    """
+    project_id = _project_id()
+    with connect() as connection, connection:
+        analysis_cache = cache.AnalysisCache(LlmAnalysesRepository(connection))
+        analysis_cache.save(project_id, 0, _analysis(inference_hash="параметры-1"))
+        hit = analysis_cache.lookup(
+            project_id, 0, cache.key_for(_analysis(inference_hash="параметры-2"))
+        )
+    assert hit.hit is False
+    assert "inference_hash" in hit.reason
 
 
 def test_dictionary_change_invalidates_affected_analysis():
@@ -338,6 +357,7 @@ def test_saved_analysis_round_trips_annotations(status):
     assert restored.items[0].needs_review is False
     assert restored.model_tag == "qwen3:8b"
     assert restored.prompt_version == versioning.PROMPT_VERSION
+    assert restored.inference_hash == analysis.inference_hash
 
 
 def test_llm_model_is_unloaded_after_analysis_pass():
@@ -394,3 +414,88 @@ def test_llm_model_is_unloaded_after_analysis_pass():
     )
     outcome = cached.run(project_id="p1", replicas=[{"index": 0, "text": "Да."}])
     assert outcome.calls == 0 and outcome.unloaded is False
+
+
+def test_deleting_project_removes_its_analyses():
+    """Удаление проекта чистит его разборы: своего каскада у таблицы нет."""
+    store = get_projects_store()
+    project_id = _project_id()
+    with connect() as connection, connection:
+        cache.AnalysisCache(LlmAnalysesRepository(connection)).save(
+            project_id, 0, _analysis()
+        )
+
+    assert store.delete_project(project_id) is True
+
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM llm_analyses WHERE project_id = ?", (project_id,)
+        ).fetchall()
+    assert rows == []
+
+
+def test_deleting_project_keeps_text_analyses():
+    """Разбор сплошного текста (`text-<хеш>`) к проекту не привязан и остаётся.
+
+    Ради этого случая и нельзя опереться на `ON DELETE CASCADE`: ключом разбора
+    бывает хеш текста, а не id проекта, и внешнего ключа на `projects` тут не
+    поставить.
+    """
+    store = get_projects_store()
+    project_id = _project_id()
+    text_key = f"text-{cache.text_hash(TEXT)}"
+    with connect() as connection, connection:
+        cache.AnalysisCache(LlmAnalysesRepository(connection)).save(text_key, 0, _analysis())
+
+    assert store.delete_project(project_id) is True
+
+    with connect() as connection:
+        left = connection.execute(
+            "SELECT COUNT(*) AS n FROM llm_analyses WHERE project_id = ?", (text_key,)
+        ).fetchone()["n"]
+    assert left == 1
+
+
+def test_reparse_drops_analyses_of_disappeared_replicas():
+    """Разборов реплик, которых нет в новом тексте, не остаётся."""
+    store = get_projects_store()
+    project = store.create_project(
+        "Разбор", source_text="ИВАН: Раз.\nМАРГО: Два.\nИВАН: Три."
+    )
+    store.parse_project(project["id"])
+    with connect() as connection, connection:
+        analysis_cache = cache.AnalysisCache(LlmAnalysesRepository(connection))
+        for index in range(3):
+            analysis_cache.save(project["id"], index, _analysis())
+
+    # Текст сокращён до одной реплики: разборы индексов 1 и 2 уходят вместе с ней.
+    store.update_project(project["id"], source_text="ИВАН: Только одна.")
+    store.parse_project(project["id"])
+
+    with connect() as connection:
+        indexes = [
+            int(row["replica_index"])
+            for row in connection.execute(
+                "SELECT replica_index FROM llm_analyses"
+                " WHERE project_id = ? ORDER BY replica_index",
+                (project["id"],),
+            )
+        ]
+    assert indexes == [0]
+
+
+def test_saved_analysis_with_bad_field_types_is_read_without_crashing():
+    """Мусор в типах сохранённой аннотации не роняет чтение разбора.
+
+    `Annotation.from_dict` приводит типы без защиты; запись, оставшаяся от старой
+    версии кода с `"span_start": "abc"`, бросала `ValueError` и уносила открытие
+    всего разбора. Негодная аннотация отбрасывается, остальное читается.
+    """
+    payload = _analysis().to_dict()
+    payload["items"] = [{**payload["items"][0], "span_start": "abc"}]
+
+    restored = cache.analysis_from_dict(payload)
+
+    assert restored.items == ()
+    assert restored.status == STATUS_READY
+    assert restored.replica_id == 1

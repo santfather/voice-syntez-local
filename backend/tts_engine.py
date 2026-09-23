@@ -5,7 +5,7 @@ import random
 import threading
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Self
 
 import numpy as np
 
@@ -27,7 +27,7 @@ class _InlineExecutor:
     def __init__(self, *args, **kwargs) -> None:
         pass
 
-    def __enter__(self) -> "_InlineExecutor":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> bool:

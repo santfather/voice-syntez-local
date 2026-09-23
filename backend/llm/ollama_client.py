@@ -26,6 +26,7 @@ import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -179,6 +180,17 @@ class OllamaClient:
         Таймаут отделён от «демон недоступен»: это разные советы пользователю
         (подождать/уменьшить модель против запустить `ollama serve`).
         """
+        # Адрес обязан быть http(s): `TTS_OLLAMA_URL=file:///…` доходил до
+        # `urllib.request` и превращал клиент в читалку локальных файлов —
+        # «ответом модели» становилось содержимое файла с диска. Для вызывающего
+        # слоя разницы нет: по такому адресу демон не отвечает, и это
+        # недоступность, а не другой способ получить разбор.
+        scheme = urllib.parse.urlsplit(self.base_url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise OllamaUnavailableError(
+                f"Адрес Ollama ({OLLAMA_URL_ENV}) должен быть http или https, "
+                f"а не «{scheme or 'без схемы'}»: {self.base_url}"
+            )
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self._url(path),

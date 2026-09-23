@@ -29,8 +29,9 @@ git log --diff-filter=D --name-only --pretty=format:'%h %s' -- '*.md' | head -40
 | [`total_audit.md`](../reports/total_audit.md) | Сквозной аудит проекта: находки по слоям (P0–P3), технический долг и план действий |
 | [`total-audit-remediation-phases.md`](../reports/total-audit-remediation-phases.md) | Фазы исправлений аудита со статусами и обязательным ритуалом проверки каждой фазы |
 | [`phase2-performance.md`](../reports/phase2-performance.md) | Фаза 2: замеры производительности «до/после» на живых прогонах |
+| [`crash-audit-report.md`](../reports/crash-audit-report.md) | Разбор SIGABRT на Apple Silicon: изоляция воркеров, дубль libomp, диагностика падений |
 
-Отчёты по более ранним волнам (`creash_*.md`, `short_utterance_*.md` и подобные) удалены при
+Отчёты по более ранним волнам (`crash_*.md`, `short_utterance_*.md` и подобные) удалены при
 уборке документации; их полные тексты достаются из истории git — команды в разделе выше.
 
 ## Хронология

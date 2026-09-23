@@ -55,7 +55,7 @@
 | `POST` | `/api/voices/{id}/references` | Добавить голосу референс-профиль (multipart: `file`, `emotion`, `ref_text`, `label`, `verify_ref_text`, `source_record_phrase_id`, `enabled`, `is_default`, `enabled_for_auto`) — отдельный профиль того же голоса; `emotion` не может быть `AUTO`. Ответ содержит `profile` и `reference_profiles` |
 | `PATCH` | `/api/voices/{id}/references/{profile_id}` | Сменить `emotion`, `label`, `enabled`, `is_default` или `enabled_for_auto` профиля, не перезаписывая запись. Именно этим включает/выключается галочка «авто» |
 | `DELETE` | `/api/voices/{id}/references/{profile_id}` | Удалить профиль вместе с его файлом (основной нейтральный не удаляется) |
-| `DELETE` | `/api/voices/{voice_id}` | Удалить голос |
+| `DELETE` | `/api/voices/{voice_id}` | Удалить голос (409, пока в очереди есть задача: её синтез читает референс с диска) |
 | `POST` | `/api/voices/{id}/benchmark` | Сравнить голос на движках одной фразой → `benchmark_id` + `job_id` (202; `engines` пустой — все объявленные, неизвестный движок — 400; приоритет 3 — фоновая работа) |
 | `GET` | `/api/benchmarks/{benchmark_id}` | Ход и результаты сравнения: строка на движок (`status`, `render_sec`, `duration_sec`, `qa`, `params`, `audio_url`) |
 | `GET` | `/api/benchmarks/{benchmark_id}/{engine}/audio` | Файл результата одного движка — для прослушивания (всегда wav) |
@@ -142,7 +142,7 @@
 | `POST` | `/api/parse` | Разобрать диалог → реплики + список спикеров (400 при слишком длинном куске) |
 | `POST` | `/api/text/preview` | Что услышит модель: стадии `original → normalized → yo → dictionary → accentized → final`, сработавшие правила, движок и состояние RUAccent — без синтеза, загрузки движка и записи в базу. Текст ограничен `TTS_MAX_PREVIEW_CHARS` (по умолчанию 2000), а не общим `TTS_MAX_TEXT_CHARS`: стадии считаются синхронно и панель ждёт их глазами |
 | `POST` | `/api/preview` | Прослушать голос: синтез одной фразы → `job_id` (приоритет 0) |
-| `POST` | `/api/generate` | Поставить задачу по диалогу → `job_id` (приоритет 2; `background: true` — приоритет 3) |
+| `POST` | `/api/generate` | **Legacy** (помечен `deprecated` в OpenAPI): разовая задача по сырому диалогу → `job_id` (приоритет 2; `background: true` — приоритет 3). Проекта и обязательной подготовки не требует: ни `final_text`, ни состояния проекта, ни `require_prepared` — синтезируется присланный текст. Фронтенд им не пользуется (панель сборки идёт через `/api/projects/{id}/render`); остаётся для скриптов и разовых прогонов |
 | `POST` | `/api/render-text` | Поставить задачу по сплошному тексту (один голос) → `job_id` (приоритет 2; `background: true` — приоритет 3) |
 | `GET` | `/api/jobs/{job_id}` | Статус, прогресс, ETA (`eta_sec` + готовая строка `eta_text`); у ошибки — `error_type` (`WORKER_CRASH`, `WORKER_TIMEOUT`, `TTS_ERROR`, `AUDIO_ERROR`, `CANCELLED`, `WATCHDOG`, `INTERRUPTED`) и `error_title`; у готовой задачи ещё и `replicas` — куски с их местом в файле, сидом, отметкой проверки качества и списком вариантов |
 | `POST` | `/api/jobs/{job_id}/cancel` | Отменить задачу: ожидающую — сразу (`cancelled`), идущую — на ближайшей безопасной точке (200, `{"job": …}`; 404 на неизвестный id, повторная отмена идемпотентна) |
@@ -298,8 +298,8 @@ multipart-загрузки (референс голоса, запись) — 96 
 фронтенда нет.
 
 В интерфейсе с проектом работает вкладка «Озвучка диалога»: Панель 1 — редактор реплик,
-Панель 4 — сборка файла. `/api/generate` и `/api/render-text` остаются для разовых задач,
-скриптов и нагрузочного теста.
+Панель 4 — сборка файла. `/api/generate` (legacy, `deprecated` в OpenAPI) и `/api/render-text`
+остаются для разовых задач, скриптов и нагрузочного теста.
 
 ## Примеры запросов
 

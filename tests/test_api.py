@@ -5,9 +5,8 @@ import contextlib
 import time
 
 import httpx
-import pytest
 
-from backend import audio_pipeline, config, main
+from backend import audio_pipeline, config, engine_lifecycle, main
 from backend.engines.base import ENGINE_KOKORO
 from backend.job_queue import JobQueue
 
@@ -56,6 +55,17 @@ async def _wait(client, job_id: str, done, timeout: float = 30.0) -> dict:
             return data
         await asyncio.sleep(0.02)
     raise AssertionError(f"задача {job_id} не достигла нужного состояния")
+
+
+def test_generate_route_is_marked_deprecated():
+    """`/api/generate` — legacy: обход обязательной подготовки виден в OpenAPI.
+
+    Роут берёт сырой диалог и не требует проекта, поэтому ни `final_text`, ни
+    состояния проекта, ни `require_prepared` у него нет. Фронтенд им не пользуется,
+    но он остаётся для скриптов и разовых прогонов — значит, должен быть помечен, а
+    не выглядеть обычной точкой входа (docs/api.md).
+    """
+    assert main.app.openapi()["paths"]["/api/generate"]["post"]["deprecated"] is True
 
 
 def test_engines_endpoint_lists_passports(stub, fake_store, monkeypatch):
@@ -126,6 +136,43 @@ def test_builtin_voices_appear_without_any_recording(monkeypatch):
             assert deleted.status_code == 200, deleted.text
             after = (await client.get("/api/voices")).json()["voices"]
             assert removed not in {voice["id"] for voice in after}
+
+    _run(scenario)
+
+
+def test_voice_delete_refused_while_queue_is_busy(monkeypatch):
+    """Голос не удаляется под работающей задачей: синтез читает его референс с диска.
+
+    Правило то же, что у выгрузки движка и сброса приложения (`queue_busy_now`):
+    иначе удаление оборвало бы рендер на середине, а ошибка выглядела бы
+    случайной. Как только очередь освободилась, тот же голос удаляется штатно —
+    проверка запрещает удаление на время задачи, а не навсегда.
+    """
+    busy = {"value": True}
+    monkeypatch.setattr(engine_lifecycle, "queue_busy_now", lambda: busy["value"])
+    monkeypatch.setattr(
+        main.model_manager,
+        "engine_available",
+        lambda engine_id: engine_id == ENGINE_KOKORO,
+    )
+
+    async def scenario():
+        async with _client(monkeypatch) as (client, _queue):
+            listed = (await client.get("/api/voices")).json()["voices"]
+            voice_id = next(
+                voice["id"] for voice in listed if voice["engine"] == ENGINE_KOKORO
+            )
+
+            refused = await client.delete(f"/api/voices/{voice_id}")
+            assert refused.status_code == 409, refused.text
+            assert "очеред" in refused.json()["detail"].lower()
+            # Голос и его файлы на месте: отказ не сделал половину работы.
+            still_there = (await client.get("/api/voices")).json()["voices"]
+            assert voice_id in {voice["id"] for voice in still_there}
+
+            busy["value"] = False
+            deleted = await client.delete(f"/api/voices/{voice_id}")
+            assert deleted.status_code == 200, deleted.text
 
     _run(scenario)
 

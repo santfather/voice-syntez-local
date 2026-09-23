@@ -155,6 +155,19 @@ def test_ollama_client_marks_cancel_and_timeout_separately():
         down_client.chat("qwen3:8b", [{"role": "user", "content": "u"}])
 
 
+def test_ollama_client_refuses_non_http_url(monkeypatch):
+    """`file://` — не адрес демона: клиент не читает локальные файлы и не молчит."""
+    monkeypatch.setenv(ollama_client.OLLAMA_URL_ENV, "file:///etc/passwd")
+    # Пустая карта маршрутов: любой запрос — неожиданный, то есть до сети дело не дошло.
+    client = ollama_client.OllamaClient(opener=_opener({}))
+    with pytest.raises(ollama_client.OllamaUnavailableError, match="http"):
+        client.version()
+    # И это состояние, а не исключение для UI: экран статуса обязан ответить.
+    status = client.health()
+    assert status.available is False
+    assert "http" in status.error
+
+
 def test_ollama_client_unload_confirms_actual_release():
     """Выгрузка подтверждается по /api/ps, а не по факту отправки запроса."""
     state = {"loaded": True}
@@ -381,6 +394,31 @@ def test_json_in_markdown_fence_is_accepted():
     analysis, errors = s.parse_analysis(raw, expected_replica_id=17, target_text=TARGET)
     assert errors == []
     assert analysis is not None
+
+
+def test_llm_response_rejects_wall_of_text():
+    """Гигантский ответ отбрасывается, а не разворачивается в разбор целиком."""
+    huge = "x" * (s.MAX_RESPONSE_CHARS + 1)
+    analysis, errors = s.parse_analysis(huge, expected_replica_id=17, target_text=TARGET)
+    assert analysis is None
+    assert errors == [s.ERROR_TOO_LARGE]
+    # Тот же порог и на окне: ответ не должен успеть стать объектом ни на одном пути.
+    window, window_errors = s.parse_window_analysis(
+        huge, replica_ids=[17], target_texts={17: TARGET}
+    )
+    assert window is None
+    assert window_errors == [s.ERROR_TOO_LARGE]
+
+
+def test_llm_response_rejects_hundreds_of_annotations():
+    """Сотни аннотаций к одной реплике — мусорный ответ, он не применяется."""
+    broken = json.loads(_valid_response())
+    broken["items"] = broken["items"] * (s.MAX_ANNOTATIONS + 1)
+    analysis, errors = s.parse_analysis(
+        json.dumps(broken, ensure_ascii=False), expected_replica_id=17, target_text=TARGET
+    )
+    assert analysis is None
+    assert errors == [s.ERROR_TOO_MANY_ITEMS]
 
 
 # --- prompt и версии ------------------------------------------------------------

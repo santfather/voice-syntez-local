@@ -29,7 +29,11 @@ from backend.engines.base import (
     SAMPLE_RATE,
     STATE_FAILED,
 )
-from backend.engines.kokoro_engine import KokoroEngine, resolve_model_dir, _split_phonemes
+from backend.engines.kokoro_engine import (
+    KokoroEngine,
+    _split_phonemes,
+    resolve_model_dir,
+)
 from backend.engines.registry import create_local_engine
 
 REF_TEXT = "Привет, это референс"
@@ -39,7 +43,7 @@ REF_TEXT = "Привет, это референс"
 # фонемизации выбрал режим.
 FAKE_PHONEMES = "ab cd ef gh ij kl mn op qr st uv wx"
 
-FAKE_G2P_SOURCE = ('''PHONEMES = "%s"
+FAKE_G2P_SOURCE = f'''PHONEMES = "{FAKE_PHONEMES}"
 
 
 class RuG2P:
@@ -57,7 +61,7 @@ class RuG2P:
     def phonemize_accented(self, text):
         self.calls.append(("phonemize_accented", text, self.reduction))
         return self.phonemes, self.oov
-''' % FAKE_PHONEMES)
+'''
 
 # Словарь, которому не хватает `misaki`: именно эту зависимость зовёт `ru_g2p.py`
 # репозитория, и отсутствие пакета обязано называть установку, а не «No module».

@@ -416,7 +416,7 @@ def test_mapping_matches_document_and_covers_every_phrase():
     # Подписи — тот же список и в том же порядке, что и RECORD_PHRASES: иначе
     # мастер записал бы фразу не под ту интонацию, а заметить это было бы нечем.
     assert [label for label, _ in mapping] == [label for label, _ in record_phrases()]
-    assert len(set(label for label, _ in mapping)) == len(mapping), (
+    assert len({label for label, _ in mapping}) == len(mapping), (
         "одна подпись не может встречаться дважды: по ней ищется профиль фразы"
     )
 

@@ -10,7 +10,12 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from backend import config
+from backend.engines.base import ENGINE_KOKORO
 from backend.voices_store import VoicesStore
 
 # id в именах файлов — `uuid.uuid4().hex[:12]`, то есть ровно 12 шестнадцатеричных
@@ -61,3 +66,79 @@ def test_recovery_is_silent_when_there_is_nothing_to_restore(workspace):
     store = VoicesStore()
     assert store.recover_from_files() == 0
     assert not config.VOICES_JSON.exists()
+
+
+def test_write_is_atomic_and_survives_interruption(workspace, monkeypatch):
+    """Обрыв записи не оставляет битый `voices.json` и не теряет заведённые голоса.
+
+    Прямая `write_text` усекает файл ещё до начала записи: падение в этот момент
+    дало бы обрезанный JSON, `_read` вернул бы пустой список, и следующая запись
+    затёрла бы библиотеку насовсем. Поэтому запись идёт во временный файл рядом, а
+    подмена — через `os.replace`: обрыв до неё текущее содержимое не трогает.
+    """
+    store = VoicesStore()
+    store.create(
+        name="Света", gender="female", ref_text="", audio_filename="",
+        audio_bytes=b"", engine=ENGINE_KOKORO,
+    )
+    before = config.VOICES_JSON.read_text(encoding="utf-8")
+    assert [voice.name for voice in store.list()] == ["Света"]
+
+    def broken_replace(*args, **kwargs):
+        raise OSError("диск переполнен")
+
+    monkeypatch.setattr("backend.voices_store.os.replace", broken_replace)
+    with pytest.raises(OSError):
+        store.create(
+            name="Дима", gender="male", ref_text="", audio_filename="",
+            audio_bytes=b"", engine=ENGINE_KOKORO,
+        )
+
+    # Прежний файл цел: обрыва посреди записи не случилось.
+    assert config.VOICES_JSON.read_text(encoding="utf-8") == before
+    assert [voice.name for voice in store.list()] == ["Света"]
+
+
+def test_audio_file_outside_voices_dir_is_ignored(workspace):
+    """`audio_file` вида `../…` не превращается в путь к чужому файлу.
+
+    `voices.json` правят руками и переносят между машинами. Значение, выводящее
+    за `voices/`, читается как «референса нет», поэтому удаление голоса не трогает
+    файл за пределами каталога.
+    """
+    victim = config.VOICES_DIR.parent / "victim.wav"
+    victim.write_bytes(b"RIFF")
+    outside_profile = "outside-profile"
+    config.VOICES_JSON.write_text(
+        json.dumps(
+            {
+                "voices": [
+                    {
+                        "id": VOICE_ID,
+                        "name": "Чужой",
+                        "gender": "female",
+                        "ref_text": "",
+                        "audio_file": "../victim.wav",
+                        "profiles": [
+                            {
+                                "id": outside_profile,
+                                "audio_file": "../victim.wav",
+                                "emotion": "neutral",
+                            }
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    store = VoicesStore()
+    voice = store.get(VOICE_ID)
+    assert voice is not None
+    assert voice.audio_file == ""
+    assert voice.profiles == []
+
+    assert store.delete(VOICE_ID) is True
+    assert victim.read_bytes() == b"RIFF"

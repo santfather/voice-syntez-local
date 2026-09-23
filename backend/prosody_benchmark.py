@@ -176,7 +176,9 @@ def load_corpus(path: Path) -> list[CorpusCase]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path.name}: строка {number}: не JSON ({exc})") from exc
         if not isinstance(payload, dict):
-            raise ValueError(f"{path.name}: строка {number}: ожидался JSON-объект")
+            raise ValueError(  # noqa: TRY004 — битый корпус это ошибка данных, не типа
+                f"{path.name}: строка {number}: ожидался JSON-объект"
+            )
         missing = [name for name in ("id", "category", "text", "expected_intent") if name not in payload]
         if missing:
             raise ValueError(
@@ -804,8 +806,10 @@ def format_report(report: dict) -> str:
         "",
         "## Сводка по профилям",
         "",
-        "`wer_delta_vs_neutral` > 0 — текст хуже нейтрального; "
-        "`text_ok_delta_vs_neutral` < 0 — доля целых текстов ниже нейтральной.",
+        (
+            "`wer_delta_vs_neutral` > 0 — текст хуже нейтрального; "
+            "`text_ok_delta_vs_neutral` < 0 — доля целых текстов ниже нейтральной."
+        ),
         "",
         "| Профиль | Ячеек | Ошибок | WER сред. | ΔWER | Текст ok | ΔТекст | Первое слово | Последнее слово | Лишние | Повторы | Длит., с | Ген., с |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
@@ -870,9 +874,11 @@ def format_report(report: dict) -> str:
         "",
         "## Что дальше",
         "",
-        "Числа говорят только о тексте: перенос интонации оценивает человек по "
-        "`review.md` (§34). Production-маршрутизация включается после прослушивания "
-        "(§35), а не по этой таблице.",
+        (
+            "Числа говорят только о тексте: перенос интонации оценивает человек по "
+            "`review.md` (§34). Production-маршрутизация включается после прослушивания "
+            "(§35), а не по этой таблице."
+        ),
         "",
     ]
     return "\n".join(lines)
@@ -888,15 +894,21 @@ def render_review(report: dict) -> str:
     lines = [
         "# Listening review: reference prosody",
         "",
-        f"Голос: {report.get('voice_name')} (`{report.get('voice_id')}`), "
-        f"движок `{report.get('engine')}`, сид {report.get('seed')}.",
+        (
+            f"Голос: {report.get('voice_name')} (`{report.get('voice_id')}`), "
+            f"движок `{report.get('engine')}`, сид {report.get('seed')}."
+        ),
         "",
-        "Заполняется вручную: Whisper здесь не судья (§34). Для каждой строки "
-        "поставьте `pass`/`fail` в первых четырёх колонках, `yes`/`no` — в двух "
-        "следующих, и коротко опишите дефект в `notes`.",
+        (
+            "Заполняется вручную: Whisper здесь не судья (§34). Для каждой строки "
+            "поставьте `pass`/`fail` в первых четырёх колонках, `yes`/`no` — в двух "
+            "следующих, и коротко опишите дефект в `notes`."
+        ),
         "",
-        "Порядок прослушивания: все профили одной реплики идут подряд — так слышно "
-        "именно смену интонации, а не разницу между фразами.",
+        (
+            "Порядок прослушивания: все профили одной реплики идут подряд — так слышно "
+            "именно смену интонации, а не разницу между фразами."
+        ),
         "",
         "| target_text | expected_intent | reference_profile | text_complete | clarity | voice_identity | prosody_match | overacting | artifacts | notes |",
         "|---|---|---|---|---|---|---|---|---|---|",
@@ -915,12 +927,16 @@ def render_review(report: dict) -> str:
         "- `text_complete` — сказано всё, без пропусков и лишнего.",
         "- `clarity` — дикция разборчива, без смазывания.",
         "- `voice_identity` — голос узнаваем как тот же, что и в других профилях.",
-        "- `prosody_match` — интонация соответствует `expected_intent` (для "
-        "неоднозначных реплик — с учётом контекста из `notes`).",
+        (
+            "- `prosody_match` — интонация соответствует `expected_intent` (для "
+            "неоднозначных реплик — с учётом контекста из `notes`)."
+        ),
         "- `overacting` — интонация наиграна, звучит неестественно.",
         "- `artifacts` — щелчки, металл, обрывы, дыхание не на месте.",
-        "- `notes` — что именно не так; для спорных реплик здесь лежит подсказка "
-        "из корпуса.",
+        (
+            "- `notes` — что именно не так; для спорных реплик здесь лежит подсказка "
+            "из корпуса."
+        ),
         "",
     ]
     return "\n".join(lines)

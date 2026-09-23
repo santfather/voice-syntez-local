@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -199,6 +200,25 @@ def _adopt_uvicorn_loggers() -> None:
             uvicorn_logger.removeHandler(handler)
             handler.close()
         uvicorn_logger.propagate = True
+
+
+def _install_excepthooks() -> None:
+    """Ведёт непойманные исключения в журнал — в главном потоке и в рабочих (P1, §3.3).
+
+    Обработчик `@app.exception_handler` видит только запросы; исключение вне
+    запроса — в потоке прогрева, в `asyncio.to_thread`, в фоновой задаче — уходило
+    в stderr мимо журнала. Ставится из `lifespan`, а не при импорте: журнал к этому
+    моменту уже настроен, а тесты, импортирующие приложение, не забирают обработчик
+    у pytest.
+    """
+
+    def log_uncaught(exc_type, exc_value, exc_tb) -> None:
+        logger.critical("Необработанное исключение", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = log_uncaught
+    threading.excepthook = lambda args: log_uncaught(
+        args.exc_type, args.exc_value, args.exc_traceback
+    )
 
 
 MIME_BY_FORMAT = {"wav": "audio/wav", "mp3": "audio/mpeg"}
@@ -597,14 +617,14 @@ def _warmup() -> None:
     _seed_builtin_voices()
     try:
         get_store().inspect_existing()  # F0 и метки для голосов, загруженных раньше
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — проверка голосов не повод не стартовать
         logger.error("Не удалось проверить загруженные голоса: %s", exc)
     try:
         # Прогреваем только F5: он движок по умолчанию для новых голосов, а XTTS
         # поднимается по факту выбора (см. engines/registry — движок живёт тёплым
         # до конца процесса, лишние секунды и гигабайты на старте не нужны).
         get_engine(ENGINE_F5).load()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — без весов синтез не пойдёт, но UI нужен
         logger.error("Не удалось загрузить TTS-модель: %s", exc)
     Accentizer.instance().load()
 
@@ -620,6 +640,7 @@ async def lifespan(app: FastAPI):
     # должно попадать и в файл, а не только в консоль (F-F1).
     _configure_file_logging()
     _adopt_uvicorn_loggers()
+    _install_excepthooks()
     app.state.instance_lock = _acquire_instance_lock()
     _assert_port_free()
     torch = config.configure_torch()
@@ -1412,7 +1433,7 @@ async def create_voice(
     verify_ref_text: bool = Form(True),
     engine: str = Form(""),
     denoise: bool = Form(False),
-    file: UploadFile | None = File(None),
+    file: UploadFile | None = File(None),  # noqa: B008 — идиома FastAPI
 ) -> dict:
     """Создаёт голос из загруженной записи и отдаёт его карточку.
 
@@ -1451,7 +1472,7 @@ async def create_voice(
 
 
 @app.post("/api/voices/analyze")
-async def analyze_voice(file: UploadFile = File(...), gender: str = Form("other")) -> dict:
+async def analyze_voice(file: UploadFile = File(...), gender: str = Form("other")) -> dict:  # noqa: B008 — идиома FastAPI
     """Проверяет запись до сохранения голоса: тон, пол, перегрузка, длительность.
 
     Запись из браузера нельзя оценить на клиенте: измерение тона живёт в
@@ -1501,7 +1522,7 @@ async def analyze_voice(file: UploadFile = File(...), gender: str = Form("other"
 
 
 @app.post("/api/voices/transcribe")
-async def transcribe_voice(file: UploadFile = File(...)) -> dict:
+async def transcribe_voice(file: UploadFile = File(...)) -> dict:  # noqa: B008 — идиома FastAPI
     """Расшифровывает запись — кнопка «Распознать» в форме нового голоса."""
     if file.size is not None and file.size > MAX_AUDIO_BYTES:
         raise HTTPException(
@@ -1548,8 +1569,25 @@ async def transcribe_voice(file: UploadFile = File(...)) -> dict:
     }
 
 
+# Удаление голоса трогает файлы референсов на диске, поэтому правило очереди то же,
+# что у выгрузки движка и сброса приложения: пока в очереди есть задача, голос
+# удалять нельзя — синтез читает его референс под идущим рендером.
+VOICE_DELETE_QUEUE_BUSY = (
+    "В очереди есть задача: голос нужен её репликам, а его референс читается с "
+    "диска прямо во время синтеза. Дождитесь окончания задачи и повторите удаление."
+)
+
+
 @app.delete("/api/voices/{voice_id}")
 async def delete_voice(voice_id: str) -> dict:
+    """Удаляет голос вместе с его референсами и файлами.
+
+    409, пока в очереди есть задача: удаление файла под работающим синтезом
+    оборвало бы рендер на середине, а причина выглядела бы случайной. 404 —
+    неизвестный голос: молчаливый no-op скрыл бы опечатку.
+    """
+    if engine_lifecycle.queue_busy_now():
+        raise HTTPException(status_code=409, detail=VOICE_DELETE_QUEUE_BUSY)
     if not get_store().delete(voice_id):
         raise HTTPException(status_code=404, detail="Голос не найден")
     return {"deleted": voice_id}
@@ -2183,9 +2221,17 @@ async def preview(payload: PreviewRequest) -> dict:
     return {"job_id": job.id, "status": job.status.value, "total_replicas": 1}
 
 
-@app.post("/api/generate", status_code=202)
+@app.post("/api/generate", status_code=202, deprecated=True)
 async def generate(payload: GenerateRequest) -> dict:
-    """Принимает диалог, проверяет назначение голосов и ставит задачу рендера.
+    """Legacy: разовая задача по сырому диалогу, без проекта и обязательной подготовки.
+
+    Роут принимает текст как есть: у него нет сохранённой подготовки (`final_text`),
+    он не проверяет состояние проекта и не выставляет `require_prepared`, поэтому
+    синтезирует то, что ему прислали. Это осознанный обход контракта «сначала
+    подготовка, потом звук» — и он нужен только скриптам и разовым прогонам
+    (`tools/loadtest.py`), фронтенд им не пользуется и ходит через
+    `POST /api/projects/{id}/render`. Помечен `deprecated`, чтобы обход был виден в
+    OpenAPI, а не выглядел обычной точкой входа (см. docs/api.md).
 
     Голос обязателен каждому спикеру: иначе задача встала бы в очередь и упала
     уже в воркере, без понятной пользователю причины.
@@ -2752,8 +2798,6 @@ def _replica_payload(project: dict, index: int, voices: dict | None = None) -> d
     speaker = next(
         (item for item in project["speakers"] if item["key"] == replica["speaker"]), None
     )
-    voice_id = str(replica["voice_id"] or (speaker["voice_id"] if speaker else "") or "")
-    voice = _resolved_voice(voice_id, {} if voices is None else voices)
     return {
         **replica,
         "inherited_voice_id": speaker["voice_id"] if speaker else "",
@@ -4478,7 +4522,7 @@ async def render_recording_project(
         asyncio.get_running_loop().run_in_executor(
             None, functools.partial(recording_pipeline.render, project_id, pause_ms=payload.pause_ms)
         )
-    except Exception as exc:  # noqa: BLE001 — состояние обязано быть видимым
+    except Exception as exc:
         recording_pipeline.abort_render(project_id, f"монтаж не запустился: {exc}")
         raise HTTPException(status_code=500, detail="Не удалось запустить монтаж") from exc
     return {"status": "running", "project_id": project_id}

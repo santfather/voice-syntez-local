@@ -229,17 +229,40 @@ class _LoadedEngine(StubEngine):
 
 
 def test_delete_allowed_when_engine_idle(models_dir, downloader):
+    """У модели свой каталог (XTTS), движок выгружен — удаление проходит."""
+    write(config.XTTS_BASE_DIR / "model.pth")
+    write(config.XTTS_BASE_DIR / "config.json")
+
+    async def scenario():
+        async with _client() as client:
+            response = await client.delete(f"/api/models/{XTTS_ID}")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["deleted"] == XTTS_ID
+            assert body["freed_bytes"] > 0
+            assert body["state"]["installed"] is False
+            assert not config.XTTS_BASE_DIR.exists()
+
+    _run(scenario)
+
+
+def test_delete_of_f5_is_refused_because_its_dir_is_shared(models_dir, downloader):
+    """F5 лежит в корне `models/`: её удаление стёрло бы веса остальных моделей."""
     install_f5(models_dir)
+    write(config.XTTS_BASE_DIR / "model.pth")
 
     async def scenario():
         async with _client() as client:
             response = await client.delete(f"/api/models/{F5_ID}")
-            assert response.status_code == 200, response.text
-            body = response.json()
-            assert body["deleted"] == F5_ID
-            assert body["freed_bytes"] > 0
-            assert body["state"]["installed"] is False
-            assert not (models_dir / config.HF_CKPT_PATH).exists()
+            assert response.status_code == 400, response.text
+            detail = response.json()["detail"]
+            assert "каталоге моделей" in detail
+            assert "вручную" in detail
+            # Чужие веса целы — отказ случился до удаления.
+            assert (config.XTTS_BASE_DIR / "model.pth").is_file()
+            assert (models_dir / config.HF_CKPT_PATH).is_file()
+            listed = (await client.get(f"/api/models/{F5_ID}")).json()
+            assert listed["installed"] is True
 
     _run(scenario)
 

@@ -19,6 +19,7 @@ import numpy as np
 from . import (
     config,
     engine_lifecycle,
+    model_manager,
     qa_screening,
     reference_resolver,
     resource_guard,
@@ -26,12 +27,16 @@ from . import (
     take_quality,
     warmup_context,
 )
-from . import model_manager
 from . import short_utterance as su
 from . import short_utterance_boundary as boundary_module
 from .accentizer import accentuate
 from .dialogue_parser import Replica
-from .engines.base import SAMPLE_RATE, SynthesisEngine, fallback_engine, requires_reference
+from .engines.base import (
+    SAMPLE_RATE,
+    SynthesisEngine,
+    fallback_engine,
+    requires_reference,
+)
 from .engines.registry import created_engines, get_engine
 from .engines.worker_protocol import ERROR_AUDIO, text_fingerprint
 from .pronunciation import active_rules

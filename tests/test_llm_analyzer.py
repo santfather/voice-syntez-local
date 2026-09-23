@@ -126,6 +126,29 @@ def test_analyzer_uses_selected_model_and_reports_it():
     assert result.model_digest == "digest-fallback"
 
 
+def test_inference_params_are_recorded_in_the_analysis():
+    """Параметры запроса записываются в разбор: они — часть входа, а не оформление.
+
+    По этому хешу (`inference_hash`) кеш решает, что разбор сделан при других
+    настройках, и не отдаёт его как актуальный (`analysis_cache.AnalysisKey`).
+    """
+    def responder(case):
+        return _response([], replica_id=case["replica_id"])
+
+    base, _ = _analyzer(responder)
+    result = base.analyze_replica(replica_id=1, target_text=CASTLE)
+    assert result.inference_hash == llm.inference_hash(base.settings)
+
+    # Любой из трёх параметров меняет хеш: иначе прежний разбор выглядел бы
+    # действительным при других настройках.
+    for override in ({"temperature": 0.7}, {"num_ctx": 4096}, {"seed": 42}):
+        other, _ = _analyzer(responder, settings=_settings(**override))
+        assert llm.inference_hash(other.settings) != result.inference_hash, override
+        assert other.analyze_replica(replica_id=1, target_text=CASTLE).inference_hash != (
+            result.inference_hash
+        ), override
+
+
 def test_analyzer_sends_russian_context_within_policy():
     """Контекст: цель + до двух соседей с каждой стороны и бюджет символов (§6)."""
     captured: dict = {}
@@ -554,6 +577,87 @@ def test_unknown_reason_code_is_informational_not_fatal():
     strict, errors = s.parse_analysis(payload, expected_replica_id=1, target_text=CASTLE)
     assert strict is None
     assert s.ERROR_UNKNOWN_REASON in errors
+
+
+def test_non_numeric_annotation_fields_reject_response_instead_of_crashing():
+    """Мусор в типах полей аннотации — негодный ответ, а не исключение.
+
+    Валидный JSON вроде `{"span_start": "abc"}` или `{"confidence": {"x": 1}}`
+    бросал `ValueError`/`TypeError` из `Annotation.from_dict`. Вызывающий слой ловит
+    только `OllamaError`, поэтому исключение уносило **весь** проход анализа — все
+    реплики вместо одной. Теперь такой ответ отвергается как обычно, с кодом ошибки.
+    """
+    bad_spans = _response(
+        [{"span_start": "abc", "span_end": 30, "source": "замка", "type": "homograph"}],
+        replica_id=1,
+    )
+    analysis, errors = s.parse_analysis(bad_spans, expected_replica_id=1, target_text=CASTLE)
+    assert analysis is None
+    assert s.ERROR_FIELD_TYPES in errors
+
+    bad_confidence = _response(
+        [
+            {
+                "span_start": 25,
+                "span_end": 30,
+                "source": "замка",
+                "type": "homograph",
+                "confidence": {"x": 1},
+            }
+        ],
+        replica_id=1,
+    )
+    analysis, errors = s.parse_analysis(bad_confidence, expected_replica_id=1, target_text=CASTLE)
+    assert analysis is None
+    assert s.ERROR_FIELD_TYPES in errors
+
+
+def test_window_with_garbage_annotation_drops_only_its_replica():
+    """В окне негодная аннотация стоит разбора одной реплики, а не всего запроса (§47)."""
+    raw = json.dumps(
+        {
+            "schema_version": s.SCHEMA_VERSION,
+            "replicas": [
+                {"replica_id": 1, "items": []},
+                {
+                    "replica_id": 2,
+                    "items": [
+                        {"span_start": "abc", "span_end": 5, "source": "тест", "type": "homograph"}
+                    ],
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    window, errors = s.parse_window_analysis(
+        raw, replica_ids=[1, 2], target_texts={1: "Первый текст.", 2: "Второй текст."}
+    )
+    assert errors == []
+    assert [analysis.replica_id for analysis in window.replicas] == [1]
+    assert [entry["replica_id"] for entry in window.rejected] == [2]
+    assert s.ERROR_FIELD_TYPES in window.rejected[0]["errors"]
+
+
+def test_garbage_utterance_falls_back_and_keeps_the_analysis():
+    """Подсказка о реплике — метаданные: её мусорный тип не отвергает разбор (§47)."""
+    payload = _response(
+        [
+            {
+                "span_start": 25,
+                "span_end": 30,
+                "source": "замка",
+                "type": "homograph",
+                "confidence": 0.9,
+            }
+        ],
+        replica_id=1,
+        extra={"utterance": {"class": "NORMAL", "context_dependency": "LOW", "emotion_confidence": {"x": 1}}},
+    )
+    analysis, errors = s.parse_analysis(payload, expected_replica_id=1, target_text=CASTLE)
+    assert errors == []
+    assert analysis is not None
+    assert analysis.items[0].source == "замка"
+    assert analysis.utterance.emotion == "", "непрочитанная эмоция — «модель не сказала»"
 
 
 def test_settings_toggle_enables_analyzer_and_survives_restart(tmp_path, monkeypatch):

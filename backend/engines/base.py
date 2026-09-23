@@ -156,7 +156,7 @@ class EngineParam:
         except (TypeError, ValueError):
             number = float(self.default)
         number = min(max(number, self.minimum), self.maximum)
-        return int(round(number)) if self.integer else round(number, 4)
+        return round(number) if self.integer else round(number, 4)
 
     def to_dict(self) -> dict:
         return {

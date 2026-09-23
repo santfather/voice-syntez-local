@@ -94,7 +94,7 @@ def call(method: str, path: str, payload: dict | None = None, timeout: float = 6
             return response.status, time.perf_counter() - started, body
     except urllib.error.HTTPError as exc:
         return exc.code, time.perf_counter() - started, exc.read()
-    except Exception as exc:  # таймаут или обрыв — тоже результат нагрузки
+    except Exception as exc:  # noqa: BLE001 — таймаут или обрыв тоже результат нагрузки
         return 0, time.perf_counter() - started, repr(exc).encode()
 
 
@@ -102,7 +102,7 @@ def call_json(method: str, path: str, payload: dict | None = None, timeout: floa
     status, elapsed, body = call(method, path, payload, timeout)
     try:
         return status, elapsed, json.loads(body)
-    except Exception:
+    except Exception:  # noqa: BLE001 — невалидный JSON тоже результат нагрузки
         return status, elapsed, None
 
 
@@ -325,7 +325,7 @@ def phase_load() -> None:
         codes: list[int] = []
         lock = threading.Lock()
 
-        def worker(offset: int) -> None:
+        def worker(offset: int, lock: threading.Lock, times: list, codes: list) -> None:
             local_times, local_codes = [], []
             for step in range(requests_per_worker):
                 method, path, payload = LIGHT_ROUTES[(offset + step) % len(LIGHT_ROUTES)]
@@ -336,7 +336,10 @@ def phase_load() -> None:
                 times.extend(local_times)
                 codes.extend(local_codes)
 
-        threads = [threading.Thread(target=worker, args=(index,)) for index in range(workers_count)]
+        threads = [
+            threading.Thread(target=worker, args=(index, lock, times, codes))
+            for index in range(workers_count)
+        ]
         started = time.perf_counter()
         for thread in threads:
             thread.start()

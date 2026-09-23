@@ -873,19 +873,49 @@ class JobQueue:
                 # этом продолжают отвечать — они слот не занимают.
                 if not await self._wait_for_heavy_slot(task.job_id):
                     continue
-                with llm_memory.get_gate().hold(
-                    llm_memory.HEAVY_TTS, owner=f"job:{task.job_id}"
-                ):
-                    if isinstance(task, RegenerateTask):
-                        await self._regenerate(task)
-                    elif isinstance(task, ProjectTakeTask):
-                        await self._project_take(task)
-                    elif isinstance(task, BenchmarkTask):
-                        await self._benchmark(task)
-                    else:
-                        await self._render(task)
+                # Слот берётся и отпускается в `_run_heavy`: гонку за него нужно
+                # пережить ожиданием, а не исключением (см. метод).
+                await self._run_heavy(task)
             finally:
                 queue.task_done()
+
+    async def _run_heavy(
+        self, task: RenderTask | RegenerateTask | ProjectTakeTask | BenchmarkTask
+    ) -> None:
+        """Выполняет задачу под тяжёлым слотом, дожидаясь его освобождения.
+
+        `_wait_for_heavy_slot` только спрашивает «свободно ли»; между ответом и
+        захватом слот может занять другой потребитель (LLM-анализ, второе окно
+        синтеза). Это ожидание, а не ошибка — слот конечен, поэтому ждём его так же,
+        как в `_wait_for_heavy_slot`. Необработанное `HeavyResourceBusy` уронило бы
+        воркер очереди: задачи перестали бы обрабатываться до перезапуска сервера.
+        """
+        while True:
+            try:
+                ticket = llm_memory.get_gate().try_acquire(
+                    llm_memory.HEAVY_TTS, owner=f"job:{task.job_id}"
+                )
+            except llm_memory.HeavyResourceBusy as exc:
+                logger.info(
+                    "Задача %s: тяжёлый слот заняли между проверкой и захватом (%s)",
+                    task.job_id,
+                    exc,
+                )
+                if not await self._wait_for_heavy_slot(task.job_id):
+                    return
+                continue
+            try:
+                if isinstance(task, RegenerateTask):
+                    await self._regenerate(task)
+                elif isinstance(task, ProjectTakeTask):
+                    await self._project_take(task)
+                elif isinstance(task, BenchmarkTask):
+                    await self._benchmark(task)
+                else:
+                    await self._render(task)
+            finally:
+                llm_memory.get_gate().release(ticket)
+            return
 
     async def _wait_for_heavy_slot(self, job_id: str) -> bool:
         """Ждёт свободный тяжёлый слот (LLM/Whisper/другой синтез).
@@ -1839,12 +1869,23 @@ class JobQueue:
             # Прерывание watchdog'ом — исключение: реплика не пересинтезирована
             # из-за нехватки памяти, и об этом надо сказать внятно.
             if job.abort_kind == ABORT_WATCHDOG:
-                job.regen_error = job.abort_reason or "прервано из-за нехватки памяти"
+                # Задача обязана стать `error`, а не остаться `processing`: иначе
+                # `is_busy()` вечно истинно, и выгрузка движка и полный сброс
+                # отвечают 409 до перезапуска сервера.
+                reason = job.abort_reason or "прервано из-за нехватки памяти"
+                job.status = JobStatus.ERROR
+                job.error_type = proto.ERROR_WATCHDOG
+                job.error = reason
+                job.regen_error = reason
                 job.message = f"Реплика {task.index + 1}: прервано"
+                job.regenerating = None
+                self._set_replica_status(
+                    task.project_id, task.index, config.REPLICA_STATUS_INTERRUPTED
+                )
                 self._drop_variants(job)
                 logger.warning(
                     "Проект %s: пересинтез реплики %s прерван watchdog'ом: %s",
-                    task.project_id, task.index + 1, job.regen_error,
+                    task.project_id, task.index + 1, reason,
                 )
             else:
                 self._mark_cancelled(job)

@@ -7,6 +7,7 @@ SQL нельзя — приложение локальное и ставится
 """
 
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -333,6 +334,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
 
+# Параметры запроса к модели — часть входа разбора, а не оформление: при том же
+# тексте, модели и prompt'е ответ зависит от `num_ctx`, `temperature` и `seed`.
+# Без их хеша в строке разбора смена параметра оставляла бы прежний результат
+# «действительным», и пользователь видел бы разбор, сделанный не при тех
+# настройках, что стоят сейчас (§46).
+_MIGRATION_12 = """
+ALTER TABLE llm_analyses ADD COLUMN inference_hash TEXT NOT NULL DEFAULT '';
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -345,6 +355,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (9, _MIGRATION_9),
     (10, _MIGRATION_10),
     (11, _MIGRATION_11),
+    (12, _MIGRATION_12),
 )
 
 
@@ -410,6 +421,79 @@ def backup_before_migration(connection: sqlite3.Connection, path: Path) -> Path 
     return target
 
 
+# `ALTER TABLE ... ADD COLUMN <колонка>` — единственная неидемпотентная операция
+# в миграциях: на базе, где колонка уже есть, повторный прогон падает с
+# `duplicate column name`. Такой оператор пропускается (см. `_apply_migration`).
+_ADD_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?P<table>[\w\"\[\]`]+)\s+ADD\s+COLUMN\s+(?P<column>[\w\"\[\]`]+)",
+    re.IGNORECASE,
+)
+
+
+def _split_statements(script: str) -> list[str]:
+    """Разбирает скрипт миграции на отдельные операторы.
+
+    `executescript` для этого не годится: перед запуском он делает неявный
+    `COMMIT`, поэтому завернуть миграцию в транзакцию снаружи нельзя. Операторы
+    выполняются по одному через `execute` — тогда их видно по отдельности и
+    границы транзакции задаёт вызывающий.
+    """
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            # Фрагмент из одних комментариев выполнять нечего: `complete_statement`
+            # считает комментарий после `;` завершённым оператором.
+            if re.sub(r"--[^\n]*", "", pending).strip():
+                statements.append(pending.strip())
+            pending = ""
+    tail = pending.strip()
+    if tail and re.sub(r"--[^\n]*", "", tail).strip():
+        statements.append(tail)
+    return statements
+
+
+def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    """Есть ли колонка `column` в таблице `table` (`PRAGMA table_info`)."""
+    info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    name = column.strip('"`[]').lower()
+    return any(str(row[1]).lower() == name for row in info)
+
+
+def _apply_migration(connection: sqlite3.Connection, version: int, script: str) -> None:
+    """Применяет миграцию вместе с записью версии — одной транзакцией.
+
+    Обрыв между изменением схемы и записью версии оставил бы базу с новой схемой
+    при старой версии: повторный прогон упал бы, а починить это из интерфейса
+    нельзя. Поэтому операторы выполняются по одному внутри одной транзакции, а
+    `ADD COLUMN` для уже существующей колонки пропускается — база могла получить
+    колонку, не записав версию.
+    """
+    # Точка сохранения, а не `BEGIN`: `apply_migrations` зовут и на соединении,
+    # где транзакция уже открыта вызывающим (например, из теста) — вложенный
+    # `BEGIN` там падает. `RELEASE` внешней точки сохранения фиксирует транзакцию.
+    connection.execute("SAVEPOINT migration")
+    try:
+        for statement in _split_statements(script):
+            match = _ADD_COLUMN_RE.match(statement)
+            if match and _has_column(connection, match.group("table"), match.group("column")):
+                logger.info(
+                    "Колонка %s.%s уже существует — пропускаю ALTER",
+                    match.group("table"),
+                    match.group("column"),
+                )
+                continue
+            connection.execute(statement)
+        connection.execute("DELETE FROM schema_version")
+        connection.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+    except Exception:
+        connection.execute("ROLLBACK TO migration")
+        connection.execute("RELEASE migration")
+        raise
+    connection.execute("RELEASE migration")
+
+
 def apply_migrations(connection: sqlite3.Connection, path: Path | None = None) -> int:
     """Доводит схему до последней версии. Возвращает итоговую версию.
 
@@ -424,9 +508,7 @@ def apply_migrations(connection: sqlite3.Connection, path: Path | None = None) -
     for version, script in MIGRATIONS:
         if version <= current:
             continue
-        connection.executescript(script)
-        connection.execute("DELETE FROM schema_version")
-        connection.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        _apply_migration(connection, version, script)
         logger.info("Схема базы обновлена до версии %s", version)
         current = version
     return current

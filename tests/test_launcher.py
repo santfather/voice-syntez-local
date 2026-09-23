@@ -443,9 +443,28 @@ def test_run_sh_logs_its_failure_to_the_journal(tmp_path):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "уже запущено" in result.stderr, "сообщение остаётся ошибкой, а не уезжает в stdout"
+
     journal = tmp_path / "logs" / "voice_syntez.log"
     assert journal.exists(), "журнал заводится даже без запуска сервера"
     assert "уже запущено" in journal.read_text(encoding="utf-8")
+
+
+# --- 10. Прямые зависимости объявлены в requirements.txt ------------------------
+def test_directly_imported_packages_are_declared_in_requirements():
+    """То, что код импортирует напрямую, объявлено строкой, а не приходит транзитивно.
+
+    `pydantic` и `starlette` backend импортирует сам, `httpx` — тесты; до сих пор
+    все три приходили через `fastapi`. Смена мажорной версии FastAPI могла убрать
+    любую из них из окружения молча, и импорт упал бы только при запуске.
+    """
+    declared = set()
+    for raw in (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            declared.add(re.split(r"[=<>!~\[ ]", line, maxsplit=1)[0].lower())
+
+    for package in ("pydantic", "starlette", "httpx"):
+        assert package in declared, f"{package} не объявлен в requirements.txt"
 
 
 # --- помощники лаунчера: версия Python, порт, замок ----------------------------

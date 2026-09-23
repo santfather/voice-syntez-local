@@ -24,7 +24,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import memory_policy as memory
 from . import scheduler as scheduler_module
@@ -39,6 +39,7 @@ from .analyzer import (
     ReplicaAnalysis,
     build_context,
     context_hash,
+    inference_hash,
     plan_windows,
     scene_hash,
 )
@@ -521,14 +522,17 @@ class ProjectLlmAnalyzer:
                 owner=f"analysis:{project_id}",
             ):
                 for start, end in windows:
-                    # Проход длинный (десятки реплик), и память может уйти в HARD
-                    # STOP уже во время него: модель загружена, KV-кэш растёт.
-                    # Проверяем перед каждым окном и останавливаемся с причиной —
-                    # частичный разбор лучше, чем swap на всей машине (§14).
+                    # Проход длинный (десятки реплик), и память может уйти под
+                    # жёсткий резерв уже во время него: модель загружена, KV-кэш
+                    # растёт. Проверяем перед каждым окном и останавливаемся с
+                    # причиной — частичный разбор лучше, чем swap на всей машине
+                    # (§14). Условие берём у политики (`must_abort_running`), а не
+                    # выводим из уровня: под порог резерва память уходит в CRITICAL,
+                    # и остановку по одному HARD STOP проход бы пропустил.
                     abort = self.scheduler.check(
                         memory.HEAVY_LLM, model_size_gb=self.model_size_gb
                     )
-                    if abort.memory_level == memory.LEVEL_HARD_STOP:
+                    if abort.must_abort_running:
                         # Модель могла быть загружена предыдущими окнами: при
                         # остановке её обязательно возвращаем системе.
                         self._unload_model_safely(model_tag or self.analyzer.selected_model())
@@ -538,7 +542,7 @@ class ProjectLlmAnalyzer:
                             model_digest=digest,
                             analyses=analyses,
                             seconds=self.clock() - started,
-                            error=f"HARD STOP: {abort.memory_reason}",
+                            error=f"{abort.memory_level.replace('_', ' ')}: {abort.memory_reason}",
                             blocked_reason=abort.memory_reason,
                             from_cache=from_cache,
                             calls=calls,
@@ -572,6 +576,7 @@ class ProjectLlmAnalyzer:
                             # по нему проверяется на втором проходе, а здесь он
                             # берётся из уже сохранённого разбора при поиске.
                             model_digest=digest,
+                            inference_hash=inference_hash(settings),
                             prompt_version=prompt_version,
                             schema_version=s.SCHEMA_VERSION,
                         )
@@ -705,15 +710,10 @@ class ProjectLlmAnalyzer:
         if self._lookup is None:
             return None
         current = self._analyzer_digest()
-        candidate_key = AnalysisKey(
-            source_text_hash=key.source_text_hash,
-            context_hash=key.context_hash,
-            dictionary_hash=key.dictionary_hash,
-            model_digest=current,
-            prompt_version=key.prompt_version,
-            schema_version=key.schema_version,
-        )
-        return self._lookup(index, candidate_key)
+        # Копия ключа с подставленным digest, а не сборка полей заново: новый признак
+        # входа, добавленный в `AnalysisKey`, иначе молча выпал бы из поиска и кеш
+        # перестал бы попадать.
+        return self._lookup(index, replace(key, model_digest=current))
 
     def _analyzer_digest(self) -> str:
         try:
@@ -748,6 +748,7 @@ class ProjectLlmAnalyzer:
             status=STATUS_FAILED,
             model_tag=self.analyzer.last_model or self.analyzer.selected_model(),
             prompt_version=self._prompt_version(scene=True),
+            inference_hash=inference_hash(self.analyzer.settings),
             source_hash=text_hash(target_text),
             context_hash=context_digest,
             dictionary_hash=rules_digest,

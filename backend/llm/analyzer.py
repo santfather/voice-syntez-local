@@ -293,6 +293,25 @@ def context_hash(context: Mapping[str, Any]) -> str:
     return text_hash(payload)
 
 
+def inference_hash(settings: AnalyzerSettings) -> str:
+    """Хеш параметров запроса к модели: они тоже вход разбора, а не оформление (§46).
+
+    При том же тексте, модели и prompt'е ответ зависит от `num_ctx`, `temperature` и
+    `seed`. Без их хеша в ключе кеша смена параметра оставляла бы прежний разбор
+    действительным, и пользователь видел бы результат, полученный не при тех
+    настройках, что стоят сейчас.
+    """
+    payload = json.dumps(
+        {
+            "num_ctx": int(settings.num_ctx),
+            "temperature": float(settings.temperature),
+            "seed": int(settings.seed),
+        },
+        sort_keys=True,
+    )
+    return text_hash(payload)
+
+
 def plan_windows(
     count: int, *, size: int = DEFAULT_SCENE_REPLICAS, overlap: int = DEFAULT_CONTEXT_REPLICAS
 ) -> tuple[tuple[int, int], ...]:
@@ -437,6 +456,9 @@ class ReplicaAnalysis:
     model_digest: str = ""
     prompt_version: str = ""
     schema_version: str = s.SCHEMA_VERSION
+    # Хеш параметров запроса (`num_ctx`, `temperature`, `seed`): разбор делался при
+    # этих настройках, и смена любой из них делает его недействительным (§46).
+    inference_hash: str = ""
     source_hash: str = ""
     context_hash: str = ""
     # Хеш словаря, влияющего на реплику: разбор перестаёт быть действительным при
@@ -465,6 +487,7 @@ class ReplicaAnalysis:
             "model_digest": self.model_digest,
             "prompt_version": self.prompt_version,
             "schema_version": self.schema_version,
+            "inference_hash": self.inference_hash,
             "source_hash": self.source_hash,
             "context_hash": self.context_hash,
             "dictionary_hash": self.dictionary_hash,
@@ -837,6 +860,7 @@ class LinguisticAnalyzer:
             model_tag=model,
             model_digest=self._model_digest(model) if model_digest is None else model_digest,
             prompt_version=prompt_version or self.prompt.version,
+            inference_hash=inference_hash(self.settings),
             source_hash=source_digest,
             context_hash=context_digest,
             dictionary_hash=dictionary_digest,
@@ -859,6 +883,7 @@ class LinguisticAnalyzer:
             status=STATUS_DISABLED,
             model_tag=self.settings.primary_model,
             prompt_version=prompt_version or self.prompt.version,
+            inference_hash=inference_hash(self.settings),
             source_hash=source_digest,
             context_hash=context_digest,
             dictionary_hash=dictionary_digest,
@@ -1049,6 +1074,7 @@ class LinguisticAnalyzer:
             model_tag=model,
             model_digest=self._model_digest(model) if model_digest is None else model_digest,
             prompt_version=prompt_version or self.prompt.version,
+            inference_hash=inference_hash(self.settings),
             source_hash=source_digest,
             context_hash=context_digest,
             dictionary_hash=dictionary_digest,

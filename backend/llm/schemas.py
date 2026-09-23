@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("tts.llm.schemas")
 
 # Версия контракта растёт вместе с полями. Эмоция и акт реплики (UPDATE 2 §32)
 # добавились в версии 2 — старые сохранённые разборы после этого считаются
@@ -228,9 +231,20 @@ ERROR_OVERLAP = "overlap"
 ERROR_UNKNOWN_UTTERANCE_CLASS = "unknown_utterance_class"
 ERROR_UNKNOWN_FIELD = "unknown_field"
 ERROR_UNKNOWN_EMOTION = "unknown_emotion"
+# Поле аннотации не приводится к своему типу (`"span_start": "abc"`,
+# `"confidence": {}`): ответ отвергается как негодный, а не падает исключением.
+ERROR_FIELD_TYPES = "field_types"
 # Повтор `replica_id` в окне (§7): два разбора одной реплики — конфликт, и первый
 # из них уже принят, поэтому второй отбрасывается с причиной.
 ERROR_DUPLICATE_REPLICA = "duplicate_replica"
+# Ответ модели больше правдоподобного: контракт — короткие аннотации к реплике, а
+# не пересказ текста. Такой ответ отбрасывается **до** `json.loads`, иначе
+# «простыня» разворачивается в объект и раздувает память процесса и время разбора.
+ERROR_TOO_LARGE = "too_large"
+# Аннотаций в одной реплике больше, чем в её тексте может быть участков: модель
+# зациклилась или вернула мусорный список. Ответ отбрасывается целиком — как и
+# любой другой, не прошедший проверку.
+ERROR_TOO_MANY_ITEMS = "too_many_items"
 
 # Поля, которые модели разрешено возвращать. Список закрытый: схема ответа и так
 # не содержит поля для текста, но модель может добавить его «от себя» — и тогда
@@ -286,6 +300,13 @@ REWRITE_FIELDS: tuple[str, ...] = (
 
 CONFIDENCE_MIN = 0.0
 CONFIDENCE_MAX = 1.0
+
+# Верхние границы ответа — защита от «простыни». Контракт возвращает аннотации к
+# тексту реплики, поэтому ответ на порядки короче промпта, а аннотаций по участкам
+# не бывает «сотни». Без порогов один ответ модели раздувает память и время
+# разбора, отклоняясь при этом всё равно целиком.
+MAX_RESPONSE_CHARS = 128 * 1024
+MAX_ANNOTATIONS = 200
 
 
 @dataclass(frozen=True)
@@ -556,6 +577,10 @@ def _extract_json(raw_text: str) -> tuple[dict | None, list[str]]:
     text = (raw_text or "").strip()
     if not text:
         return None, [ERROR_NOT_JSON]
+    # Размер проверяется до `json.loads`: смысл порога в том, чтобы «простыня» не
+    # разворачивалась в объект со всеми аннотациями, а была отброшена как есть.
+    if len(text) > MAX_RESPONSE_CHARS:
+        return None, [ERROR_TOO_LARGE]
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
@@ -677,14 +702,32 @@ def _parse_payload(
     if expected_replica_id is not None and replica_id != expected_replica_id:
         errors.append(ERROR_UNKNOWN_REPLICA)
 
+    raw_items = payload.get("items") or []
+    if isinstance(raw_items, list) and len(raw_items) > MAX_ANNOTATIONS:
+        # Разбор такого списка — работа без пользы: ответ отбрасывается целиком, а
+        # «сотни аннотаций» к одной реплике не бывает. Ранний выход ещё и не даёт
+        # потратить время на проверку каждой аннотации мусорного ответа.
+        return None, [ERROR_TOO_MANY_ITEMS]
+
     items: list[Annotation] = []
-    for raw_item in payload.get("items") or []:
+    for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             errors.append(ERROR_NOT_OBJECT)
             continue
         if set(raw_item) - set(ANNOTATION_FIELDS):
             errors.append(ERROR_UNKNOWN_FIELD)
-        item = Annotation.from_dict(raw_item)
+        # Приведение типов не защищено в самой `Annotation.from_dict`: строка в
+        # числовом поле (`"span_start": "abc"`) или непустой объект в `confidence`
+        # бросили бы `ValueError`/`TypeError` (ложные значения вроде `{}` спасает
+        # идиома `or 0.0`). Ловить это здесь обязательно — иначе
+        # исключение уходит из `parse_analysis` мимо `except OllamaError` у
+        # вызывающего слоя и роняет весь проход анализа, а не одну реплику.
+        try:
+            item = Annotation.from_dict(raw_item)
+        except (TypeError, ValueError):
+            logger.warning("Аннотация с неподходящими типами полей отброшена: %r", raw_item)
+            errors.append(ERROR_FIELD_TYPES)
+            continue
         if item.type not in allowed:
             errors.append(ERROR_UNKNOWN_TYPE)
         if item.reason_code and item.reason_code not in REASON_CODES:
@@ -721,7 +764,15 @@ def _parse_payload(
     prosody_raw = utterance_raw.get("prosody") if isinstance(utterance_raw, dict) else None
     if isinstance(prosody_raw, dict) and set(prosody_raw) - set(PROSODY_FIELDS):
         errors.append(ERROR_UNKNOWN_FIELD)
-    utterance = UtteranceHint.from_dict(utterance_raw)
+    # Подсказка о реплике — метаданные, поэтому негодные типы её полей не
+    # отвергают разбор (§47: «reject field, safe fallback»): непрочитанная эмоция
+    # не меняет текст пользователя, а пустая подсказка оставляет решение
+    # детерминированному резолверу. Падать исключением здесь тем более нельзя.
+    try:
+        utterance = UtteranceHint.from_dict(utterance_raw)
+    except (TypeError, ValueError):
+        logger.warning("Подсказка о реплике с неподходящими типами полей отброшена: %r", utterance_raw)
+        utterance = UtteranceHint()
     if utterance.cls not in UTTERANCE_CLASSES:
         errors.append(ERROR_UNKNOWN_UTTERANCE_CLASS)
     if utterance.context_dependency not in CONTEXT_DEPENDENCIES:

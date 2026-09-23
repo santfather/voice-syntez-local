@@ -583,6 +583,21 @@ def test_delete_removes_only_model_directory(models_dir, downloader):
     assert state(XTTS_ID)["installed"] is False
 
 
+def test_delete_of_f5_does_not_wipe_shared_models_dir(models_dir, downloader):
+    """F5 хранится файлами в корне `models/`: её удаление не должно снести чужие веса."""
+    install_xtts(models_dir)
+    write(config.CKPT_FILE)
+    write(config.VOCAB_FILE)
+    assert state(F5_ID)["installed"] is True
+
+    with pytest.raises(ModelPathError):
+        get_manager().delete(F5_ID)
+
+    assert config.MODELS_DIR.is_dir()
+    assert config.CKPT_FILE.is_file()
+    assert config.XTTS_BASE_DIR.is_dir()
+
+
 def test_cache_model_cannot_be_deleted_or_downloaded(models_dir, downloader):
     with pytest.raises(ModelNotDownloadableError):
         get_manager().download("whisper")

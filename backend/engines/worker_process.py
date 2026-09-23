@@ -29,10 +29,12 @@ SIGBUS или тихое убийство по памяти — уносит с 
 
 from __future__ import annotations
 
+import faulthandler
 import importlib
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from multiprocessing.connection import Connection
@@ -48,6 +50,50 @@ TRACEBACK_LIMIT = 4000
 # Текст ошибки тоже усекаем: некоторые библиотеки вставляют в сообщение весь
 # тензор целиком.
 ERROR_LIMIT = 600
+
+
+def _enable_faulthandler() -> None:
+    """Пишет Python-стек нативного падения воркера в файл (P1, §3.1 рекомендаций).
+
+    Без этого SIGABRT/SIGSEGV/SIGBUS не оставляют ни строки в логе: `os.abort()` и
+    `ctypes.string_at(0)` убивают процесс до того, как сработает обработчик
+    исключений, и причину приходилось восстанавливать по форме кадров в `.ips`.
+    Файл кладётся рядом с журналом приложения: читают их вместе — строка `.ips`
+    ведёт в `logs/voice_syntez.log`, а причина падения оказывается здесь.
+
+    Неудачное открытие файла воркер не роняет: диагностика не повод не синтезировать.
+    Файл не закрывается намеренно — он живёт до конца процесса, а закрывать его при
+    падении ядро умеет лучше нас. Ссылку faulthandler держит сам: локального имени
+    достаточно, и проверено, что поток не собирается сборщиком мусора до падения.
+    """
+    from .. import config
+
+    target = config.LOG_PATH.with_name("worker_faulthandler.log")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(target, "a", encoding="utf-8")  # noqa: SIM115
+    except OSError as exc:
+        logger.warning("Воркер: faulthandler не подключён (%s), стек падения не сохранится", exc)
+        return
+    faulthandler.enable(file=stream)
+
+
+def _install_excepthooks() -> None:
+    """Логирует непойманные исключения — в главном потоке и в рабочих (P1, §3.3).
+
+    Главный цикл ловит `BaseException` вокруг `handle_request`, но исключения вне
+    этого блока и любые исключения в потоках, которые заводит движок, до сих пор
+    не попадали никуда: `threading.excepthook` по умолчанию пишет в stderr только
+    для потоков, у которых нет своего обработчика, а корневой логгер о них не знает.
+    """
+
+    def log_uncaught(exc_type, exc_value, exc_tb) -> None:
+        logger.critical("Необработанное исключение", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = log_uncaught
+    threading.excepthook = lambda args: log_uncaught(
+        args.exc_type, args.exc_value, args.exc_traceback
+    )
 
 
 def _configure_logging(engine_id: str) -> None:
@@ -204,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
     """
     engine_id, request_fd, response_fd = _parse_args(list(sys.argv[1:] if argv is None else argv))
     _configure_logging(engine_id)
+    # Диагностику ставим сразу: движок ещё не импортирован, а падения нативных
+    # библиотек начинаются уже с первого обращения к нему.
+    _enable_faulthandler()
+    _install_excepthooks()
     # Порядок важен: `config` выставляет лимиты потоков в переменных окружения, и
     # сделать это нужно до первого импорта torch (внутри движка).
     from .. import config  # noqa: F401
@@ -214,7 +264,18 @@ def main(argv: list[str] | None = None) -> int:
     request = Connection(request_fd, readable=True, writable=False)
     response = Connection(response_fd, readable=False, writable=True)
     holder = _EngineHolder(engine_id)
-    logger.info("Воркер %s запущен: pid %s", engine_id, os.getpid())
+    # pid/argv/executable/cwd/sys.path в одной строке: по ним строка лога в
+    # `logs/voice_syntez.log` связывается с процессом в будущем `.ips`, где есть
+    # только procPath, parentPid и время.
+    logger.info(
+        "Воркер %s запущен: pid=%s argv=%s executable=%s cwd=%s sys.path=%s",
+        engine_id,
+        os.getpid(),
+        sys.argv,
+        sys.executable,
+        os.getcwd(),
+        sys.path,
+    )
 
     try:
         while True:

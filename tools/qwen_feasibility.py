@@ -42,7 +42,6 @@ from backend import config, model_manager, resource_guard
 from backend.engines.base import (
     ENGINE_MODE_EXPERIMENTAL,
     ENGINE_MODE_KEY,
-    ENGINE_MODE_QUALITY,
     ENGINE_QWEN,
     engine_info,
 )

@@ -8,8 +8,8 @@
 
 Действительность разбора решается сравнением хешей входа, а не временем: в строке
 лежат `source_text_hash`, `context_hash`, `dictionary_hash`, `model_digest`,
-`prompt_version`, `schema_version`. Совпали все — разбор ещё про этот вход; любое
-расхождение делает его устаревшим (§11, §18 Task 2).
+`prompt_version`, `schema_version`, `inference_hash`. Совпали все — разбор ещё про
+этот вход; любое расхождение делает его устаревшим (§11, §18 Task 2).
 
 Репозиторий не знает про транзакции и не решает, что делать с устаревшим разбором:
 он принимает соединение и работает в его рамках. Политика кеша — в `llm/analysis_cache.py`.
@@ -28,6 +28,7 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
     "model_digest",
     "prompt_version",
     "schema_version",
+    "inference_hash",
 )
 
 
@@ -48,6 +49,7 @@ def _row_to_analysis(row: sqlite3.Row) -> dict:
         "model_digest": row["model_digest"],
         "prompt_version": row["prompt_version"],
         "schema_version": row["schema_version"],
+        "inference_hash": row["inference_hash"],
         "analysis_json": row["analysis_json"],
         "status": row["status"],
         "error": row["error"],
@@ -78,6 +80,7 @@ class LlmAnalysesRepository:
         model_digest: str = "",
         prompt_version: str = "",
         schema_version: str = "",
+        inference_hash: str = "",
         error: str = "",
     ) -> dict:
         """Сохраняет разбор реплики, заменяя прежний.
@@ -93,8 +96,8 @@ class LlmAnalysesRepository:
                 analysis_id, project_id, replica_id, replica_index,
                 source_text_hash, context_hash, dictionary_hash,
                 model_tag, model_digest, prompt_version, schema_version,
-                analysis_json, status, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                inference_hash, analysis_json, status, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, replica_index) DO UPDATE SET
                 analysis_id = excluded.analysis_id,
                 replica_id = excluded.replica_id,
@@ -105,6 +108,7 @@ class LlmAnalysesRepository:
                 model_digest = excluded.model_digest,
                 prompt_version = excluded.prompt_version,
                 schema_version = excluded.schema_version,
+                inference_hash = excluded.inference_hash,
                 analysis_json = excluded.analysis_json,
                 status = excluded.status,
                 error = excluded.error,
@@ -122,6 +126,7 @@ class LlmAnalysesRepository:
                 model_digest,
                 prompt_version,
                 schema_version,
+                inference_hash,
                 analysis_json,
                 status,
                 error,
@@ -177,5 +182,18 @@ class LlmAnalysesRepository:
         cursor = self._conn.execute(
             f"DELETE FROM llm_analyses WHERE project_id = ? AND replica_index IN ({placeholders})",
             (project_id, *[int(index) for index in replica_indexes]),
+        )
+        return int(cursor.rowcount or 0)
+
+    def delete_for_project(self, project_id: str) -> int:
+        """Удаляет все разборы проекта (он сам удалён).
+
+        Явное удаление, а не `ON DELETE CASCADE`: ключом `project_id` бывает и
+        синтетическое значение `text-<хеш>` (разбор сплошного текста без проекта),
+        поэтому внешний ключ на `projects` здесь поставить нельзя. Разбор —
+        производная данных, и вместе с проектом он не нужен.
+        """
+        cursor = self._conn.execute(
+            "DELETE FROM llm_analyses WHERE project_id = ?", (project_id,)
         )
         return int(cursor.rowcount or 0)
