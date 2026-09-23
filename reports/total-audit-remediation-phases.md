@@ -33,6 +33,15 @@ python -m pytest
 - **F-X3** (Minor) — убрать мусор из корня: `dialogue.mp3`, `dialogue-2.mp3`, `total_audit.md`
   (после того как план на его основе создан — сам файл аудита туда, где хранятся остальные
   отчёты, не в корень).
+
+  **Статус: закрыто (этот коммит).** `total_audit.md` переехал в `reports/` ещё в Фазе 0
+  (там же `total-audit-remediation-phases.md` и `phase2-performance.md`). `dialogue.mp3` и
+  `dialogue-2.mp3` были untracked-артефактом ручных `curl` из `docs/api.md` — на момент уборки
+  их в дереве уже не было. Оставался сырой дамп macOS-crash-репорта `find_and_fix.md` (802
+  строки системной информации и JSON, без выводов) — удалён. В `.gitignore` добавлено
+  `/dialogue*.mp3`: эти же примеры скачивания пишут в cwd, то есть снова в корень, и правило
+  не даёт мусору вернуться в `git status`. В корне остались только рабочие файлы: `.gitignore`,
+  `README.md`, `VOICE_SYNTEZ.command`, `pytest.ini`, `requirements*.txt`, `run.sh`.
 - **F-L1** (Major) — `run.sh` и `VOICE_SYNTEZ.command` дублируют логику лока. `.command`
   должен вызывать `run.sh`, а не дублировать pidfile-логику.
 
