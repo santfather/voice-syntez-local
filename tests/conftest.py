@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from backend import audio_pipeline, config, job_queue, model_manager
+from backend import audio_pipeline, config, job_queue, memory_guard, model_manager
 from backend.engines.base import SAMPLE_RATE, STATE_READY, EngineInfo, SynthesisEngine
 from backend.engines.supervisor import get_supervisor
 from backend.voices_store import Voice
@@ -148,9 +148,17 @@ def no_memory_pressure(monkeypatch):
     Патчатся оба входа: `is_memory_critical` — то, чем пользуется очередь, и
     `check_system_memory_pressure` — прежняя проверка, на которую опираются
     отдельные тесты.
+
+    Тем же способом выключается и проактивный бюджет памяти
+    (`memory_guard.guard_engine_load`): он считает свободную память машины, и
+    без подстановки тесты загрузки движка зависели бы от того, сколько её
+    осталось в момент прогона. Сама проверка (`check_engine_load_budget`)
+    тестируется напрямую — подстановка патчит только вход, которым пользуются
+    роут и пайплайн.
     """
     monkeypatch.setattr(job_queue.resource_guard, "is_memory_critical", lambda: False)
     monkeypatch.setattr(job_queue.resource_guard, "check_system_memory_pressure", lambda: False)
+    monkeypatch.setattr(memory_guard, "guard_engine_load", lambda engine_id: None)
 
 
 @pytest.fixture

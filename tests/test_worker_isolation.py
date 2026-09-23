@@ -185,16 +185,29 @@ def test_engine_error_keeps_worker_alive(isolated):
 
 
 def test_worker_timeout_kills_process_and_restarts(isolated, monkeypatch):
-    monkeypatch.setattr(config, "WORKER_REQUEST_TIMEOUT_SEC", 1.0)
+    """Зависший воркер убивается по таймауту, и поднимается замена.
+
+    Холодный спавн вынесен за бюджет таймаута намеренно: под песочницей TraeCode
+    первый подъём воркера (импорт torch, ~2 с) не укладывается в секунду, и
+    проверка ловила бы скорость импорта, а не реакцию супервизора. Поэтому
+    сначала воркер прогревается с щедрым лимитом фикстуры (10 с), и только
+    потом бюджет ужимается до 1 с — и «HANG» проверяет именно таймаут. Перед
+    последней репликой бюджет возвращается: её выполняет уже **новая**, только
+    что поднятая замена, и ужимать её спавн снова было бы той же ошибкой.
+    """
     engine = _make_engine()
+    generous = config.WORKER_REQUEST_TIMEOUT_SEC
     try:
-        _synth(engine, "Разогрев")
+        _synth(engine, "Разогрев")  # спавн завершён, воркер ответил
+        monkeypatch.setattr(config, "WORKER_REQUEST_TIMEOUT_SEC", 1.0)
         stale = engine.worker.process
         with pytest.raises(proto.WorkerTimeoutError) as caught:
             _synth(engine, "HANG")
         assert caught.value.error_type == proto.ERROR_WORKER_TIMEOUT
+        assert "не ответил за 1 с" in str(caught.value)
         assert _pid_gone(stale), "зависший процесс обязан быть убит, а не ждать вечно"
         assert _wait_for(lambda: engine.worker.alive() and engine.worker.process is not stale)
+        monkeypatch.setattr(config, "WORKER_REQUEST_TIMEOUT_SEC", generous)
         _synth(engine, "После таймаута")
     finally:
         engine.unload()

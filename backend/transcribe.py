@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config
+from . import config, memory_guard
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,10 @@ def _run_worker(audio_path: Path, full: bool) -> Transcription:
     command = [sys.executable, "-m", WORKER_MODULE, str(audio_path)]
     if full:
         command.append(WORKER_FULL_FLAG)
+    # Whisper не считается TTS-движком (он транзиентный), но в пике ест ~1.5 ГБ:
+    # поверх двух поднятых движков это тот самый случай из E2E. Отказа здесь нет
+    # (проверка качества нужна именно на слабых машинах) — только предупреждение.
+    memory_guard.check_whisper_load_budget(memory_guard.loaded_tts_engines())
     try:
         proc = subprocess.run(
             command,
@@ -103,6 +107,8 @@ def transcribe_file(audio_path: Path) -> Transcription:
 def _run_words_worker(audio_path: Path) -> list[WordStamp]:
     """Запускает воркер в режиме таймстемпов слов."""
     command = [sys.executable, "-m", WORKER_MODULE, str(audio_path), WORKER_WORDS_FLAG]
+    # См. `_run_worker`: тот же транзиентный Whisper, то же предупреждение.
+    memory_guard.check_whisper_load_budget(memory_guard.loaded_tts_engines())
     try:
         proc = subprocess.run(
             command,

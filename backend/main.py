@@ -38,6 +38,7 @@ from . import (
     diagnostics,
     emotions,
     engine_lifecycle,
+    memory_guard,
     model_manager,
     project_analysis,
     project_export,
@@ -1150,6 +1151,14 @@ async def load_engine(engine_id: str) -> dict:
     info = ENGINE_INFOS.get(engine_id)
     if info is None:
         raise _unknown_engine(engine_id)
+    try:
+        # Бюджет памяти проверяется до подъёма весов и по живому состоянию:
+        # `created_engines()` не создаёт движок, поэтому «сколько уже поднято»
+        # считается без побочного эффекта. 409 — не ошибка сервиса: пользователю
+        # нужно освободить память и повторить, а не искать причину в журнале.
+        memory_guard.guard_engine_load(engine_id)
+    except memory_guard.MemoryBudgetExceeded as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
         engine = get_engine(engine_id)
         await asyncio.to_thread(engine.load)

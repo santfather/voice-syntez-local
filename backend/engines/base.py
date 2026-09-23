@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from .. import config
+from .. import config, memory_guard
 
 logger = logging.getLogger(__name__)
 
@@ -832,6 +832,10 @@ class SynthesisEngine(ABC):
             self._active_synthesizes += 1
         try:
             if not self.is_loaded:
+                # Бюджет памяти проверяется до подъёма весов: вызов идёт и мимо
+                # роута загрузки (ленивый путь), и это не менее важный вход —
+                # именно так движки поднимались в E2E, где пик дошёл до 90.5 %.
+                memory_guard.guard_engine_load(self.id)
                 self.load()
             merged = self._merged_params(params)
             # Снимок берётся после загрузки: иначе в дельту попал бы вес модели,
