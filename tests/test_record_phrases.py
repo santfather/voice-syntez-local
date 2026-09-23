@@ -1,10 +1,15 @@
-"""Фразы для записи голоса в `frontend/app.js`: состав, «ё», mapping и запрет тестовой фразы.
+"""Фразы для записи голоса в `frontend/voice-record.js`: состав, «ё», mapping.
 
-JS-раннера в проекте нет, поэтому тест читает `frontend/app.js` как текст — тем же
+JS-раннера в проекте нет, поэтому тест читает исходники как текст — тем же
 приёмом, что `test_launcher.py` читает `VOICE_SYNTEZ.command`. Разбор — регулярные
 выражения плюс крошечный сканер строк и комментариев: он переживает
 переформатирование массива, экранированные кавычки и комментарии между элементами,
 но падает с понятной ошибкой, если структура не нашлась.
+
+Файлов два, потому что запись разнесена по смыслу, а не по удобству теста:
+список фраз и мастер живут в модуле записи (`voice-record.js`), а тестовая фраза
+с плотной «ё» и её кнопка-пример остались в точке входа (`app.js`) — ею пользуется
+панель «Что услышит модель», а не мастер записи.
 
 Проверяется не «текст совпадает с документом побайтово», а смысл: первые пять фраз
 не тронуты, новых ровно шесть и в порядке документа, в новых есть «ё» и новые
@@ -24,6 +29,7 @@ from backend.text_normalization import normalize
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 APP_JS = PROJECT_ROOT / "frontend" / "app.js"
+VOICE_RECORD_JS = PROJECT_ROOT / "frontend" / "voice-record.js"
 INDEX_HTML = PROJECT_ROOT / "frontend" / "index.html"
 
 # Первые пять фраз — защита от случайной правки работающего списка: они должны
@@ -172,8 +178,9 @@ _ESCAPES = {
 }
 
 
-def _fail(message: str) -> NoReturn:
-    raise ValueError(f"frontend/app.js: {message}")
+def _fail(message: str, path: Path = VOICE_RECORD_JS) -> NoReturn:
+    """Ошибка с именем файла, в котором разбор не нашёл ожидаемую структуру."""
+    raise ValueError(f"{path.relative_to(PROJECT_ROOT)}: {message}")
 
 
 def _strip_comments(source: str) -> str:
@@ -279,15 +286,15 @@ def _decode_js_string(literal: str) -> str:
     return "".join(out)
 
 
-def _read_app_js() -> str:
-    if not APP_JS.is_file():
-        _fail(f"нет файла {APP_JS}")
-    return _strip_comments(APP_JS.read_text(encoding="utf-8"))
+def _read_source(path: Path) -> str:
+    if not path.is_file():
+        _fail(f"нет файла {path}", path)
+    return _strip_comments(path.read_text(encoding="utf-8"))
 
 
 def record_phrases() -> list[tuple[str, str]]:
     """Пары (label, text) из `RECORD_PHRASES`; понятная ошибка при смене структуры."""
-    source = _read_app_js()
+    source = _read_source(VOICE_RECORD_JS)
     declaration = _ARRAY_DECL.search(source)
     if not declaration:
         _fail("не найдено объявление `const RECORD_PHRASES = [`")
@@ -314,7 +321,7 @@ _PROFILE_ENTRY = re.compile(
 
 def record_phrase_profiles() -> list[tuple[str, str]]:
     """Пары (подпись фразы, ключ профиля) из `RECORD_PHRASE_PROFILES` (§16)."""
-    source = _read_app_js()
+    source = _read_source(VOICE_RECORD_JS)
     declaration = _PROFILE_MAP_DECL.search(source)
     if not declaration:
         _fail("не найдено объявление `const RECORD_PHRASE_PROFILES = {`")
@@ -334,10 +341,11 @@ def record_phrase_profiles() -> list[tuple[str, str]]:
 
 def yo_stress_test_phrase() -> str:
     """Текст `YO_STRESS_TEST_PHRASE`; ошибка, если объявление пропало."""
-    source = _read_app_js()
+    # Фраза осталась в точке входа: ею пользуется панель preview, а не мастер записи.
+    source = _read_source(APP_JS)
     match = _YO_DECL.search(source)
     if not match:
-        _fail("не найдено объявление `const YO_STRESS_TEST_PHRASE = '...';`")
+        _fail("не найдено объявление `const YO_STRESS_TEST_PHRASE = '...';`", APP_JS)
     return _decode_js_string(match.group("value"))
 
 
@@ -426,7 +434,7 @@ def test_every_phrase_profile_is_recordable_and_unique():
 
 def test_wizard_saves_recording_as_profile_of_selected_voice():
     """Мастер пишет запись в профиль выбранного голоса, а не в новый голос (§16)."""
-    source = APP_JS.read_text(encoding="utf-8")
+    source = VOICE_RECORD_JS.read_text(encoding="utf-8")
     # Запись уходит в профили конкретного голоса — и вместе с фразой, по которой
     # записана: без `source_record_phrase_id` повторная запись не заменила бы
     # прежний профиль, а легла бы рядом вторым.
@@ -513,14 +521,28 @@ def test_yo_stress_phrase_restores_yo_without_mutating_source():
 
 # --- 8. Тестовая фраза не предлагается при записи -----------------------------
 def test_yo_stress_phrase_is_not_offered_for_recording():
-    source = APP_JS.read_text(encoding="utf-8")
-    assert "YO_STRESS_TEST_PHRASE" in source, "константа должна использоваться, а не быть мёртвой"
+    # Панель записи разнесена по двум файлам: список фраз и его заполнение — в модуле
+    # записи, обработчик выбора фразы (кнопка) — в точке входа. Проверяем оба: фраза
+    # не должна оказаться рядом с разметкой записи ни в одном из них.
+    sources = {
+        path.name: path.read_text(encoding="utf-8") for path in (VOICE_RECORD_JS, APP_JS)
+    }
+    assert "YO_STRESS_TEST_PHRASE" in sources[APP_JS.name], (
+        "константа должна использоваться, а не быть мёртвой"
+    )
 
-    record_lines = [line for line in source.splitlines() if "record-phrase" in line]
-    assert record_lines, "в app.js должны быть обращения к элементам записи"
-    for line in record_lines:
+    record_lines = [
+        (name, line)
+        for name, source in sources.items()
+        for line in source.splitlines()
+        if "record-phrase" in line
+    ]
+    assert record_lines, "должны быть обращения к элементам записи"
+    record_files = {name for name, _ in record_lines}
+    assert "voice-record.js" in record_files, "запись живёт в модуле записи"
+    for name, line in record_lines:
         assert "YO_STRESS_TEST_PHRASE" not in line, (
-            f"тестовая фраза не должна подставляться в UI записи: {line.strip()}"
+            f"тестовая фраза не должна подставляться в UI записи: {name}: {line.strip()}"
         )
 
     html = INDEX_HTML.read_text(encoding="utf-8")

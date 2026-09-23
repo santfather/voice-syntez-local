@@ -32,8 +32,10 @@ import {
   engineInfo,
   loadVoices,
   watchEngines,
-  resetRecording,
 } from './app.js';
+// Сброс записи голоса живёт в модуле записи: карточка нового голоса очищает
+// панель «Запись с микрофона» после сохранения, а та — его поле.
+import { resetRecording } from './voice-record.js';
 
 function voiceTags(voice) {
   const label = voice.gender === 'male' ? 'муж.' : voice.gender === 'female' ? 'жен.' : '—';
