@@ -11,9 +11,9 @@ FastAPI и ванильный фронтенд без сборки. Тяжёла
 ```
 VOICE_SYNTEZ/
 ├── backend/
-│   ├── main.py              # FastAPI: роуты + отдача дашборда
+│   ├── main.py              # FastAPI: роуты, отдача дашборда, middleware request-id и лимита тела, /healthz, единый обработчик 500
 │   ├── engines/
-│   │   ├── base.py          # паспорта движков, их ручки и режимы (черновик/качество/эксперимент), общий интерфейс SynthesisEngine
+│   │   ├── base.py          # паспорта движков, их ручки, режимы (черновик/качество/эксперимент) и встроенные голоса, общий интерфейс SynthesisEngine
 │   │   ├── registry.py      # ленивое создание движка по id
 │   │   ├── f5_engine.py     # обёртка F5-TTS над tts_engine.TTSEngine
 │   │   ├── xtts_engine.py   # XTTS v2 (базовая и banana): загрузка, кеш латентов, шим isin_mps_friendly
@@ -88,15 +88,15 @@ VOICE_SYNTEZ/
 │   ├── resource_guard.py    # watchdog по RSS/CPU и проверка заполненности памяти системы
 │   ├── memory_monitor.py    # три источника классификации памяти (воркеры, система, MPS) для /api/status
 │   ├── recovery.py          # восстановление после рестарта: зависшие реплики, анализ, мусорные файлы
-│   ├── voices_store.py      # CRUD над voices.json и файлами референсов
+│   ├── voices_store.py      # CRUD над voices.json и файлами референсов, карточки встроенных голосов движков
 │   ├── pronunciation.py     # словарь произношения: CRUD в SQLite + кеш активных правил
 │   ├── db/                  # проекты в SQLite: схема, соединение, репозитории
 │   │   ├── migrations.py    # нумерованные миграции: схема создаётся при первом запуске
 │   │   ├── connection.py    # соединение на операцию (WAL, foreign_keys), границы транзакций
-│   │   ├── repositories/    # projects.py, replicas.py, takes.py, pronunciation.py, crashes.py, llm_analyses.py
+│   │   ├── repositories/    # projects.py, replicas.py, takes.py, pronunciation.py, crashes.py, llm_analyses.py, jobs.py
 │   │   └── store.py         # фасад: транзакции, каскады, файлы вариантов в одном месте
 │   └── config.py            # пути, дефолты, настройки MPS/потоков
-├── frontend/                # index.html + app.js + style.css (без сборки), оформление — по ui-design/
+├── frontend/                # index.html + ES-модули: app.js (точка входа), voices.js, timeline.js, project-io.js + style.css (без сборки), оформление — по ui-design/
 ├── ui-design/               # референс дизайна (Next.js/v0): палитра и вёрстка, в рантайме не используется
 ├── docs/                    # страницы документации (индекс — README.md внутри этого каталога)
 ├── models/                  # веса F5-TTS, XTTS v2, Qwen3-TTS и Kokoro-ru (в git не попадают)
@@ -104,7 +104,8 @@ VOICE_SYNTEZ/
 ├── output/                  # готовые файлы (чистятся по TTL и вручную) + output/projects/{id}/ — куски проектов, output/benchmarks/ — сравнение движков, output/diagnostics/ — архивы диагностики, output/trace/ — трейсы синтеза
 ├── recordings/              # проекты вкладки «Сам себе звукорежиссер»: projects.json, {id}/{raw,processed,previews,output} (в git не попадает)
 ├── data/                    # voice_syntez.db — проекты, реплики и варианты; llm_settings.json — настройки анализатора (в git не попадает)
-├── logs/                    # voice_syntez.log — журнал запуска из VOICE_SYNTEZ.command (в git не попадает)
+├── logs/                    # voice_syntez.log — журнал приложения с ротацией (в git не попадает)
+├── reports/                 # рабочие тексты разработки: полный аудит и план исправлений (dev-only, не документация)
 ├── requirements.txt
 ├── requirements-denoise.txt # опциональный DeepFilterNet (ставится с --no-deps)
 ├── requirements-qwen.txt    # опциональный Qwen3-TTS (ставится с --no-deps: свой transformers)
@@ -134,8 +135,8 @@ VOICE_SYNTEZ/
 │   ├── llm_benchmark_report.py # отчёт по сохранённым результатам и выбор primary/fallback с допусками
 │   ├── diagnostics_smoke.py # архив диагностики проекта без запуска моделей (--list, --project, --no-references)
 │   └── short_trace.py       # живой разбор обрывов коротких реплик: трейс стадий + ASR по словам (--asr)
-├── VOICE_SYNTEZ.command     # лёгкий лаунчер для macOS: двойной клик из Finder
-└── run.sh
+├── VOICE_SYNTEZ.command     # лёгкий лаунчер для macOS: двойной клик из Finder, зовёт run.sh
+└── run.sh                   # единственный лаунчер: venv, зависимости, порт, замок, uvicorn
 ```
 
 Движки приведены к общему интерфейсу `SynthesisEngine` (`load()` → `synthesize(text, ref_audio,
