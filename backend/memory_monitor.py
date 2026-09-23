@@ -6,7 +6,8 @@
   Apple Silicon вес моделей в него не попадает (Metal считает отдельно), поэтому
   этот лимит ловит утечки, но не модели;
 * **RSS процессов-воркеров** — именно там живут модели (creash_report), и без
-  этого слагаемого watchdog не увидел бы главного потребителя памяти;
+  этого слагаемого watchdog не увидел бы главного потребителя памяти; в
+  классификацию идёт самый тяжёлый процесс, а не сумма по всем (см. `classify`);
 * **заполненность памяти системы** — видит чужие процессы (браузер, редактор с
   индексацией) и не зависит от того, как учтена память в Python.
 
@@ -76,6 +77,10 @@ def _default_sampler() -> dict:
         "system_percent": round(system_percent, 1),
         "workers": workers,
         "workers_rss_mb": round(sum(item["rss_mb"] for item in workers), 1),
+        # Самый тяжёлый воркер — по нему идёт классификация: сумма по всем
+        # процессам делила бы единый потолок между движками, и два движка
+        # упирались бы в лимит, ни один из которых его не превысил (см. `classify`).
+        "worker_peak_rss_mb": round(max((item["rss_mb"] for item in workers), default=0.0), 1),
     }
 
 
@@ -95,6 +100,7 @@ def sample(sampler: Sampler | None = None) -> dict:
     return {
         "rss_mb": float(data.get("rss_mb") or 0.0),
         "workers_rss_mb": float(data.get("workers_rss_mb") or 0.0),
+        "worker_peak_rss_mb": float(data.get("worker_peak_rss_mb") or 0.0),
         "system_percent": float(data.get("system_percent") or 0.0),
         "workers": list(data.get("workers") or []),
     }
@@ -103,7 +109,7 @@ def sample(sampler: Sampler | None = None) -> dict:
 def classify(
     *,
     rss_mb: float,
-    workers_rss_mb: float,
+    worker_peak_rss_mb: float,
     system_percent: float,
     max_rss_mb: float | None = None,
     worker_max_rss_mb: float | None = None,
@@ -114,6 +120,13 @@ def classify(
     Порядок проверок — от самого общего к частному: системная память важнее
     своего RSS, потому что при перегруженной машине новая задача навредит всем,
     а не только нам.
+
+    Потолок воркеров сравнивается с **самым тяжёлым** процессом синтеза, а не с
+    суммой по всем: `WORKER_MAX_RSS_MB` — это потолок одного процесса, и на
+    сумме два движка делили бы один бюджет. Хуже, что движки не равны по
+    аппетиту: CPU-движок (Kokoro-ru) держит модель и произносительный словарь в
+    RSS целиком, а MPS-движок почти не виден в RSS, поэтому общий бюджет
+    срабатывал бы на первом же честном прогоне CPU-движка.
     """
     max_rss = config.MAX_RSS_MB if max_rss_mb is None else max_rss_mb
     worker_max = config.WORKER_MAX_RSS_MB if worker_max_rss_mb is None else worker_max_rss_mb
@@ -130,10 +143,11 @@ def classify(
         )
     if rss_mb > max_rss:
         return STATE_CRITICAL, f"бэкенд занимает {rss_mb:.0f} МБ (лимит {max_rss:.0f} МБ)"
-    if workers_rss_mb > worker_max:
+    if worker_peak_rss_mb > worker_max:
         return (
             STATE_CRITICAL,
-            f"процессы синтеза занимают {workers_rss_mb:.0f} МБ (лимит {worker_max:.0f} МБ)",
+            f"процесс синтеза занимает {worker_peak_rss_mb:.0f} МБ "
+            f"(лимит {worker_max:.0f} МБ)",
         )
 
     if system_percent > threshold - WARNING_SYSTEM_MARGIN:
@@ -143,10 +157,10 @@ def classify(
         )
     if rss_mb > max_rss * WARNING_RSS_RATIO:
         return STATE_WARNING, f"бэкенд занимает {rss_mb:.0f} МБ — близко к лимиту {max_rss:.0f} МБ"
-    if workers_rss_mb > worker_max * WARNING_RSS_RATIO:
+    if worker_peak_rss_mb > worker_max * WARNING_RSS_RATIO:
         return (
             STATE_WARNING,
-            f"процессы синтеза занимают {workers_rss_mb:.0f} МБ — близко к лимиту "
+            f"процесс синтеза занимает {worker_peak_rss_mb:.0f} МБ — близко к лимиту "
             + f"{worker_max:.0f} МБ",
         )
     return STATE_NORMAL, "памяти достаточно"
@@ -157,7 +171,7 @@ def get_state(sampler: Sampler | None = None) -> dict:
     data = sample(sampler)
     state, reason = classify(
         rss_mb=data["rss_mb"],
-        workers_rss_mb=data["workers_rss_mb"],
+        worker_peak_rss_mb=data["worker_peak_rss_mb"],
         system_percent=data["system_percent"],
     )
     return {

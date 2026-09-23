@@ -41,14 +41,16 @@ FIRST = "Первая реплика диалога"
 # --- классификация памяти ------------------------------------------------------
 def test_classify_reports_normal_warning_and_critical():
     """Три состояния различаются по числам, а не по «на глаз»."""
-    normal = memory_monitor.classify(rss_mb=100, workers_rss_mb=100, system_percent=40)
+    normal = memory_monitor.classify(rss_mb=100, worker_peak_rss_mb=100, system_percent=40)
     assert normal[0] == memory_monitor.STATE_NORMAL
 
-    warning = memory_monitor.classify(rss_mb=100, workers_rss_mb=100, system_percent=82)
+    warning = memory_monitor.classify(rss_mb=100, worker_peak_rss_mb=100, system_percent=82)
     assert warning[0] == memory_monitor.STATE_WARNING
     assert "близко к порогу" in warning[1]
 
-    system_critical = memory_monitor.classify(rss_mb=100, workers_rss_mb=100, system_percent=91)
+    system_critical = memory_monitor.classify(
+        rss_mb=100, worker_peak_rss_mb=100, system_percent=91
+    )
     assert system_critical[0] == memory_monitor.STATE_CRITICAL
     assert "память системы занята" in system_critical[1]
 
@@ -56,20 +58,20 @@ def test_classify_reports_normal_warning_and_critical():
 def test_classify_counts_backend_and_worker_limits():
     """Свой потолок и потолок воркеров проверяются отдельно от системного."""
     backend = memory_monitor.classify(
-        rss_mb=6000, workers_rss_mb=100, system_percent=40, max_rss_mb=5000
+        rss_mb=6000, worker_peak_rss_mb=100, system_percent=40, max_rss_mb=5000
     )
     assert backend[0] == memory_monitor.STATE_CRITICAL
     assert "бэкенд занимает" in backend[1]
 
     workers = memory_monitor.classify(
-        rss_mb=100, workers_rss_mb=6000, system_percent=40, worker_max_rss_mb=5000
+        rss_mb=100, worker_peak_rss_mb=6000, system_percent=40, worker_max_rss_mb=5000
     )
     assert workers[0] == memory_monitor.STATE_CRITICAL
     # Модели живут в воркерах: без этого слагаемого watchdog их не увидел бы.
-    assert "процессы синтеза занимают" in workers[1]
+    assert "процесс синтеза занимает" in workers[1]
 
     warning = memory_monitor.classify(
-        rss_mb=100, workers_rss_mb=4500, system_percent=40, worker_max_rss_mb=5000
+        rss_mb=100, worker_peak_rss_mb=4500, system_percent=40, worker_max_rss_mb=5000
     )
     assert warning[0] == memory_monitor.STATE_WARNING
 
@@ -77,10 +79,16 @@ def test_classify_counts_backend_and_worker_limits():
 def test_get_state_uses_injected_sampler():
     """Сбор чисел инъектируется: тест не зависит от того, что ещё запущено рядом."""
     state = memory_monitor.get_state(
-        lambda: {"rss_mb": 120.5, "workers_rss_mb": 2600.0, "system_percent": 55.0}
+        lambda: {
+            "rss_mb": 120.5,
+            "workers_rss_mb": 2600.0,
+            "worker_peak_rss_mb": 1500.0,
+            "system_percent": 55.0,
+        }
     )
     assert state["state"] == memory_monitor.STATE_NORMAL
     assert state["workers_rss_mb"] == 2600.0
+    assert state["worker_peak_rss_mb"] == 1500.0
     assert state["thresholds"]["worker_max_rss_mb"] == config.WORKER_MAX_RSS_MB
 
 
@@ -95,7 +103,7 @@ def test_broken_sampler_does_not_block_work():
     assert state["rss_mb"] == 0.0
 
 
-def test_default_sampler_sums_worker_memory(monkeypatch):
+def test_default_sampler_reports_worker_rss(monkeypatch):
     """Сводка по умолчанию включает RSS процессов синтеза (там живут модели)."""
     import psutil
 
@@ -113,11 +121,57 @@ def test_default_sampler_sums_worker_memory(monkeypatch):
 
     state = memory_monitor.sample()
     assert state["workers_rss_mb"] == pytest.approx(300.0, abs=1.0)
+    assert state["worker_peak_rss_mb"] == pytest.approx(300.0, abs=1.0)
     assert state["workers"][0]["pid"] == 4242
     # Фейковый процесс не умеет `wait`/`terminate`: убираем его до уборки теста,
     # иначе супервизор попытается остановить несуществующий процесс.
     handle.process = None
     handle.state = proto.WORKER_STATE_STOPPED
+    supervisor.reset_after_stop()
+
+
+def test_worker_peak_is_max_not_sum(monkeypatch):
+    """Пик воркера — максимум по процессам, а не сумма: по нему идёт классификация.
+
+    Сумма остаётся в сводке для показа. Если бы классификация шла по ней, два
+    движка делили бы один потолок `WORKER_MAX_RSS_MB`, и прогон CPU-движка
+    (Kokoro-ru держит модель и словарь RUAccent целиком в RSS) отменялся бы
+    «превышен лимит памяти» без превышения потолка хотя бы одним процессом.
+    """
+    import psutil
+
+    supervisor = supervisor_module.WorkerSupervisor()
+    rss_by_pid = {4242: 700 * 1024 * 1024, 4343: 400 * 1024 * 1024}
+    handles = []
+    for engine_id, pid in (("f5", 4242), ("xtts", 4343)):
+        handle = supervisor.handle(engine_id)
+        handle.process = SimpleNamespace(pid=pid, poll=lambda: None)
+        handles.append(handle)
+    monkeypatch.setattr(supervisor_module, "_supervisor", supervisor)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda pid: SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=rss_by_pid.get(pid, 50 * 1024 * 1024))
+        ),
+    )
+
+    state = memory_monitor.sample()
+    assert state["workers_rss_mb"] == pytest.approx(1100.0, abs=1.0)
+    assert state["worker_peak_rss_mb"] == pytest.approx(700.0, abs=1.0)
+    # Ни один процесс не превысил потолок 1024 МБ — состояние нормальное, хотя
+    # сумма больше него.
+    decision, reason = memory_monitor.classify(
+        rss_mb=state["rss_mb"],
+        worker_peak_rss_mb=state["worker_peak_rss_mb"],
+        system_percent=40.0,
+        worker_max_rss_mb=1024,
+    )
+    assert decision == memory_monitor.STATE_NORMAL, reason
+
+    for handle in handles:
+        handle.process = None
+        handle.state = proto.WORKER_STATE_STOPPED
     supervisor.reset_after_stop()
 
 

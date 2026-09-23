@@ -542,9 +542,17 @@ WORKER_DEGRADED_COOLDOWN_SEC = float(os.environ.get("TTS_WORKER_DEGRADED_COOLDOW
 # повтор — компромисс: разовый сбой (OOM от соседнего процесса) лечится сам, а
 # систематический не превращается в бесконечный цикл.
 WORKER_CRASH_RETRIES = int(os.environ.get("TTS_WORKER_CRASH_RETRIES", "1"))
-# Потолок памяти воркера (МБ): вес моделей виден только в его процессе, поэтому
-# watchdog следит за ним отдельно (см. resource_guard).
-WORKER_MAX_RSS_MB = int(os.environ.get("TTS_WORKER_MAX_RSS_MB", str(MAX_RSS_MB)))
+# Потолок памяти одного процесса синтеза (МБ). Вес моделей виден только в RSS
+# воркера, поэтому watchdog следит за ним отдельно (см. resource_guard) и
+# сравнивает с **самым тяжёлым** воркером, а не с суммой по всем (см.
+# memory_monitor.classify). Дефолт намеренно отвязан от MAX_RSS_MB: тот
+# подобран под MPS-движки, чей вес модели в RSS не виден, а CPU-движок
+# Kokoro-ru держит в процессе и чекпоинт, и произносительный словарь RUAccent
+# целиком — замерено ~5 ГБ в покое и до ~7.5 ГБ на пике синтеза длинной реплики.
+# При унаследованных 5120 МБ watchdog прерывал честный прогон Kokoro-ru
+# («превышен лимит памяти»), хотя система была занята на 64 % против порога 85 %.
+# За перегрузку всей машины по-прежнему отвечает SYSTEM_MEM_THRESHOLD_PERCENT.
+WORKER_MAX_RSS_MB = int(os.environ.get("TTS_WORKER_MAX_RSS_MB", "10240"))
 
 
 def worker_isolation_enabled() -> bool:

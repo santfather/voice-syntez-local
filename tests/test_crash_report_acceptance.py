@@ -445,9 +445,10 @@ def test_memory_pressure_does_not_block_light_api(monkeypatch):
         "get_state",
         lambda sampler=None: {
             "state": memory_monitor.STATE_CRITICAL,
-            "reason": "процессы синтеза занимают 9000 МБ",
+            "reason": "процесс синтеза занимает 9000 МБ",
             "rss_mb": 200.0,
             "workers_rss_mb": 9000.0,
+            "worker_peak_rss_mb": 9000.0,
             "system_percent": 90.0,
             "workers": [],
             "thresholds": {},
