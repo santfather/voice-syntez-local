@@ -338,6 +338,17 @@ python -m pytest
 - **F-W4** (Minor, но помечено ⚠️ SECURITY) — 60 `innerHTML`, два без `esc()`
   (`app.js:1271`, `app.js:4263`). Обернуть оба в `esc()`, даже если источник сейчас — числовые
   id из БД: правило должно соблюдаться без исключений «в этом случае не опасно».
+
+  **Статус: закрыто (коммит `ee5dd3f`, шаг 1 разбиения `app.js`).** Оба места найдены в монолите
+  по аудиту и получили `esc()` тем же коммитом: `data-entry-id="${esc(entry.id)}"` (словарь
+  произношения, ныне `frontend/dictionary.js`) и `data-take="${esc(take.id)}"` (история звучаний
+  реплики, ныне `frontend/app.js`, `takesHtml`). Проверено свежим аудитом всего `frontend/`:
+  ни одного `innerHTML` с атрибутом или текстом из данных без `esc()` — без `esc()` остались
+  только числовые индексы циклов (`data-index="${index}"`), границы диапазонов (`min`/`max`/`step`)
+  и статические константы кода (`RECORD_NEW_VOICE`, `category.id`, значения `REFERENCE_EMOTIONS`).
+  Единственное «голое» присваивание — `element.innerHTML = saved.value`
+  ([app.js:989](file:///Users/vladislavkovalenko/Projects/VOICE_SYNTEZ/frontend/app.js#L989)):
+  это возврат снятого при загрузке статического шаблона `#text-drop`, а не данных с сервера.
 - SECURITY Major — нет лимита размера тела JSON (`main.py:1019`) и нет лимита размера/числа
   записей при импорте архива (`project_export.py:574-599`, zip-bomb). Лимит `Content-Length`
   на входе, `max_entries`/`max_uncompressed` при распаковке.
